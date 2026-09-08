@@ -1,0 +1,697 @@
+# Desktop Vista — Feature Innovation & UX Enhancement
+**Agent 1 Deliverable** · Lead Product Architect & UX Innovation Specialist (Lynda)  
+**Project:** Desktop Vista · **Tagline:** *All my drives. One perfect view.*  
+**Baseline:** v1.0 (`desktop_vista.py`, September 2026) · **Date:** 8 September 2026  
+**Audience:** Engineering, design, and release planning
+
+---
+
+## Document purpose
+
+This document turns the Agent 1 investigation tracks into a concrete product plan: prioritised features, architectural patterns grounded in the current codebase, UI wireframes, a backward-compatible `config.json` v2 schema, and a phased roadmap for v1.1 → v1.2 → v2.0.
+
+**v1 constraints that shape every recommendation**
+
+| Area | Today |
+| :--- | :--- |
+| UI | `customtkinter` dual-pane: left ~300 px control panel, right 16:9 preview (`PREVIEW_W/H = 800×450`) |
+| Wallpaper | `set_windows_wallpaper()` → Registry `WallpaperStyle`/`TileWallpaper` + `SystemParametersInfoW(SPI_SETDESKWALLPAPER)` — **global**, not per-monitor |
+| Slideshow | `self.after()` timer; deck = `self.images` from **one** selected folder; shuffle = `random.choice` excluding current index |
+| Preview | Synchronous Pillow `.draft("RGB", …)` + `.thumbnail(…, LANCZOS)` on the UI thread |
+| Config keys | `folders`, `current_folder`, `current_image`, `style`, `interval`, `shuffle` |
+| Planned (code/README) | `pystray` tray daemon; multi-monitor via modern APIs |
+
+---
+
+## 1. Executive Feature Matrix
+
+| Feature Name | Category | User Impact | Implementation Complexity | Target Version |
+| :--- | :--- | :---: | :---: | :---: |
+| **Track A — Multi-drive & aggregation** | | | | |
+| Unified multi-folder playlists | Aggregation | High | Med | v1.2 |
+| Playlist source = folders ∪ playlists in slideshow | Aggregation | High | Med | v1.2 |
+| Drive hot-plug / offline folder marking | Resilience | High | Med | v1.1 |
+| Skip missing files without crashing | Resilience | High | Low | v1.1 |
+| Resume offline folders on reconnect | Resilience | Med | Med | v1.2 |
+| Smart tags (non-destructive metadata) | Organisation | Med | Med | v2.0 |
+| Virtual collections (cross-path, no copy) | Organisation | High | Med | v2.0 |
+| **Track B — Multi-monitor** | | | | |
+| `IDesktopWallpaper` COM per-monitor set | Display | High | High | v2.0 |
+| Monitor topology read (paths, RECTs, IDs) | Display | High | Med | v2.0 |
+| Panoramic / ultrawide span assist | Display | Med | High | v2.0 |
+| Per-monitor preview mini-cards | Display / UX | High | Med | v2.0 |
+| Per-monitor style & assignment map | Display | High | Med | v2.0 |
+| **Track C — Tray & automation** | | | | |
+| `pystray` daemon + context menu | Automation | High | Med | v1.1 |
+| Minimise-to-tray (close vs hide) | Automation | High | Low | v1.1 |
+| Startup Run key + `--minimized` | Automation | High | Low | v1.1 |
+| Battery saver throttle / pause | Power | Med | Low | v1.2 |
+| Fullscreen / game suppression (`SHQueryUserNotificationState`) | Power | Med | Med | v1.2 |
+| Tray “Next / Previous / Pause / Reveal / Exit” | Automation | High | Low | v1.1 |
+| **Track D — Schedules & shuffle** | | | | |
+| Solar / time-of-day cycles (Dawn→Night) | Dynamic | Med | High | v2.0 |
+| Custom intervals (seconds / hours) | Scheduling | High | Low | v1.1 |
+| Clock-time triggers (e.g. every day 08:00) | Scheduling | Med | Med | v1.2 |
+| Fisher–Yates shuffle deck (no repeats until exhaust) | Playback | High | Low | v1.1 |
+| **Track E — UI / UX polish** | | | | |
+| Responsive preview canvas (aspect-safe resize) | UX | Med | Med | v1.2 |
+| Crossfade feasibility (desktop DC / overlay) | UX | Low | High | v2.0* |
+| Favourite (heart) quick list | Curator | Med | Low | v1.2 |
+| Blacklist / hide without deleting file | Curator | Med | Low | v1.2 |
+| Reveal in File Explorer | Curator | Med | Low | v1.1 |
+| Set as Lock Screen (WinRT) | Curator | Med | High | v2.0 |
+| Acrylic / Mica backdrop (Win11) | Aesthetic | Low | High | v2.0 |
+| Branded icon (Framed Landscape / Aperture & Folder / Floating Displays) | Branding | Med | Low | v1.1 |
+
+\*Crossfade on the **actual** Windows desktop is poorly supported without shell hacks; treat as research spike in v2.0, not a committed ship item. In-app preview crossfade is feasible earlier if desired.
+
+### Impact summary (why these versions)
+
+- **v1.1** ships the “silent companion” story notes_001 asked for (tray, reveal, resilient offline skips, honest shuffle, flexible intervals) without rewriting wallpaper plumbing.
+- **v1.2** delivers the tagline’s multi-folder promise (playlists) plus curator tools and power awareness.
+- **v2.0** is the display-topology and Fluent leap: COM per-monitor, collections/tags, solar cycles, lock screen, Mica.
+
+---
+
+## 2. Architectural Blueprints & Code Snippets
+
+All samples use British English comments and align with today’s shapes: `DesktopVista(ctk.CTk)`, `self.after` / `self.after_cancel`, `self.images` / `self.index`, `set_windows_wallpaper`, `list_images`, `PREVIEW_W/H`, `load_config` / `save_config`.
+
+### 2.1 `pystray` + CustomTkinter coexistence
+
+**Problem:** `pystray` wants its own blocking icon loop; `customtkinter` owns the main thread via `mainloop()`. Running both on one thread deadlocks.
+
+**Pattern:** Keep Tk on the main thread. Run the tray icon in a **daemon** thread. Route every tray action back onto Tk with `self.after(0, …)` so UI and wallpaper calls stay thread-safe.
+
+```python
+# Illustrative pattern for Desktop Vista — embed in desktop_vista.py later;
+# do not treat as a drop-in rewrite of the current file.
+
+import threading
+from PIL import Image as PilImage  # tray needs a small RGBA icon
+
+try:
+    import pystray
+    from pystray import MenuItem as Item
+except ImportError:
+    pystray = None
+
+
+class DesktopVistaTrayMixin:
+    """Coexists with DesktopVista's existing self.after slideshow jobs."""
+
+    def _start_tray(self) -> None:
+        if pystray is None:
+            self._set_status("Install pystray for system-tray support.")
+            return
+
+        # Prefer a branded .ico beside the app; fall back to a tiny placeholder.
+        icon_path = APP_DIR / "assets" / "desktop_vista.ico"
+        if icon_path.exists():
+            image = PilImage.open(icon_path)
+        else:
+            image = PilImage.new("RGBA", (64, 64), (0, 120, 215, 255))
+
+        menu = pystray.Menu(
+            Item(lambda text: self._tray_current_label(), lambda: None, enabled=False),
+            Item("Next wallpaper", lambda: self._tray_call(self._tray_next_and_set)),
+            Item("Previous wallpaper", lambda: self._tray_call(self._tray_prev_and_set)),
+            Item("Pause / Resume slideshow", lambda: self._tray_call(self._toggle_slideshow)),
+            Item("Reveal current in Explorer", lambda: self._tray_call(self._reveal_current)),
+            pystray.Menu.SEPARATOR,
+            Item("Open Desktop Vista", lambda: self._tray_call(self._restore_from_tray)),
+            Item("Exit", lambda: self._tray_call(self._quit_from_tray)),
+        )
+        self._tray_icon = pystray.Icon("desktop_vista", image, APP_NAME, menu)
+        threading.Thread(target=self._tray_icon.run, name="vista-tray", daemon=True).start()
+
+    def _tray_call(self, fn) -> None:
+        # Marshal onto the Tk main loop — never touch widgets from the tray thread.
+        self.after(0, fn)
+
+    def _tray_current_label(self) -> str:
+        if 0 <= self.index < len(self.images):
+            return f"Current: {Path(self.images[self.index]).name}"
+        return "Current: (none)"
+
+    def _tray_next_and_set(self) -> None:
+        self._next()
+        self._set_wallpaper()
+
+    def _tray_prev_and_set(self) -> None:
+        self._prev()
+        self._set_wallpaper()
+
+    def _restore_from_tray(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _on_close(self) -> None:
+        # Replace destroy-on-close with hide-to-tray when tray is active.
+        if getattr(self, "_tray_icon", None) is not None:
+            self._save()
+            self.withdraw()
+            self._set_status("Running in the system tray.")
+            return
+        self._save()
+        self.destroy()
+
+    def _quit_from_tray(self) -> None:
+        self._stop_slideshow()
+        self._save()
+        if getattr(self, "_tray_icon", None) is not None:
+            self._tray_icon.stop()
+        self.destroy()
+```
+
+**CLI:** parse `sys.argv` for `--minimized` before `DesktopVista().mainloop()`; if set, `withdraw()` after `_build_ui` / `_restore_state` and start the tray immediately. Register under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` with a quoted path plus `--minimized`.
+
+**Slideshow note:** Keep using `self.after` (as `_schedule_next` does today). Do not move wallpaper ticks onto the tray thread.
+
+---
+
+### 2.2 Per-monitor wallpaper via `IDesktopWallpaper` (comtypes)
+
+**Problem:** Today’s `set_windows_wallpaper` is intentionally global. Multi-monitor needs `IDesktopWallpaper::SetWallpaper(monitorId, path)`.
+
+**Preferred stack:** `comtypes` (IDL-friendly). Fallback: document a subprocess helper only if COM binding proves fragile — still call COM, never invent a fake shell API.
+
+```python
+# Per-monitor setter — parallel to set_windows_wallpaper(), not a replacement yet.
+# Keep the legacy path for "All monitors (Span / single image)" and v1 styles.
+
+from __future__ import annotations
+
+import comtypes
+import comtypes.client
+from ctypes import POINTER, windll
+from ctypes.wintypes import RECT
+
+# GUIDs from Shobjidl / Windows SDK
+CLSID_DesktopWallpaper = "{C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD}"
+IID_IDesktopWallpaper = "{B92B56A9-8B55-4E14-9A89-0199BBB6F93B}"
+
+
+def _desktop_wallpaper():
+    comtypes.CoInitialize()
+    return comtypes.client.CreateObject(
+        CLSID_DesktopWallpaper, interface=comtypes.gen.DesktopWallpaper.IDesktopWallpaper
+        if hasattr(comtypes, "gen") and hasattr(comtypes.gen, "DesktopWallpaper")
+        else None,
+    )
+
+
+def list_monitor_ids() -> list[str]:
+    """Return monitor device-path IDs for UI mini-cards."""
+    # After generating the interface once with GetModule / GetInterface:
+    #   count = wallpaper.GetMonitorDevicePathCount()
+    #   return [wallpaper.GetMonitorDevicePathAt(i) for i in range(count)]
+    raise NotImplementedError("Wire after comtypes interface generation in v2.0 sprint.")
+
+
+def set_wallpaper_on_monitor(monitor_id: str | None, path: str) -> None:
+    """
+    monitor_id=None → all monitors (similar spirit to today's SPI call).
+    Otherwise set only that display's wallpaper.
+    """
+    wallpaper = comtypes.client.CreateObject(CLSID_DesktopWallpaper)
+    # wallpaper.SetWallpaper(monitor_id, path)
+    # Optionally wallpaper.SetPosition(DWPOS_FILL / FIT / SPAN / ...) mirroring WALLPAPER_STYLES
+    _ = (wallpaper, monitor_id, path)  # placeholder until IDL stubs are generated
+
+
+def safe_set_wallpaper(path: str, style: str, monitor_id: str | None = None) -> None:
+    """
+    Compatibility shim used by UI code:
+    - v1 / single-monitor / Span-all → existing set_windows_wallpaper()
+    - v2 per-monitor → IDesktopWallpaper
+    """
+    if monitor_id is None:
+        set_windows_wallpaper(path, style)  # today's ctypes + Registry path
+        return
+    set_wallpaper_on_monitor(monitor_id, path)
+```
+
+**Topology for mini-cards:** `GetMonitorDevicePathCount` / `GetMonitorDevicePathAt` / `GetMonitorRECT` → normalise RECTs to a bounding box → draw proportional cards in the left panel (or a thin strip above the preview). Map each card to a `monitor_assignments[monitor_id]` entry in config (see §4).
+
+**Panoramic span:** keep today’s Registry `Span` (`WallpaperStyle=22`) for true multi-monitor span images; use per-monitor set only when the user assigns **different** images per display. Ultrawide single displays remain Fill/Fit/Centre on that one ID.
+
+---
+
+### 2.3 Async pre-decode + LRU cache (no UI stutter)
+
+**Problem:** `_show_current` opens, drafts, converts, and thumbnails on the UI thread. Large folders + tray “Next” under slideshow will hitch.
+
+**Pattern:** Worker thread decodes to a `CTkImage`-ready RGB thumbnail; main thread only swaps `self._preview_ref`. Cap memory with an LRU keyed by `(path, mtime, PREVIEW_W, PREVIEW_H)`.
+
+```python
+import queue
+import threading
+from collections import OrderedDict
+from dataclasses import dataclass
+
+
+@dataclass
+class _Decoded:
+    path: str
+    width: int
+    height: int
+    rgb_image: object  # PIL.Image.Image RGB thumbnail
+
+
+class PreviewCache:
+    """Small LRU of preview-sized RGB images — matches PREVIEW_W/H decode policy."""
+
+    def __init__(self, capacity: int = 48) -> None:
+        self.capacity = capacity
+        self._data: OrderedDict[str, _Decoded] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, path: str) -> _Decoded | None:
+        with self._lock:
+            item = self._data.get(path)
+            if item is not None:
+                self._data.move_to_end(path)
+            return item
+
+    def put(self, item: _Decoded) -> None:
+        with self._lock:
+            self._data[item.path] = item
+            self._data.move_to_end(item.path)
+            while len(self._data) > self.capacity:
+                self._data.popitem(last=False)
+
+
+class PreviewDecoder:
+    """
+    Background decode queue. UI calls request(path); results arrive via
+    self.after(0, …) exactly like tray marshalling.
+    """
+
+    def __init__(self, app: "DesktopVista", cache: PreviewCache) -> None:
+        self.app = app
+        self.cache = cache
+        self._q: queue.Queue[str | None] = queue.Queue()
+        self._latest: str | None = None  # drop stale frames if user clicks quickly
+        self._thread = threading.Thread(target=self._worker, name="vista-decode", daemon=True)
+        self._thread.start()
+
+    def request(self, path: str) -> None:
+        hit = self.cache.get(path)
+        if hit is not None:
+            self.app.after(0, lambda: self.app._apply_decoded(hit))
+            return
+        self._latest = path
+        self._q.put(path)
+
+    def _worker(self) -> None:
+        while True:
+            path = self._q.get()
+            if path is None:
+                return
+            try:
+                with Image.open(path) as im:
+                    width, height = im.size
+                    im.draft("RGB", (PREVIEW_W, PREVIEW_H))
+                    im = im.convert("RGB")
+                    im.thumbnail((PREVIEW_W, PREVIEW_H), Image.LANCZOS)
+                    decoded = _Decoded(path, width, height, im.copy())
+                self.cache.put(decoded)
+                # Only apply if this path is still the newest request.
+                if path == self._latest:
+                    self.app.after(0, lambda d=decoded: self.app._apply_decoded(d))
+            except Exception as exc:
+                if path == self._latest:
+                    self.app.after(0, lambda e=exc, p=path: self.app._preview_failed(p, e))
+
+
+# Inside DesktopVista (conceptual):
+#   self._preview_cache = PreviewCache()
+#   self._decoder = PreviewDecoder(self, self._preview_cache)
+#   def _show_current(self):
+#       path = self.images[self.index]
+#       self._decoder.request(path)   # replaces inline Image.open block
+#   def _apply_decoded(self, decoded: _Decoded):
+#       self._preview_ref = ctk.CTkImage(
+#           light_image=decoded.rgb_image, dark_image=decoded.rgb_image,
+#           size=decoded.rgb_image.size)
+#       self.preview.configure(image=self._preview_ref, text="")
+#       ... update meta / _save as today ...
+```
+
+**Prefetch:** on `_next` / slideshow tick, also `request(self.images[(self.index + 1) % n])` so the following frame is warm.
+
+**Fisher–Yates deck (Track D, trivial, ship in v1.1):**
+
+```python
+def _rebuild_shuffle_deck(self) -> None:
+    self._shuffle_deck = list(range(len(self.images)))
+    # In-place Fisher–Yates — every index once before reshuffle.
+    for i in range(len(self._shuffle_deck) - 1, 0, -1):
+        j = random.randint(0, i)
+        self._shuffle_deck[i], self._shuffle_deck[j] = self._shuffle_deck[j], self._shuffle_deck[i]
+    self._deck_pos = 0
+
+def _random(self) -> None:
+    if not self.images:
+        return
+    if not getattr(self, "_shuffle_deck", None) or self._deck_pos >= len(self._shuffle_deck):
+        self._rebuild_shuffle_deck()
+    # Prefer a different image when possible without breaking the deck contract.
+    self.index = self._shuffle_deck[self._deck_pos]
+    self._deck_pos += 1
+    self._show_current()
+```
+
+Rebuild the deck whenever `_load_folder` / playlist membership changes.
+
+---
+
+## 3. UI/UX Wireframes
+
+Aesthetic: Windows 11 dark mode, blue accent (`ctk` default), rounded `corner_radius=12` frames — unchanged from v1.
+
+### 3.1 Updated dual-pane (v1.2+)
+
+```text
+┌─ Desktop Vista — All my drives. One perfect view. ─────────────────────────┐
+│ ┌─ Control panel (≈300px) ──┐  ┌─ Canvas ─────────────────────────────────┐ │
+│ │ Desktop Vista             │  │  ┌─ Monitor strip (v2) ────────────────┐ │ │
+│ │ All my drives. One …      │  │  │ [■ 1 1920×1080] [■ 2 2560×1440]     │ │ │
+│ │                           │  │  └─────────────────────────────────────┘ │ │
+│ │ WALLPAPER FOLDERS          │  │                                         │ │
+│ │ [ D:\Wallpapers      ▾ ]  │  │         ┌─────────────────────┐         │ │
+│ │ [+ Add]  [Remove]         │  │         │                     │         │ │
+│ │                           │  │         │   16:9 PREVIEW      │         │ │
+│ │ PLAYLISTS          [Edit] │  │         │   (responsive box)  │         │ │
+│ │ [ All Drives Mix   ▾ ]    │  │         │                     │         │ │
+│ │ ○ Folder only  ● Playlist │  │         └─────────────────────┘         │ │
+│ │                           │  │  glow13.jpg · 3840×2160 · 4.2 MB · 3/120│ │
+│ │ FIT STYLE  [ Fill    ▾ ]  │  │                                         │ │
+│ │ TARGET     [ All / M1 ▾]  │  │  [♡ Fav] [Reveal] [Hide]               │ │
+│ │                           │  │  [ ← Previous ] [ Random ] [ Next → ]   │ │
+│ │ [  Set as Wallpaper  ]    │  │                                         │ │
+│ │                           │  └─────────────────────────────────────────┘ │
+│ │ SLIDESHOW                 │                                              │
+│ │ Interval [ 15 minutes ▾]  │   (Custom… opens seconds / clock dialog)     │
+│ │ [x] Shuffle (fair deck)   │                                              │
+│ │ [ Start Slideshow ]       │                                              │
+│ │ Status: Slideshow running │                                              │
+│ └───────────────────────────┘                                              │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 Monitor selector mini-cards (Mermaid — v2.0)
+
+```mermaid
+flowchart LR
+  subgraph Strip["Monitor topology strip"]
+    M1["Monitor 1<br/>1920×1080<br/>primary"]
+    M2["Monitor 2<br/>2560×1440"]
+    ALL["All / Span"]
+  end
+  Strip --> Preview["Preview canvas shows<br/>selected target's image"]
+  M1 --> Assign1["config.monitor_assignments[id1]"]
+  M2 --> Assign2["config.monitor_assignments[id2]"]
+  ALL --> Legacy["set_windows_wallpaper()"]
+```
+
+Selected card: blue accent border; offline / disconnected: grey “(offline)” badge (same language as offline folders).
+
+### 3.3 Playlist manager dialog (v1.2)
+
+```text
+┌─ Playlist Manager ──────────────────────────────────────┐
+│ Playlists                          Sources              │
+│ ┌──────────────────┐               ┌──────────────────┐ │
+│ │ All Drives Mix * │               │ ☑ D:\Wallpapers  │ │
+│ │ Nature Only      │               │ ☑ E:\4K\Nature   │ │
+│ │ + New playlist   │               │ ☐ F:\Archive     │ │
+│ └──────────────────┘               │   (offline)      │ │
+│ Name: [ All Drives Mix         ]   └──────────────────┘ │
+│ [ Include tagged: Nature ▾ ]  (v2 — disabled until tags)│
+│                              [ Save ]  [ Close ]        │
+└─────────────────────────────────────────────────────────┘
+```
+
+Slideshow source radio (sidebar): **Folder only** (v1 behaviour) vs **Active playlist** (union of `list_images` across members, de-duplicated, offline paths skipped).
+
+### 3.4 System tray menu (v1.1)
+
+```text
+  🖼 Desktop Vista
+  ─────────────────────
+  Current: Windows 11 - Glow13.jpg
+  Next wallpaper
+  Previous wallpaper
+  Pause / Resume slideshow
+  Reveal current in Explorer
+  ─────────────────────
+  Open Desktop Vista
+  Exit
+```
+
+### 3.5 Information architecture (Mermaid)
+
+```mermaid
+flowchart TB
+  subgraph UI["CustomTkinter main thread"]
+    Sidebar[Control panel]
+    Canvas[Preview canvas]
+    AfterJobs["self.after slideshow + UI marshaling"]
+  end
+  subgraph BG["Daemon / worker threads"]
+    Tray[pystray icon loop]
+    Decode[PreviewDecoder worker]
+  end
+  subgraph OS["Windows"]
+    SPI[SystemParametersInfoW + Registry]
+    COM[IDesktopWallpaper COM]
+    Power[GetSystemPowerStatus]
+    QUNS[SHQueryUserNotificationState]
+  end
+  Tray -->|after 0| AfterJobs
+  Decode -->|after 0| Canvas
+  Sidebar --> AfterJobs
+  AfterJobs --> SPI
+  AfterJobs --> COM
+  AfterJobs --> Power
+  AfterJobs --> QUNS
+```
+
+---
+
+## 4. Configuration Schema v2
+
+### 4.1 Full example (illustrative)
+
+```json
+{
+  "schema_version": 2,
+
+  "folders": [
+    "D:\\Wallpapers\\Landscapes",
+    "E:\\Media\\Desktop Backgrounds"
+  ],
+  "current_folder": "D:\\Wallpapers\\Landscapes",
+  "current_image": "D:\\Wallpapers\\Landscapes\\example_widescreen.jpg",
+  "style": "Fill",
+  "interval": "15 minutes",
+  "shuffle": true,
+
+  "interval_custom_seconds": null,
+  "interval_clock_times": [],
+
+  "playback_source": "folder",
+  "active_playlist_id": null,
+  "playlists": [
+    {
+      "id": "pl_all_drives",
+      "name": "All Drives Mix",
+      "folder_paths": [
+        "D:\\Wallpapers\\Landscapes",
+        "E:\\Media\\Desktop Backgrounds"
+      ],
+      "collection_ids": []
+    }
+  ],
+
+  "monitor_assignments": {},
+  "wallpaper_target": "all",
+
+  "tray": {
+    "enabled": true,
+    "start_minimized": false,
+    "close_to_tray": true,
+    "run_at_startup": false
+  },
+
+  "power": {
+    "pause_on_battery_saver": true,
+    "throttle_seconds_on_battery": 1800,
+    "suppress_when_fullscreen": true
+  },
+
+  "tags": {},
+  "collections": [],
+  "favourites": [],
+  "blacklist": [],
+
+  "solar": {
+    "enabled": false,
+    "latitude": null,
+    "longitude": null,
+    "slots": {
+      "dawn": null,
+      "day": null,
+      "dusk": null,
+      "night": null
+    }
+  }
+}
+```
+
+### 4.2 Key reference
+
+| Key | Type | Version | Notes |
+| :--- | :--- | :---: | :--- |
+| `folders` | `string[]` | v1 | **Preserved.** Absolute wallpaper directories. |
+| `current_folder` | `string \| null` | v1 | **Preserved.** Sidebar selection. |
+| `current_image` | `string \| null` | v1 | **Preserved.** Restored on launch. |
+| `style` | `string` | v1 | **Preserved.** `Fill` / `Fit` / `Stretch` / `Centre` / `Span`. |
+| `interval` | `string` | v1 | **Preserved.** Label from `SLIDESHOW_INTERVALS` or `"Custom"`. |
+| `shuffle` | `boolean` | v1 | **Preserved.** Fair deck when true (v1.1+). |
+| `schema_version` | `number` | v2 | Optional; default assume `1` if missing. |
+| `interval_custom_seconds` | `number \| null` | v2 | When `interval == "Custom"`. |
+| `interval_clock_times` | `string[]` | v2 | `"HH:MM"` 24h local times (v1.2). |
+| `playback_source` | `"folder" \| "playlist"` | v2 | Default `"folder"` = v1 behaviour. |
+| `playlists` | `object[]` | v2 | Named unions of folder paths (+ later collections). |
+| `active_playlist_id` | `string \| null` | v2 | Ignored unless `playback_source == "playlist"`. |
+| `monitor_assignments` | `object` | v2 | `{ "<monitorId>": { "image": "...", "style": "Fill" } }`. |
+| `wallpaper_target` | `"all" \| string` | v2 | `"all"` → legacy SPI; else monitor id. |
+| `tray.*` | `object` | v2 | Tray / startup preferences. |
+| `power.*` | `object` | v2 | Battery + fullscreen policies. |
+| `tags` | `object` | v2 | `{ "<abs-path>": ["Nature", "Dark"] }` non-destructive. |
+| `collections` | `object[]` | v2 | Virtual sets of paths and/or tag queries. |
+| `favourites` / `blacklist` | `string[]` | v2 | Absolute paths; blacklist filtered in `list_images` successors. |
+| `solar.*` | `object` | v2 | Optional; disabled until v2.0 feature flag. |
+
+### 4.3 Backward compatibility
+
+1. **Load:** start from `DEFAULT_CONFIG` (v1 keys), `cfg.update(json)`, then `_migrate_config(cfg)`:
+   - If `schema_version` missing → treat as 1; set `schema_version = 2` in memory but **do not** require new keys.
+   - Missing `tray`, `playlists`, etc. → fill safe defaults (`tray.enabled=False` until user opts in, or `True` once pystray ships — product call; recommend default **enabled** only after tray is stable).
+2. **Save:** always write v1 keys so older builds can still read core state; unknown keys ignored by v1.
+3. **Intervals:** unknown `interval` labels fall back to `"15 minutes"` (mirror today’s `SLIDESHOW_INTERVALS` lookup). Custom seconds live beside the label, not instead of it.
+4. **Folders offline:** keep paths in `folders` / playlists forever; mark UI “(offline)” when `Path.exists()` is false — do not auto-purge (matches “No files are deleted” remove-folder dialogue spirit).
+
+---
+
+## 5. Phased Implementation Roadmap
+
+### Sprint map
+
+```mermaid
+gantt
+    title Desktop Vista feature phases
+    dateFormat  YYYY-MM
+    axisFormat  %b %Y
+    section v1.1
+    Tray + hide-to-tray + Reveal     :a1, 2026-09, 3w
+    Fair shuffle + custom seconds    :a2, 2026-09, 2w
+    Offline skip + folder badges     :a3, 2026-10, 2w
+    Branded icon asset               :a4, 2026-10, 1w
+    section v1.2
+    Playlists + playback_source      :b1, 2026-11, 4w
+    Favourites / blacklist           :b2, 2026-11, 2w
+    Battery + fullscreen suppress    :b3, 2026-12, 2w
+    Responsive preview canvas        :b4, 2026-12, 2w
+    Clock-time triggers              :b5, 2027-01, 2w
+    section v2.0
+    IDesktopWallpaper + topology UI  :c1, 2027-02, 6w
+    Tags + virtual collections       :c2, 2027-03, 4w
+    Solar cycles                     :c3, 2027-04, 3w
+    Lock screen + Mica spike         :c4, 2027-04, 3w
+    Crossfade research spike         :c5, 2027-05, 2w
+```
+
+Dates are indicative planning anchors from September 2026; adjust to team capacity.
+
+### v1.1 — “Silent companion” (dependencies: `pystray`, optional icon file)
+
+| Priority | Item | Depends on |
+| :---: | :--- | :--- |
+| P0 | Tray icon + menu; close/minimise → `withdraw`; Exit quits cleanly | — |
+| P0 | `--minimized` + optional Run-key startup | Tray |
+| P0 | Reveal in Explorer (`explorer /select,"path"`) | — |
+| P1 | Fisher–Yates deck replacing `random.choice` shuffle | — |
+| P1 | Custom interval in seconds (`interval_custom_seconds`) | Config migrate |
+| P1 | Offline-aware `list_images` / slideshow skip + “(offline)” badge | — |
+| P2 | Branded `.ico` from notes_001 concepts (prefer **Floating Displays** or **Framed Landscape** for 32×32 clarity) | Asset design |
+
+**Exit criteria:** slideshow survives window hide; USB-unplugged folder does not crash ticks; shuffle exhausts folder before repeat.
+
+### v1.2 — “All my drives” playlists (dependencies: v1.1 tray stable, schema v2 migrate)
+
+| Priority | Item | Depends on |
+| :---: | :--- | :--- |
+| P0 | Playlist manager + `playback_source` | Schema v2 |
+| P0 | Slideshow builds image list from playlist members | Playlist model |
+| P1 | Favourites + blacklist filters | — |
+| P1 | Battery saver pause/throttle | `GetSystemPowerStatus` |
+| P1 | Fullscreen suppression | `SHQueryUserNotificationState` |
+| P2 | Responsive preview (bind `<Configure>`, letterbox to 16:9) | Decoder cache recommended |
+| P2 | Clock-time interval mode | Scheduler beside `self.after` |
+| P2 | Drive reconnect watcher (poll or `WM_DEVICECHANGE`) | Offline badges |
+
+**Exit criteria:** one playlist spanning two drives; laptop on Battery Saver lengthens or pauses interval; preview scales without distortion.
+
+### v2.0 — “One perfect view” across monitors (dependencies: comtypes tooling, v1.2 playlists)
+
+| Priority | Item | Depends on |
+| :---: | :--- | :--- |
+| P0 | `IDesktopWallpaper` integration + dual path with SPI | COM stubs |
+| P0 | Topology strip + per-monitor assignments in config | COM |
+| P1 | Tags + virtual collections wired into playlists | Schema |
+| P1 | Solar / time-of-day slot playlists | Scheduler |
+| P2 | Lock Screen WinRT setter | Packaging / capabilities |
+| P2 | Acrylic/Mica experiment (may remain optional) | Win11 only |
+| P3 | Desktop crossfade spike — go/no-go report | Research only |
+
+**Exit criteria:** different images on Monitor 1 vs 2; Span-all still uses legacy path; collections filter without copying files.
+
+### Cross-cutting engineering notes
+
+1. **Do not break** `set_windows_wallpaper` until COM path is proven; feature-flag `wallpaper_target`.
+2. Introduce `PreviewDecoder` before responsive canvas and aggressive prefetch — shared dependency.
+3. Keep proprietary copyright header on any new `.py` modules; prefer snippets-in-docs until implementation sprints begin.
+4. `config.json` remains gitignored; update `config.example.json` when schema lands in code.
+5. Stay within Desktop Vista — no coupling to EuroDatabase or other projects.
+
+---
+
+## Appendix A — Branding recommendation (from notes_001)
+
+| Concept | Strength | Best use |
+| :--- | :--- | :--- |
+| Framed Landscape | Instant “wallpaper” readability | Primary app icon / Store tile |
+| Aperture & Folder | Expresses 4K + directories | About dialog / splash |
+| Floating Displays | Matches multi-monitor roadmap | v2 tray + monitor-strip motif |
+
+Generation tip (unchanged): *minimalist flat vector, UI app icon, transparent background, symmetrical* for clean 32×32 tray scaling.
+
+## Appendix B — Gaps / deferred decisions
+
+| Topic | Status |
+| :--- | :--- |
+| Exact comtypes IDL generation script | Deferred to v2.0 implementation spike |
+| Whether tray defaults **on** for upgrades | Product decision at v1.1 RC |
+| Desktop true crossfade | Feasibility unknown — research only |
+| Network share auth / credential prompts | Out of scope; treat like offline if unreadable |
+| Non-Windows platforms | Explicitly unsupported (as today) |
+
+---
+
+*Desktop Vista — All my drives. One perfect view.*  
+*Agent 1 feature innovation deliverable · British English · proprietary product planning document*
