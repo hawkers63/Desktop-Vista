@@ -1,0 +1,32 @@
+# Desktop Vista — local secrets & user config (never commit)
+config.json
+config.json.tmp
+
+# Temporary / backup files
+*.tmp
+*.bak
+
+# Python bytecode & caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Windows thumbnails & folder metadata
+Thumbs.db
+ehthumbs.db
+desktop.ini
+
+# Packaging / build artefacts
+build/
+dist/
+*.spec

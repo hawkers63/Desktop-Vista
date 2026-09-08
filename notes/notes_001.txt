@@ -1,0 +1,40 @@
+### Project: Desktop Vista  
+**Function:** A Lightweight Desktop Wallpapers Manager  
+
+The wallpaper files within this application will primarily conform to a 16:9 aspect ratio and will predominantly be of 4K quality. I recommend that we store the actual wallpapers on separate drives, enabling the application to reference a specific directory with enhanced efficiency.
+
+The application will be designed to manage multiple directories and will include a compact preview of the currently selected wallpaper. Users will have the flexibility to set an individual image as their wallpaper or initiate a slideshow for the entire folder, all of which will be configurable within the application. This functionality aims to enhance the user experience by reducing the necessity to repeatedly access the 'Backgrounds' settings in the Windows Control Panel.
+
+Below is the proposed scope for the application:
+
+- **The Framed Landscape:** A sleek, minimalist representation of a mountain range or ocean horizon enclosed within a glowing 16:9 rectangle, effectively conveying the themes of "landscape wallpapers" and "widescreen."
+
+- **The Aperture & Folder:** A harmonious fusion of a camera lens aperture, symbolising 4K photographic quality, emerging from a sleek, stylised file folder, representing directory management.
+
+- **The Floating Displays:** Two or three translucent, floating 16:9 screens layered atop one another, showcasing vibrant colours against a dark background, in alignment with the modern Windows 11 aesthetic.
+
+**Tip for Generation:** When creating the prompt for the icon, it is advisable to specify a "minimalist flat vector style, UI app icon, transparent background, symmetrical" to ensure effective scaling to a 32x32 pixel taskbar icon without appearing cluttered.
+
+### User Interface (UI) Design  
+A contemporary Python UI library, such as CustomTkinter, is ideally suited for this project due to its dark mode and rounded corners, which seamlessly integrate with the Windows 11 environment.
+
+Here is a proposed layout structure that balances lightweight design with high functionality:
+
+1. **The Dual-Pane Layout**
+
+   - **Left Sidebar (The Control Panel):** Dedicated to navigation and settings.
+     - **Directory Manager:** A scrollable list or dropdown to select the target drive and folder (e.g., smoothly transitioning from D:\ to an external F:\ drive).
+     - **Action Buttons:** Prominent buttons for "Set as Wallpaper" and "Start Slideshow."
+     - **Slideshow Settings:** A user-friendly slider or dropdown to set the interval (e.g., 15 minutes, 1 hour, 1 day) along with a toggle for "Shuffle."
+
+   - **Right Main Area (The Canvas):** Exclusively devoted to visual feedback.
+     - **Preview Frame:** A large, 16:9 scaled preview of the currently selected 4K image.
+     - **File Metadata (Optional):** Small, unobtrusive text beneath the image displaying the filename, resolution, and file size.
+
+2. **Navigation & Workflow**  
+   Below the preview frame, we could incorporate simple "Previous" and "Next" arrow buttons to cycle through the images in the currently selected directory, thereby eliminating the need for a complex thumbnail grid and ensuring the application remains fast and memory-efficient.
+
+3. **The System Tray**  
+   As this application will manage slideshows, it should possess the capability to minimise to the Windows System Tray. This will allow the Python script to operate silently in the background, updating the wallpaper at designated intervals without cluttering the taskbar.
+
+By embracing this structured approach, we can develop an application that not only meets our requirements but also inspires users to enhance their digital workspace.
