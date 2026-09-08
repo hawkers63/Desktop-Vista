@@ -8,7 +8,7 @@
 # See the LICENSE file in the project root for the full proprietary notice.
 """
 Desktop Vista  —  All my drives. One perfect view.
-Version 1.1 hardened  (September 2026)
+Version 1.2-dev  (September 2026)
 
 A lightweight Windows wallpaper manager.
 
@@ -16,7 +16,7 @@ Location : D:\\Desktop_Vista\\desktop_vista.py
 Config   : D:\\Desktop_Vista\\config.json  (created automatically)
 
 Requirements (run once):
-    pip install customtkinter pillow
+    pip install customtkinter pillow pystray
 
 Features in v1.1 (hardened):
     - Manage any number of wallpaper folders across any drives
@@ -30,7 +30,14 @@ Features in v1.1 (hardened):
     - EXIF orientation correction; dynamic preview resize; richer shortcuts
     - Remembers folders, style, interval, shuffle and last image
 
-Planned for v2: minimise to system tray (pystray), multi-monitor.
+New in v1.2 (in progress):
+    - System tray icon (pystray): close hides to tray instead of quitting
+    - Tray menu: current image, Next/Previous, Pause/Resume slideshow,
+      Reveal in Explorer, Open Desktop Vista, Exit
+
+Still to come in v1.2: --minimized startup flag, custom interval in
+seconds, offline-aware folder badges, branded tray icon.
+Planned for v2: multi-monitor (IDesktopWallpaper COM).
 """
 
 from __future__ import annotations
@@ -40,6 +47,7 @@ import json
 import logging
 import os
 import random
+import subprocess
 import sys
 import tempfile
 import threading
@@ -58,8 +66,13 @@ try:
 except ImportError:
     winreg = None  # type: ignore[assignment]
 
+try:
+    import pystray
+except ImportError:
+    pystray = None  # type: ignore[assignment]
+
 import customtkinter as ctk
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps
 from tkinter import filedialog, messagebox
 
 # ---------------------------------------------------------------------------
@@ -115,6 +128,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "style": "Fill",
     "interval": "15 minutes",
     "shuffle": False,
+    "tray": {"enabled": True, "close_to_tray": True},
 }
 
 
@@ -183,6 +197,18 @@ def _validate_config(raw: dict) -> dict[str, Any]:
         cfg["shuffle"] = shuffle
     else:
         log.warning("Invalid 'shuffle' in config; using default.")
+
+    tray = raw.get("tray", DEFAULT_CONFIG["tray"])
+    if isinstance(tray, dict):
+        cfg["tray"] = {
+            "enabled": bool(tray.get("enabled", DEFAULT_CONFIG["tray"]["enabled"])),
+            "close_to_tray": bool(
+                tray.get("close_to_tray", DEFAULT_CONFIG["tray"]["close_to_tray"])
+            ),
+        }
+    else:
+        log.warning("Invalid 'tray' in config; using default.")
+        cfg["tray"] = dict(DEFAULT_CONFIG["tray"])
 
     return cfg
 
@@ -331,6 +357,36 @@ def _load_preview_image(path: str, max_w: int, max_h: int) -> tuple[Image.Image,
     return out, width, height
 
 
+def build_tray_icon_image(size: int = 64) -> Image.Image:
+    """
+    Procedural placeholder tray icon: a minimalist framed 16:9 landscape.
+
+    Stands in for the branded .ico (v1.2 P2, notes_001 concepts) until that
+    asset exists — keeps the tray feature unblocked by icon design work.
+    """
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    margin = max(size // 8, 2)
+    frame = (margin, margin, size - margin, size - margin)
+    draw.rounded_rectangle(frame, radius=max(size // 10, 2), outline=(58, 141, 222, 255),
+                            width=max(size // 16, 2))
+    horizon_y = margin + int((frame[3] - frame[1]) * 0.62)
+    draw.line((frame[0] + 2, horizon_y, frame[2] - 2, horizon_y),
+              fill=(58, 141, 222, 255), width=max(size // 24, 1))
+    peak_h = int((frame[3] - frame[1]) * 0.32)
+    base_y = horizon_y
+    peak_x = frame[0] + int((frame[2] - frame[0]) * 0.38)
+    draw.polygon(
+        [
+            (frame[0] + int((frame[2] - frame[0]) * 0.18), base_y),
+            (peak_x, base_y - peak_h),
+            (frame[0] + int((frame[2] - frame[0]) * 0.58), base_y),
+        ],
+        fill=(58, 141, 222, 255),
+    )
+    return img
+
+
 # ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
@@ -356,10 +412,13 @@ class DesktopVista(ctk.CTk):
         self._preview_size: tuple[int, int] = (PREVIEW_W, PREVIEW_H)
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dv-img")
         self._closing = False
+        self.tray_icon: Any = None
+        self._tray_thread: Optional[threading.Thread] = None
 
         self._build_ui()
         self._restore_state()
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.protocol("WM_DELETE_WINDOW", self._on_close_request)
+        self._init_tray()
 
     # ---------------- UI construction ----------------
 
@@ -825,6 +884,99 @@ class DesktopVista(ctk.CTk):
         if update_status:
             self._set_status("Slideshow stopped.")
 
+    # ---------------- System tray ----------------
+
+    def _tray_available(self) -> bool:
+        return pystray is not None and sys.platform == "win32"
+
+    def _init_tray(self) -> None:
+        if not self._tray_available():
+            return
+        if not self.cfg.get("tray", {}).get("enabled", True):
+            return
+        try:
+            self._start_tray_icon()
+        except Exception as exc:
+            log.warning("Tray icon unavailable, falling back to normal close: %s", exc)
+            self.tray_icon = None
+
+    def _tray_menu_items(self) -> tuple:
+        if 0 <= self.index < len(self.images):
+            current_name = f"Current: {Path(self.images[self.index]).name}"
+        else:
+            current_name = "Current: (none)"
+        slideshow_running = self._slideshow_job is not None
+        return (
+            pystray.MenuItem(current_name, None, enabled=False),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Open Desktop Vista", self._on_tray_restore, default=True),
+            pystray.MenuItem("Next Wallpaper", self._on_tray_next),
+            pystray.MenuItem("Previous Wallpaper", self._on_tray_prev),
+            pystray.MenuItem(
+                "Pause Slideshow" if slideshow_running else "Resume Slideshow",
+                self._on_tray_toggle_slideshow,
+            ),
+            pystray.MenuItem("Reveal in Explorer", self._on_tray_reveal),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Exit", self._on_tray_exit),
+        )
+
+    def _start_tray_icon(self) -> None:
+        if self.tray_icon is not None:
+            return
+        image = build_tray_icon_image()
+        menu = pystray.Menu(self._tray_menu_items)
+        self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
+        self._tray_thread = threading.Thread(
+            target=self.tray_icon.run, name="dv-tray", daemon=True
+        )
+        self._tray_thread.start()
+
+    def _stop_tray_icon(self) -> None:
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
+
+    # pystray invokes these on its own thread — always marshal back onto Tk's.
+    def _on_tray_restore(self, _icon=None, _item=None) -> None:
+        self.after(0, self._tray_restore)
+
+    def _tray_restore(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def _on_tray_next(self, _icon=None, _item=None) -> None:
+        self.after(0, self._next)
+
+    def _on_tray_prev(self, _icon=None, _item=None) -> None:
+        self.after(0, self._prev)
+
+    def _on_tray_toggle_slideshow(self, _icon=None, _item=None) -> None:
+        self.after(0, self._toggle_slideshow)
+
+    def _on_tray_reveal(self, _icon=None, _item=None) -> None:
+        self.after(0, self._reveal_current_in_explorer)
+
+    def _reveal_current_in_explorer(self) -> None:
+        if not (0 <= self.index < len(self.images)):
+            self._set_status("Nothing to reveal.")
+            return
+        path = self.images[self.index]
+        try:
+            # Windows paths cannot contain '"', so this cannot break out of
+            # the /select argument; no shell is involved (shell=False).
+            subprocess.Popen(f'explorer /select,"{path}"')
+        except OSError as exc:
+            log.warning("Reveal in Explorer failed: %s", exc)
+            self._set_status("Could not open Explorer.")
+
+    def _on_tray_exit(self, _icon=None, _item=None) -> None:
+        self.after(0, self._on_close)
+
     # ---------------- Close ----------------
 
     def _cancel_after_jobs(self) -> None:
@@ -837,11 +989,20 @@ class DesktopVista(ctk.CTk):
                     pass
                 setattr(self, attr, None)
 
+    def _on_close_request(self) -> None:
+        """Handle the window's close button: hide to tray if it's running."""
+        if self.tray_icon is not None and self.cfg.get("tray", {}).get("close_to_tray", True):
+            self._flush_save()
+            self.withdraw()
+        else:
+            self._on_close()
+
     def _on_close(self) -> None:
         self._closing = True
         self._load_token += 1  # invalidate in-flight preview loads
         self._cancel_after_jobs()
         self._write_config()
+        self._stop_tray_icon()
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:

@@ -79,11 +79,37 @@ def test_load_config_valid_values_kept(tmp_path):
         "style": "Centre",
         "interval": "1 hour",
         "shuffle": True,
+        "tray": {"enabled": False, "close_to_tray": False},
     }
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps(payload), encoding="utf-8")
     cfg = dv.load_config(cfg_path)
     assert cfg == payload
+
+
+# ---------------------------------------------------------------------------
+# tray config
+# ---------------------------------------------------------------------------
+
+def test_load_config_tray_defaults_when_missing(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"folders": ["/a"]}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["tray"] == {"enabled": True, "close_to_tray": True}
+
+
+def test_load_config_tray_invalid_type_falls_back(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"tray": "not-a-dict"}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["tray"] == {"enabled": True, "close_to_tray": True}
+
+
+def test_load_config_tray_partial_keys_filled(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"tray": {"enabled": False}}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["tray"] == {"enabled": False, "close_to_tray": True}
 
 
 # ---------------------------------------------------------------------------
@@ -244,3 +270,18 @@ def test_wallpaper_cache_key_stable(tmp_path):
     k2 = dv.wallpaper_cache_key(p)
     assert k1 == k2
     assert len(k1) == 32
+
+
+# ---------------------------------------------------------------------------
+# Tray icon image
+# ---------------------------------------------------------------------------
+
+def test_build_tray_icon_image_default_size():
+    img = dv.build_tray_icon_image()
+    assert img.size == (64, 64)
+    assert img.mode == "RGBA"
+
+
+def test_build_tray_icon_image_custom_size():
+    img = dv.build_tray_icon_image(32)
+    assert img.size == (32, 32)

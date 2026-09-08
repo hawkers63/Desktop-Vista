@@ -7,5 +7,9 @@
   "current_image": "D:\\Wallpapers\\Landscapes\\example_widescreen.jpg",
   "style": "Fill",
   "interval": "15 minutes",
-  "shuffle": false
+  "shuffle": false,
+  "tray": {
+    "enabled": true,
+    "close_to_tray": true
+  }
 }

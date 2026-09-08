@@ -49,6 +49,7 @@ The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to previ
 - **Fit styles** — Fill, Fit, Stretch, Centre, Span (Windows wallpaper registry styles)
 - **Keyboard navigation** — browse and apply without reaching for the mouse
 - **Persistent preferences** — folders, style, interval, shuffle, and last image remembered in `config.json`
+- **System tray** — closing the window hides Desktop Vista to the tray instead of quitting; the tray menu shows the current image and offers Next / Previous, Pause / Resume slideshow, Reveal in Explorer, Open Desktop Vista, and Exit
 
 ---
 
@@ -56,7 +57,7 @@ The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to previ
 
 - Windows 10 or Windows 11
 - Python **3.10+**
-- [`customtkinter`](https://github.com/TomSchimansky/CustomTkinter) and [`Pillow`](https://python-pillow.org/)
+- [`customtkinter`](https://github.com/TomSchimansky/CustomTkinter), [`Pillow`](https://python-pillow.org/), and [`pystray`](https://github.com/moses-palmer/pystray) (tray icon; the app still runs without it, but closing the window quits instead of minimising to tray)
 
 ---
 
@@ -67,7 +68,7 @@ The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to previ
 3. Install dependencies:
 
 ```powershell
-pip install customtkinter pillow
+pip install customtkinter pillow pystray
 ```
 
 4. Copy the example configuration and edit it for your machine:
@@ -98,6 +99,8 @@ python desktop_vista.py
 
 Use the sidebar to add folders, choose fit style, set slideshow interval, toggle shuffle, and start or stop the slideshow. Previous / Random / Next buttons under the preview mirror the keyboard actions.
 
+Closing the window (✕) hides Desktop Vista to the system tray rather than quitting, as long as the tray icon started successfully. Right-click the tray icon for Open Desktop Vista, Next / Previous, Pause / Resume slideshow, Reveal in Explorer, and Exit — Exit is the way to fully quit while the tray icon is running.
+
 ---
 
 ## Configuration reference
@@ -112,6 +115,8 @@ Settings are stored in `config.json` beside `desktop_vista.py`. Use [`config.exa
 | `style` | `string` | Wallpaper fit style: `Fill`, `Fit`, `Stretch`, `Centre`, or `Span` |
 | `interval` | `string` | Slideshow interval label, e.g. `"15 minutes"` (see app for full list) |
 | `shuffle` | `boolean` | When `true`, slideshow picks images at random |
+| `tray.enabled` | `boolean` | Start the system tray icon (default `true`) |
+| `tray.close_to_tray` | `boolean` | Closing the window hides to tray instead of quitting (default `true`) |
 
 Example (placeholders only):
 
@@ -125,7 +130,11 @@ Example (placeholders only):
   "current_image": "D:\\Wallpapers\\Landscapes\\example_widescreen.jpg",
   "style": "Fill",
   "interval": "15 minutes",
-  "shuffle": false
+  "shuffle": false,
+  "tray": {
+    "enabled": true,
+    "close_to_tray": true
+  }
 }
 ```
 
@@ -147,8 +156,7 @@ Desktop_Vista/
 
 ## Roadmap (planned)
 
-- Minimise to system tray (`pystray`) for silent slideshows
-- Multi-monitor wallpaper routing
+See [`ROADMAP.md`](ROADMAP.md) for the full four-release plan (v1.2 → v1.5) — tray/background automation, cross-drive playlists, power awareness, and monitor-topology groundwork ahead of the v2.0 multi-monitor rewrite.
 
 ---
 
