@@ -50,6 +50,7 @@ The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to previ
 - **Keyboard navigation** — browse and apply without reaching for the mouse
 - **Persistent preferences** — folders, style, interval, shuffle, and last image remembered in `config.json`
 - **System tray** — closing the window hides Desktop Vista to the tray instead of quitting; the tray menu shows the current image and offers Next / Previous, Pause / Resume slideshow, Reveal in Explorer, Open Desktop Vista, and Exit
+- **Start with Windows** — an optional Run-key entry launches Desktop Vista minimised to the tray at login (`--minimized` flag)
 
 ---
 
@@ -117,6 +118,7 @@ Settings are stored in `config.json` beside `desktop_vista.py`. Use [`config.exa
 | `shuffle` | `boolean` | When `true`, slideshow picks images at random |
 | `tray.enabled` | `boolean` | Start the system tray icon (default `true`) |
 | `tray.close_to_tray` | `boolean` | Closing the window hides to tray instead of quitting (default `true`) |
+| `tray.run_at_startup` | `boolean` | Launch Desktop Vista minimised at Windows login (Run key); reflects the actual registry state, not just this file (default `false`) |
 
 Example (placeholders only):
 
@@ -133,7 +135,8 @@ Example (placeholders only):
   "shuffle": false,
   "tray": {
     "enabled": true,
-    "close_to_tray": true
+    "close_to_tray": true,
+    "run_at_startup": false
   }
 }
 ```

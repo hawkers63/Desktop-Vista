@@ -79,7 +79,7 @@ def test_load_config_valid_values_kept(tmp_path):
         "style": "Centre",
         "interval": "1 hour",
         "shuffle": True,
-        "tray": {"enabled": False, "close_to_tray": False},
+        "tray": {"enabled": False, "close_to_tray": False, "run_at_startup": True},
     }
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -95,21 +95,113 @@ def test_load_config_tray_defaults_when_missing(tmp_path):
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps({"folders": ["/a"]}), encoding="utf-8")
     cfg = dv.load_config(cfg_path)
-    assert cfg["tray"] == {"enabled": True, "close_to_tray": True}
+    assert cfg["tray"] == {"enabled": True, "close_to_tray": True, "run_at_startup": False}
 
 
 def test_load_config_tray_invalid_type_falls_back(tmp_path):
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps({"tray": "not-a-dict"}), encoding="utf-8")
     cfg = dv.load_config(cfg_path)
-    assert cfg["tray"] == {"enabled": True, "close_to_tray": True}
+    assert cfg["tray"] == {"enabled": True, "close_to_tray": True, "run_at_startup": False}
 
 
 def test_load_config_tray_partial_keys_filled(tmp_path):
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps({"tray": {"enabled": False}}), encoding="utf-8")
     cfg = dv.load_config(cfg_path)
-    assert cfg["tray"] == {"enabled": False, "close_to_tray": True}
+    assert cfg["tray"] == {"enabled": False, "close_to_tray": True, "run_at_startup": False}
+
+
+# ---------------------------------------------------------------------------
+# Startup (Run key) — command building is pure; registry access is mocked
+# ---------------------------------------------------------------------------
+
+def test_build_startup_command_prefers_pythonw(tmp_path):
+    python_exe = tmp_path / "python.exe"
+    python_exe.write_bytes(b"")
+    pythonw_exe = tmp_path / "pythonw.exe"
+    pythonw_exe.write_bytes(b"")
+    script = tmp_path / "desktop_vista.py"
+
+    cmd = dv.build_startup_command(str(python_exe), str(script))
+
+    assert str(pythonw_exe) in cmd
+    assert str(script) in cmd
+    assert "--minimized" in cmd
+
+
+def test_build_startup_command_falls_back_without_pythonw(tmp_path):
+    python_exe = tmp_path / "python.exe"
+    python_exe.write_bytes(b"")
+    script = tmp_path / "desktop_vista.py"
+
+    cmd = dv.build_startup_command(str(python_exe), str(script))
+
+    assert str(python_exe) in cmd
+    assert "--minimized" in cmd
+
+
+class _FakeRegKey:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+
+def _patch_fake_registry(monkeypatch, store: dict):
+    """Redirect dv.winreg calls to an in-memory dict instead of the real registry."""
+    monkeypatch.setattr(dv.winreg, "OpenKey", lambda *a, **k: _FakeRegKey())
+
+    def fake_query(_key, name):
+        if name not in store:
+            raise FileNotFoundError(name)
+        return store[name], 1
+
+    def fake_set(_key, name, _reserved, _type, value):
+        store[name] = value
+
+    def fake_delete(_key, name):
+        if name not in store:
+            raise FileNotFoundError(name)
+        del store[name]
+
+    monkeypatch.setattr(dv.winreg, "QueryValueEx", fake_query)
+    monkeypatch.setattr(dv.winreg, "SetValueEx", fake_set)
+    monkeypatch.setattr(dv.winreg, "DeleteValue", fake_delete)
+
+
+@pytest.mark.skipif(dv.winreg is None, reason="registry tests require Windows winreg")
+def test_is_startup_enabled_false_when_absent(monkeypatch):
+    _patch_fake_registry(monkeypatch, {})
+    assert dv.is_startup_enabled() is False
+
+
+@pytest.mark.skipif(dv.winreg is None, reason="registry tests require Windows winreg")
+def test_set_startup_enabled_true_then_detected(monkeypatch):
+    store: dict = {}
+    _patch_fake_registry(monkeypatch, store)
+    dv.set_startup_enabled(True)
+    assert dv.STARTUP_VALUE_NAME in store
+    assert "--minimized" in store[dv.STARTUP_VALUE_NAME]
+    assert dv.is_startup_enabled() is True
+
+
+@pytest.mark.skipif(dv.winreg is None, reason="registry tests require Windows winreg")
+def test_set_startup_enabled_false_removes_entry(monkeypatch):
+    store = {dv.STARTUP_VALUE_NAME: "existing command"}
+    _patch_fake_registry(monkeypatch, store)
+    dv.set_startup_enabled(False)
+    assert dv.STARTUP_VALUE_NAME not in store
+    assert dv.is_startup_enabled() is False
+
+
+@pytest.mark.skipif(dv.winreg is None, reason="registry tests require Windows winreg")
+def test_set_startup_enabled_false_when_already_absent_is_noop(monkeypatch):
+    store: dict = {}
+    _patch_fake_registry(monkeypatch, store)
+    dv.set_startup_enabled(False)
+    assert dv.STARTUP_VALUE_NAME not in store
 
 
 # ---------------------------------------------------------------------------

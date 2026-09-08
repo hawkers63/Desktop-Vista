@@ -34,9 +34,10 @@ New in v1.2 (in progress):
     - System tray icon (pystray): close hides to tray instead of quitting
     - Tray menu: current image, Next/Previous, Pause/Resume slideshow,
       Reveal in Explorer, Open Desktop Vista, Exit
+    - --minimized launch flag + "Start with Windows" Run-key toggle
 
-Still to come in v1.2: --minimized startup flag, custom interval in
-seconds, offline-aware folder badges, branded tray icon.
+Still to come in v1.2: custom interval in seconds, offline-aware folder
+badges, branded tray icon.
 Planned for v2: multi-monitor (IDesktopWallpaper COM).
 """
 
@@ -128,8 +129,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "style": "Fill",
     "interval": "15 minutes",
     "shuffle": False,
-    "tray": {"enabled": True, "close_to_tray": True},
+    "tray": {"enabled": True, "close_to_tray": True, "run_at_startup": False},
 }
+
+STARTUP_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_VALUE_NAME = "DesktopVista"
 
 
 # ---------------------------------------------------------------------------
@@ -204,6 +208,9 @@ def _validate_config(raw: dict) -> dict[str, Any]:
             "enabled": bool(tray.get("enabled", DEFAULT_CONFIG["tray"]["enabled"])),
             "close_to_tray": bool(
                 tray.get("close_to_tray", DEFAULT_CONFIG["tray"]["close_to_tray"])
+            ),
+            "run_at_startup": bool(
+                tray.get("run_at_startup", DEFAULT_CONFIG["tray"]["run_at_startup"])
             ),
         }
     else:
@@ -344,6 +351,51 @@ def set_windows_wallpaper(path: str, style: str) -> None:
         raise ctypes.WinError()
 
 
+def build_startup_command(python_exe: str, script_path: str) -> str:
+    """
+    Build the Run-key command line to relaunch Desktop Vista minimised.
+
+    Prefers ``pythonw.exe`` beside *python_exe* (no console flash on login);
+    falls back to *python_exe* itself if pythonw isn't present alongside it.
+    """
+    exe = python_exe
+    pythonw = Path(python_exe).with_name("pythonw.exe")
+    if pythonw.is_file():
+        exe = str(pythonw)
+    return f'"{exe}" "{script_path}" --minimized'
+
+
+def is_startup_enabled() -> bool:
+    """Return True if a Desktop Vista Run-key startup entry exists."""
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, STARTUP_KEY_PATH, 0, winreg.KEY_READ
+        ) as key:
+            winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
+        return True
+    except OSError:
+        return False
+
+
+def set_startup_enabled(enabled: bool) -> None:
+    """Create or remove the Desktop Vista Run-key startup entry."""
+    if winreg is None:
+        raise RuntimeError("Windows registry (winreg) is unavailable.")
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, STARTUP_KEY_PATH, 0, winreg.KEY_SET_VALUE
+    ) as key:
+        if enabled:
+            command = build_startup_command(sys.executable, str(APP_DIR / "desktop_vista.py"))
+            winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, command)
+        else:
+            try:
+                winreg.DeleteValue(key, STARTUP_VALUE_NAME)
+            except FileNotFoundError:
+                pass
+
+
 def _load_preview_image(path: str, max_w: int, max_h: int) -> tuple[Image.Image, int, int]:
     """Open *path*, apply EXIF transpose, thumbnail to max box. Returns (rgb, w, h)."""
     with Image.open(path) as im:
@@ -392,8 +444,9 @@ def build_tray_icon_image(size: int = 64) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 class DesktopVista(ctk.CTk):
-    def __init__(self) -> None:
+    def __init__(self, start_minimized: bool = False) -> None:
         super().__init__()
+        self._start_minimized = start_minimized
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
@@ -419,6 +472,12 @@ class DesktopVista(ctk.CTk):
         self._restore_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close_request)
         self._init_tray()
+        self._sync_startup_state()
+        if self._start_minimized:
+            if self.tray_icon is not None:
+                self.withdraw()
+            else:
+                log.warning("--minimized requested but no tray icon is running; showing window.")
 
     # ---------------- UI construction ----------------
 
@@ -484,11 +543,22 @@ class DesktopVista(ctk.CTk):
             command=self._toggle_slideshow)
         self.slide_btn.grid(row=11, column=0, padx=16, pady=(12, 0), sticky="ew")
 
+        # Startup
+        ctk.CTkLabel(side, text="STARTUP", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="gray60").grid(row=12, column=0, padx=16, pady=(24, 0), sticky="w")
+        self.startup_var = ctk.BooleanVar(value=False)
+        self.startup_switch = ctk.CTkSwitch(
+            side, text="Start with Windows (minimised)", variable=self.startup_var,
+            command=self._on_startup_toggle)
+        self.startup_switch.grid(row=13, column=0, padx=16, pady=(4, 0), sticky="w")
+        if winreg is None or sys.platform != "win32":
+            self.startup_switch.configure(state="disabled")
+
         # Status
-        side.grid_rowconfigure(12, weight=1)
+        side.grid_rowconfigure(14, weight=1)
         self.status = ctk.CTkLabel(side, text="Ready.", text_color="gray60",
                                    font=ctk.CTkFont(size=11), wraplength=260, justify="left")
-        self.status.grid(row=13, column=0, padx=16, pady=(0, 14), sticky="sw")
+        self.status.grid(row=15, column=0, padx=16, pady=(0, 14), sticky="sw")
 
         # ---- Right main area: the canvas ----
         self.main = ctk.CTkFrame(self, corner_radius=12)
@@ -884,6 +954,30 @@ class DesktopVista(ctk.CTk):
         if update_status:
             self._set_status("Slideshow stopped.")
 
+    # ---------------- Startup (Run key) ----------------
+
+    def _sync_startup_state(self) -> None:
+        """Reflect the actual registry state in the switch, and reconcile config."""
+        actual = is_startup_enabled()
+        self.startup_var.set(actual)
+        tray_cfg = self.cfg.get("tray", {})
+        if tray_cfg.get("run_at_startup") != actual:
+            self.cfg["tray"] = {**tray_cfg, "run_at_startup": actual}
+            self._schedule_save()
+
+    def _on_startup_toggle(self) -> None:
+        enabled = bool(self.startup_var.get())
+        try:
+            set_startup_enabled(enabled)
+        except Exception as exc:
+            log.warning("Could not update startup entry: %s", exc)
+            self.startup_var.set(not enabled)
+            messagebox.showerror(APP_NAME, f"Could not update Windows startup setting:\n{exc}")
+            return
+        self.cfg["tray"] = {**self.cfg.get("tray", {}), "run_at_startup": enabled}
+        self._schedule_save()
+        self._set_status("Start with Windows: " + ("on" if enabled else "off"))
+
     # ---------------- System tray ----------------
 
     def _tray_available(self) -> bool:
@@ -1014,4 +1108,5 @@ class DesktopVista(ctk.CTk):
 if __name__ == "__main__":
     if sys.platform != "win32":
         print("Desktop Vista is designed for Windows.")
-    DesktopVista().mainloop()
+    start_minimized = "--minimized" in sys.argv[1:]
+    DesktopVista(start_minimized=start_minimized).mainloop()

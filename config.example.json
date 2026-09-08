@@ -10,6 +10,7 @@
   "shuffle": false,
   "tray": {
     "enabled": true,
-    "close_to_tray": true
+    "close_to_tray": true,
+    "run_at_startup": false
   }
 }
