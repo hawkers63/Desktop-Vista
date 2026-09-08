@@ -1,9 +1,9 @@
-# Copyright (c) 2026 hawkers63. All Rights Reserved.
+# Copyright (c) 2026 Mark Hawksworth (https://github.com/hawkers63/). All Rights Reserved.
 #
 # Desktop Vista is proprietary software. Unauthorised copying, reproduction,
 # redistribution, modification, reverse-engineering, or commercial use of this
 # file or any portion of it is strictly prohibited without prior written consent
-# from the copyright holder (hawkers63).
+# from the copyright holder (Mark Hawksworth — https://github.com/hawkers63/).
 #
 # See the LICENSE file in the project root for the full proprietary notice.
 """

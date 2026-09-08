@@ -6,19 +6,37 @@
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white)
 ![Licence](https://img.shields.io/badge/Licence-Proprietary%20%2F%20All%20Rights%20Reserved-red)
 
-A lightweight Windows wallpaper manager built with CustomTkinter. Desktop Vista keeps every wallpaper folder across your drives in one dual-pane workspace, with a memory-efficient 16:9 preview engine so you can browse 4K images without loading them at full resolution.
+A lightweight Windows wallpaper manager built with CustomTkinter. Desktop Vista gathers wallpaper folders from every local and external drive into one dual-pane workspace, and pairs that with a memory-efficient 16:9 preview engine so you can browse large (including 4K) images without decoding them at full resolution.
 
 ---
 
 ## Why Desktop Vista?
 
-Windows Background settings are awkward when your wallpapers live on several disks. Desktop Vista exists so you can:
+Windows Background settings become awkward when wallpapers live across several disks. Desktop Vista exists so you can:
 
-- Organise folders on any local or external drive from a single control panel
-- Preview images instantly in a fixed 16:9 frame (decoded straight to preview size, not full 4K)
-- Set a wallpaper or run a folder slideshow without opening the Control Panel again and again
+- Keep every wallpaper folder — internal, USB, or network-mapped — in one control panel
+- Preview candidates instantly in a fixed 16:9 frame (decoded straight to preview size)
+- Apply a single image or run a folder slideshow without returning to the Control Panel
 
-The layout is dual-pane: a left **control panel** for folders, fit style, and slideshow; a right **canvas** for preview, metadata, and Previous / Random / Next navigation.
+The dual-pane layout is intentional: a left **control panel** for folders, fit style, and slideshow; a right **canvas** for preview, metadata, and Previous / Random / Next navigation. Browse on the right; manage sources and timing on the left.
+
+---
+
+## Dual-pane workflow
+
+1. **Add folders** in the left pane (any drive path your machine can read).
+2. **Select a folder** to load its images into the preview canvas.
+3. **Browse** with Previous / Random / Next (or the keyboard shortcuts below).
+4. **Choose a fit style** (Fill, Fit, Stretch, Centre, Span) before applying.
+5. **Set as Wallpaper** for the current image, or start a **slideshow** with your preferred interval and optional shuffle.
+
+Preferences and the last-selected image are restored from `config.json` on the next launch.
+
+---
+
+## Preview engine
+
+The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to preview size rather than loading full-resolution bitmaps into the UI, which keeps memory use low when you walk through large collections. Supported types: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`.
 
 ---
 
@@ -31,8 +49,6 @@ The layout is dual-pane: a left **control panel** for folders, fit style, and sl
 - **Fit styles** — Fill, Fit, Stretch, Centre, Span (Windows wallpaper registry styles)
 - **Keyboard navigation** — browse and apply without reaching for the mouse
 - **Persistent preferences** — folders, style, interval, shuffle, and last image remembered in `config.json`
-
-Supported image types: `.jpg`, `.jpeg`, `.png`, `.bmp`, `.webp`.
 
 ---
 
@@ -138,7 +154,7 @@ Desktop_Vista/
 
 ## Copyright & Licence
 
-**Copyright © 2026 hawkers63. All Rights Reserved.**
+**Copyright © 2026 Mark Hawksworth. All Rights Reserved.**
 
 Desktop Vista and all materials in this repository are proprietary. Unauthorised copying, reproduction, redistribution, modification, reverse-engineering, or commercial use is strictly prohibited without prior written consent from the copyright holder.
 
