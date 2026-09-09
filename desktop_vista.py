@@ -8,7 +8,7 @@
 # See the LICENSE file in the project root for the full proprietary notice.
 """
 Desktop Vista  —  All my drives. One perfect view.
-Version 1.2-dev  (September 2026)
+Version 1.2.1  (September 2026)
 
 A lightweight Windows wallpaper manager.
 
@@ -30,25 +30,49 @@ Features in v1.1 (hardened):
     - EXIF orientation correction; dynamic preview resize; richer shortcuts
     - Remembers folders, style, interval, shuffle and last image
 
-New in v1.2 (in progress):
-    - System tray icon (pystray): close hides to tray instead of quitting
-    - Tray menu: current image, Next/Previous, Pause/Resume slideshow,
-      Reveal in Explorer, Open Desktop Vista, Exit
+New in v1.2 "Silent Companion":
+    - System tray icon (pystray) with the branded Desktop Vista glyph;
+      close hides to tray instead of quitting
+    - Tray menu: current image, Next/Previous (now applies the wallpaper,
+      not just the preview), Pause/Resume slideshow, Reveal in Explorer,
+      Open Desktop Vista, Exit
     - --minimized launch flag + "Start with Windows" Run-key toggle
     - Custom slideshow interval in seconds ("Custom…" + a prompt)
     - Offline-aware folders: "(offline)" badge in the folder dropdown,
       unattended slideshow skips missing files instead of popping a
       blocking error dialog
 
-Still to come in v1.2: branded tray icon.
-Planned for v2: multi-monitor (IDesktopWallpaper COM).
+v1.2.1 hardening addendum (see notes/notes_004.txt review):
+    - Branded window/tray icon loaded from icon/desktop_vista.ico
+    - Fixed a stale-exception NameError risk in the preview error callback
+    - Tray Next/Previous now actually re-apply the wallpaper
+    - Tray startup readiness is tracked explicitly; --minimized falls back
+      to a visible window if the tray failed to come up
+    - Folder switches invalidate any in-flight preview load, even when the
+      new folder is empty
+    - Config defaults are deep-copied (a shared mutable default could leak
+      between validation passes); tray flags require real booleans;
+      non-finite custom intervals are rejected instead of crashing
+    - Config saves use a unique temp file per write, avoiding a rename
+      race between two running instances
+    - Preview decoding reads EXIF orientation before requesting a Pillow
+      draft box, so rotated images still get the fast reduced decode
+    - Shuffle deck advances via a cursor instead of list.pop(0)
+    - "Start with Windows" reflects whether the registry command still
+      matches this install, not just whether some value exists
+
+Planned for v1.3+: cross-drive playlists, then power/context awareness,
+monitor-topology groundwork, and finally multi-monitor (IDesktopWallpaper
+COM) in v2.0 — see ROADMAP.md.
 """
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import subprocess
@@ -94,9 +118,24 @@ log = logging.getLogger("desktop_vista")
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Desktop Vista"
+APP_VERSION = "1.2.1"
 TAGLINE = "All my drives. One perfect view."
-APP_DIR = Path(__file__).resolve().parent
+
+# Frozen (PyInstaller) builds extract bundled files under a temporary
+# sys._MEIPASS directory each run; __file__ there does NOT sit beside the
+# .exe. Config must live next to the real executable so it survives past a
+# single run, while bundled read-only assets (the icon) are read from the
+# extraction dir.
+FROZEN = bool(getattr(sys, "frozen", False))
+if FROZEN:
+    APP_DIR = Path(sys.executable).resolve().parent
+    RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", APP_DIR))
+else:
+    APP_DIR = Path(__file__).resolve().parent
+    RESOURCE_DIR = APP_DIR
+
 CONFIG_PATH = APP_DIR / "config.json"
+BRAND_ICON_PATH = RESOURCE_DIR / "icon" / "desktop_vista.ico"
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 NATIVE_WALLPAPER_EXTS = {".jpg", ".jpeg", ".bmp", ".png"}
@@ -190,6 +229,7 @@ def resolve_interval_seconds(interval_key: str, custom_seconds: Any) -> int:
         if (
             isinstance(custom_seconds, (int, float))
             and not isinstance(custom_seconds, bool)
+            and math.isfinite(custom_seconds)
             and custom_seconds > 0
         ):
             return max(MIN_CUSTOM_INTERVAL_SECONDS, int(custom_seconds))
@@ -199,7 +239,12 @@ def resolve_interval_seconds(interval_key: str, custom_seconds: Any) -> int:
 
 def _validate_config(raw: dict) -> dict[str, Any]:
     """Coerce *raw* into a valid config dict, filling defaults where needed."""
-    cfg = dict(DEFAULT_CONFIG)
+    # Deep-copy: DEFAULT_CONFIG holds nested mutable values (e.g. "folders": []).
+    # A shallow dict(DEFAULT_CONFIG) would share those objects, so a rejected
+    # field (see the "folders" branch below) could leave cfg pointing straight
+    # at the shared default, letting later in-place mutation (e.g. append)
+    # contaminate DEFAULT_CONFIG itself for the rest of the process.
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
 
     folders = raw.get("folders", DEFAULT_CONFIG["folders"])
     if isinstance(folders, list) and all(isinstance(f, str) for f in folders):
@@ -239,6 +284,7 @@ def _validate_config(raw: dict) -> dict[str, Any]:
     elif (
         isinstance(custom_seconds, (int, float))
         and not isinstance(custom_seconds, bool)
+        and math.isfinite(custom_seconds)
         and custom_seconds > 0
     ):
         cfg["interval_custom_seconds"] = int(custom_seconds)
@@ -254,14 +300,12 @@ def _validate_config(raw: dict) -> dict[str, Any]:
 
     tray = raw.get("tray", DEFAULT_CONFIG["tray"])
     if isinstance(tray, dict):
+        tray_defaults = DEFAULT_CONFIG["tray"]
+        # Require a literal bool for each flag — bool(value) would silently
+        # accept "false" (truthy string) or 0/1 as if they were intentional.
         cfg["tray"] = {
-            "enabled": bool(tray.get("enabled", DEFAULT_CONFIG["tray"]["enabled"])),
-            "close_to_tray": bool(
-                tray.get("close_to_tray", DEFAULT_CONFIG["tray"]["close_to_tray"])
-            ),
-            "run_at_startup": bool(
-                tray.get("run_at_startup", DEFAULT_CONFIG["tray"]["run_at_startup"])
-            ),
+            key: tray[key] if isinstance(tray.get(key), bool) else tray_defaults[key]
+            for key in tray_defaults
         }
     else:
         log.warning("Invalid 'tray' in config; using default.")
@@ -286,12 +330,19 @@ def load_config(path: Path | None = None) -> dict[str, Any]:
 
 
 def save_config(cfg: dict, path: Path | None = None) -> None:
-    """Atomically write *cfg* to *path* via a temporary sibling file."""
+    """Atomically write *cfg* to *path* via a unique temporary sibling file."""
     cfg_path = path if path is not None else CONFIG_PATH
-    tmp_path = cfg_path.with_suffix(cfg_path.suffix + ".tmp")
+    # A fixed ".tmp" name would let two instances (or a smoke-test script
+    # relaunched quickly) race on the same temp file; mkstemp guarantees a
+    # unique name per call.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=cfg_path.stem + ".", suffix=".tmp", dir=str(cfg_path.parent)
+    )
+    tmp_path = Path(tmp_name)
     try:
         data = json.dumps(cfg, indent=2)
-        tmp_path.write_text(data, encoding="utf-8")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
         os.replace(tmp_path, cfg_path)
     except OSError as exc:
         log.error("Could not save config: %s", exc)
@@ -405,9 +456,13 @@ def build_startup_command(python_exe: str, script_path: str) -> str:
     """
     Build the Run-key command line to relaunch Desktop Vista minimised.
 
-    Prefers ``pythonw.exe`` beside *python_exe* (no console flash on login);
-    falls back to *python_exe* itself if pythonw isn't present alongside it.
+    In a frozen build, *python_exe* (``sys.executable``) already *is*
+    DesktopVista.exe, so it's invoked directly with no script argument.
+    Otherwise prefers ``pythonw.exe`` beside *python_exe* (no console flash
+    on login), falling back to *python_exe* itself if that's not present.
     """
+    if FROZEN:
+        return f'"{python_exe}" --minimized'
     exe = python_exe
     pythonw = Path(python_exe).with_name("pythonw.exe")
     if pythonw.is_file():
@@ -416,17 +471,25 @@ def build_startup_command(python_exe: str, script_path: str) -> str:
 
 
 def is_startup_enabled() -> bool:
-    """Return True if a Desktop Vista Run-key startup entry exists."""
+    """
+    Return True if the Run-key entry exists AND still matches the command
+    this install would write today.
+
+    A stale entry (Python moved/upgraded, script relocated) is reported as
+    disabled rather than a false "on" that the toggle can't actually turn
+    off cleanly — flipping it re-registers the current, correct command.
+    """
     if winreg is None:
         return False
     try:
         with winreg.OpenKey(
             winreg.HKEY_CURRENT_USER, STARTUP_KEY_PATH, 0, winreg.KEY_READ
         ) as key:
-            winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
-        return True
+            value, _ = winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
     except OSError:
         return False
+    expected = build_startup_command(sys.executable, str(APP_DIR / "desktop_vista.py"))
+    return value == expected
 
 
 def set_startup_enabled(enabled: bool) -> None:
@@ -449,13 +512,22 @@ def set_startup_enabled(enabled: bool) -> None:
 def _load_preview_image(path: str, max_w: int, max_h: int) -> tuple[Image.Image, int, int]:
     """Open *path*, apply EXIF transpose, thumbnail to max box. Returns (rgb, w, h)."""
     with Image.open(path) as im:
-        im = ImageOps.exif_transpose(im)
         width, height = im.size
-        im.draft("RGB", (max_w, max_h))
+        # Read orientation before draft(): draft() can decide to load pixels
+        # at a reduced size immediately, and calling exif_transpose()
+        # afterwards would then rotate a box already sized for the
+        # un-rotated image — request draft with the box swapped for a 90°
+        # rotation so the fast reduced decode still lands close to target.
+        rotated = im.getexif().get(274, 1) in (5, 6, 7, 8)
+        draft_box = (max_h, max_w) if rotated else (max_w, max_h)
+        im.draft("RGB", draft_box)
+        im = ImageOps.exif_transpose(im)
         im = im.convert("RGB")
         im.thumbnail((max_w, max_h), Image.LANCZOS)
         # Copy pixels out of the context manager
         out = im.copy()
+    if rotated:
+        width, height = height, width
     return out, width, height
 
 
@@ -489,6 +561,19 @@ def build_tray_icon_image(size: int = 64) -> Image.Image:
     return img
 
 
+def load_brand_icon(size: int = 64) -> Image.Image:
+    """Load the supplied Desktop Vista glyph for the tray; fall back to the
+    procedural placeholder if the asset is missing or unreadable."""
+    try:
+        with Image.open(BRAND_ICON_PATH) as source:
+            result = source.convert("RGBA")
+        result.thumbnail((size, size), Image.LANCZOS)
+        return result
+    except (OSError, ValueError):
+        log.warning("Brand icon unavailable; using fallback", exc_info=True)
+        return build_tray_icon_image(size)
+
+
 # ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
@@ -512,23 +597,33 @@ class DesktopVista(ctk.CTk):
         self._slideshow_job: Any = None
         self._save_job: Any = None
         self._shuffle_order: list[int] = []
+        self._shuffle_cursor: int = 0
         self._load_token: int = 0
         self._preview_size: tuple[int, int] = (PREVIEW_W, PREVIEW_H)
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dv-img")
         self._closing = False
         self.tray_icon: Any = None
         self._tray_thread: Optional[threading.Thread] = None
+        self._tray_ready: Optional[threading.Event] = None
+        self._tray_failed = False
 
         self._build_ui()
+        self._apply_window_icon()
+        # CustomTkinter sets its own default window icon shortly after
+        # construction on Windows; re-apply ours once that has had a chance
+        # to run so the branded icon isn't silently overwritten.
+        self.after(300, self._apply_window_icon)
         self._restore_state()
         self.protocol("WM_DELETE_WINDOW", self._on_close_request)
         self._init_tray()
         self._sync_startup_state()
         if self._start_minimized:
-            if self.tray_icon is not None:
+            if self._tray_is_ready():
                 self.withdraw()
             else:
-                log.warning("--minimized requested but no tray icon is running; showing window.")
+                log.warning(
+                    "--minimized requested but the tray icon isn't ready; showing window."
+                )
 
     # ---------------- UI construction ----------------
 
@@ -647,6 +742,16 @@ class DesktopVista(ctk.CTk):
         self.preview.bind("<Configure>", self._on_preview_configure)
         self.main.bind("<Configure>", self._on_preview_configure)
 
+    # ---------------- Branding ----------------
+
+    def _apply_window_icon(self) -> None:
+        if sys.platform != "win32" or not BRAND_ICON_PATH.is_file():
+            return
+        try:
+            self.iconbitmap(str(BRAND_ICON_PATH))
+        except Exception as exc:
+            log.warning("Could not set window icon: %s", exc)
+
     # ---------------- Debounced save ----------------
 
     def _schedule_save(self) -> None:
@@ -747,8 +852,10 @@ class DesktopVista(ctk.CTk):
         if self.cfg["folders"]:
             self._load_folder(self.cfg["folders"][0])
         else:
+            self._load_token += 1
             self.images, self.index = [], -1
             self._shuffle_order = []
+            self._shuffle_cursor = 0
             self.cfg["current_folder"] = None
             self.cfg["current_image"] = None
             self._refresh_folder_menu()
@@ -763,10 +870,16 @@ class DesktopVista(ctk.CTk):
 
     def _load_folder(self, folder: str, show: bool = True) -> None:
         self._flush_save()  # persist previous folder/image before switching
+        # Invalidate any in-flight preview load from the previous folder
+        # immediately, even if this folder turns out to have no images —
+        # otherwise a late callback for the old folder could still land and
+        # repaint over the "No images found" / offline status text.
+        self._load_token += 1
         self.cfg["current_folder"] = folder
         self._refresh_folder_menu()
         self.images = list_images(folder)
         self._shuffle_order = []
+        self._shuffle_cursor = 0
         if not self.images:
             self.index = -1
             if show:
@@ -831,7 +944,11 @@ class DesktopVista(ctk.CTk):
                 size_bytes = os.path.getsize(path)
             except Exception as exc:
                 log.warning("Preview load failed for %s: %s", path, exc)
-                self.after(0, lambda: self._on_preview_error(token, path, exc))
+                # Python clears `exc` when the except block exits, and this
+                # lambda runs later via `after()` — bind it as a default
+                # argument now or the callback raises NameError instead of
+                # showing the intended error.
+                self.after(0, lambda exc=exc: self._on_preview_error(token, path, exc))
                 return
             self.after(
                 0,
@@ -904,10 +1021,12 @@ class DesktopVista(ctk.CTk):
             self.index = 0
             self._show_current()
             return
-        if not self._shuffle_order:
+        if not self._shuffle_order or self._shuffle_cursor >= len(self._shuffle_order):
             self._shuffle_order = build_shuffle_deck(len(self.images), self.index)
+            self._shuffle_cursor = 0
         if self._shuffle_order:
-            self.index = self._shuffle_order.pop(0)
+            self.index = self._shuffle_order[self._shuffle_cursor]
+            self._shuffle_cursor += 1
             self._show_current()
 
     def _random(self) -> None:
@@ -931,6 +1050,7 @@ class DesktopVista(ctk.CTk):
 
     def _on_shuffle_changed(self) -> None:
         self._shuffle_order = []
+        self._shuffle_cursor = 0
         self._save()
 
     def _set_wallpaper(self, silent: bool = False) -> None:
@@ -1102,13 +1222,39 @@ class DesktopVista(ctk.CTk):
     def _start_tray_icon(self) -> None:
         if self.tray_icon is not None:
             return
-        image = build_tray_icon_image()
+        image = load_brand_icon()
         menu = pystray.Menu(self._tray_menu_items)
         self.tray_icon = pystray.Icon(APP_NAME, image, APP_NAME, menu)
-        self._tray_thread = threading.Thread(
-            target=self.tray_icon.run, name="dv-tray", daemon=True
-        )
+        self._tray_ready = threading.Event()
+        self._tray_failed = False
+
+        def _run() -> None:
+            def _on_setup(icon) -> None:
+                icon.visible = True
+                self._tray_ready.set()
+
+            try:
+                self.tray_icon.run(setup=_on_setup)
+            except Exception as exc:
+                log.warning("Tray icon thread failed: %s", exc)
+                self._tray_failed = True
+                self._tray_ready.set()
+
+        self._tray_thread = threading.Thread(target=_run, name="dv-tray", daemon=True)
         self._tray_thread.start()
+
+    def _tray_is_ready(self, timeout: float = 2.0) -> bool:
+        """Block briefly for the tray thread to signal success/failure.
+
+        Storing a non-None Icon the instant it's constructed (before its
+        background thread actually starts serving) let a startup failure
+        leave --minimized hiding the only window with no working way to
+        restore it. Waiting on an explicit readiness event closes that gap.
+        """
+        if self.tray_icon is None or self._tray_ready is None:
+            return False
+        self._tray_ready.wait(timeout)
+        return self._tray_ready.is_set() and not self._tray_failed
 
     def _stop_tray_icon(self) -> None:
         if self.tray_icon is not None:
@@ -1117,6 +1263,8 @@ class DesktopVista(ctk.CTk):
             except Exception:
                 pass
             self.tray_icon = None
+        self._tray_ready = None
+        self._tray_failed = False
 
     # pystray invokes these on its own thread — always marshal back onto Tk's.
     def _on_tray_restore(self, _icon=None, _item=None) -> None:
@@ -1128,10 +1276,17 @@ class DesktopVista(ctk.CTk):
         self.focus_force()
 
     def _on_tray_next(self, _icon=None, _item=None) -> None:
-        self.after(0, self._next)
+        self.after(0, self._tray_navigate_and_apply, 1)
 
     def _on_tray_prev(self, _icon=None, _item=None) -> None:
-        self.after(0, self._prev)
+        self.after(0, self._tray_navigate_and_apply, -1)
+
+    def _tray_navigate_and_apply(self, delta: int) -> None:
+        """Tray "Next/Previous Wallpaper" must change the desktop, not just
+        the in-window preview — the main window's arrow buttons keep the
+        preview-only behaviour via `_step`/`_prev`/`_next`."""
+        self._step(delta)
+        self._set_wallpaper(silent=True)
 
     def _on_tray_toggle_slideshow(self, _icon=None, _item=None) -> None:
         self.after(0, self._toggle_slideshow)

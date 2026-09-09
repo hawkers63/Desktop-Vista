@@ -85,6 +85,36 @@ def test_load_config_interval_custom_label_and_seconds_kept(tmp_path):
     assert cfg["interval_custom_seconds"] == 45
 
 
+def test_load_config_folders_default_not_shared_after_invalid(tmp_path):
+    """A rejected 'folders' field must not leave cfg['folders'] aliased to
+    DEFAULT_CONFIG['folders'] — mutating it later would contaminate the
+    shared default for the rest of the process."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"folders": "not-a-list"}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["folders"] == []
+    cfg["folders"].append("D:\\Contaminated")
+    assert dv.DEFAULT_CONFIG["folders"] == []
+
+
+def test_load_config_custom_seconds_infinite_falls_back(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"interval_custom_seconds": float("inf")}), encoding="utf-8"
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["interval_custom_seconds"] is None
+
+
+def test_load_config_custom_seconds_nan_falls_back(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"interval_custom_seconds": float("nan")}), encoding="utf-8"
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["interval_custom_seconds"] is None
+
+
 def test_load_config_valid_values_kept(tmp_path):
     payload = {
         "folders": ["D:\\Wallpapers"],
@@ -125,6 +155,19 @@ def test_load_config_tray_partial_keys_filled(tmp_path):
     cfg_path.write_text(json.dumps({"tray": {"enabled": False}}), encoding="utf-8")
     cfg = dv.load_config(cfg_path)
     assert cfg["tray"] == {"enabled": False, "close_to_tray": True, "run_at_startup": False}
+
+
+def test_load_config_tray_non_bool_values_fall_back(tmp_path):
+    """bool(0) is False and bool("") is False, but neither is a *literal*
+    boolean — a hand-edited or corrupted config with these values should
+    fall back to the default rather than be silently coerced."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"tray": {"enabled": 0, "close_to_tray": "", "run_at_startup": 1}}),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["tray"] == {"enabled": True, "close_to_tray": True, "run_at_startup": False}
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +475,33 @@ def test_wallpaper_cache_key_stable(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# EXIF-rotated preview decoding
+# ---------------------------------------------------------------------------
+
+def test_load_preview_image_reports_rotated_dimensions(tmp_path):
+    """A 100x50 source tagged EXIF orientation 6 (rotate 90) should be
+    reported as displaying at 50x100 — dimensions swapped for the rotation
+    — exercising the orientation-aware draft-box path."""
+    path = tmp_path / "rotated.jpg"
+    img = Image.new("RGB", (100, 50), color=(200, 50, 50))
+    exif = img.getexif()
+    exif[274] = 6  # Orientation tag
+    img.save(path, format="JPEG", exif=exif)
+
+    out, width, height = dv._load_preview_image(str(path), 200, 200)
+    assert (width, height) == (50, 100)
+    assert out.mode == "RGB"
+
+
+def test_load_preview_image_unrotated_dimensions_unchanged(tmp_path):
+    path = tmp_path / "normal.jpg"
+    Image.new("RGB", (100, 50), color=(50, 200, 50)).save(path, format="JPEG")
+
+    out, width, height = dv._load_preview_image(str(path), 200, 200)
+    assert (width, height) == (100, 50)
+
+
+# ---------------------------------------------------------------------------
 # Tray icon image
 # ---------------------------------------------------------------------------
 
@@ -444,3 +514,26 @@ def test_build_tray_icon_image_default_size():
 def test_build_tray_icon_image_custom_size():
     img = dv.build_tray_icon_image(32)
     assert img.size == (32, 32)
+
+
+def test_load_brand_icon_uses_shipped_asset():
+    img = dv.load_brand_icon(64)
+    assert img.mode == "RGBA"
+    assert max(img.size) <= 64
+
+
+def test_load_brand_icon_falls_back_when_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(dv, "BRAND_ICON_PATH", tmp_path / "does-not-exist.ico")
+    img = dv.load_brand_icon(48)
+    assert img.size == (48, 48)
+
+
+# ---------------------------------------------------------------------------
+# Startup staleness (registry command drift)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(dv.winreg is None, reason="registry tests require Windows winreg")
+def test_is_startup_enabled_false_when_command_is_stale(monkeypatch):
+    store = {dv.STARTUP_VALUE_NAME: '"C:\\old\\python.exe" "C:\\old\\desktop_vista.py" --minimized'}
+    _patch_fake_registry(monkeypatch, store)
+    assert dv.is_startup_enabled() is False
