@@ -64,5 +64,12 @@
     "hide": "Win+Alt+H",
     "undo": "Win+Alt+Z",
     "toggle": "Win+Alt+S"
+  },
+  "ui": {
+    "selected_page": "library",
+    "appearance": "dark",
+    "hud_always_visible": false,
+    "reduced_motion": false,
+    "seen_shortcut_notice_v2": false
   }
 }

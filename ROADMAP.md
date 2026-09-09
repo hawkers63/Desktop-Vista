@@ -145,6 +145,62 @@ Goal: land everything that does not require a second physical display to be corr
 
 ---
 
+## v1.6.1 — UI hardening addendum ✅ Done (2026-09-09)
+
+A UI/UX audit (`notes/notes_006.txt`, reviewed against commit `ce8b849`) found two real P1 defects, plus a much larger seven-track redesign proposal (see "Beyond this window — UI evolution" below). The two defects were fixed directly; the redesign proposal is scoped as a separate forward track, not folded into this patch, same pattern as v1.2.1.
+
+| Priority | Item | Status |
+| :---: | :--- | :--- |
+| P1 | Keyboard shortcuts leaked into text-entry widgets — typing "forest" into the Tags field also triggered Favourite (`f`) and Random (`r`), since CTkEntry wraps a real Tk Entry and `self.bind()` on the toplevel still sees those keystrokes | ✅ Fixed — `_shortcut`/`_focus_is_text_entry` guard walks the focused widget's class/ancestry and no-ops (returns without consuming the key) while focus is inside an Entry/Text/Spinbox/Combobox |
+| P1 | Fit Style dropdown was an apply command, not a staged preference — `_on_style_changed` called `set_windows_wallpaper` directly and unconditionally, always through the legacy global SPI path even with the experimental per-monitor COM engine and a specific target monitor selected | ✅ Fixed — the handler now only saves the preference; `style_var` is already read at apply time by every real apply path (`_apply_path`/`_set_wallpaper`), so the new style takes effect on the next explicit apply through whichever backend (SPI/COM) and target is actually selected |
+
+**Verification note:** the review's live-Windows test run (mutex/pipe/hotkey, 5 of 148 failing) was re-run in this session on the same commit with nothing else on the machine holding those resources: 148/148 passed cleanly. The failure signature (mutex "not primary", pipe `ERROR_ACCESS_DENIED`, no synthetic hotkey delivery) is consistent with the review having run in a different/isolated execution context — not a code regression. Both new fixes were live-verified against this machine's real registry/focus state, not just reasoned about.
+
+**Exit criteria (both met):** typing in the Tags field no longer triggers image actions, and shortcuts still fire normally once focus is elsewhere (verified live); changing Fit Style leaves the registry untouched until an explicit apply, and the staged value is then used correctly (verified live against `HKCU\Control Panel\Desktop\WallpaperStyle`).
+
+---
+
+## v1.7 — UI/interaction rewrite ✅ Done (2026-09-09)
+
+notes_006's phases B–D, implemented in the same session as v1.6.1, per Mark's explicit go-ahead to continue through them rather than stop at the two defect fixes.
+
+| Phase | Scope | Status |
+| :---: | :--- | :--- |
+| B | Four-page sidebar (Library/Playback/Displays/Settings) replacing the 11-section stack; 3-row main layout (context header / stage / permanent footer); three button rows consolidated into one floating HUD | ✅ Done — pages are built once and shown via `grid()`/`grid_remove()` (never rebuilt, state survives a switch); footer's single "Apply to `<target>`" button reads live from the COM target selection |
+| C | Tag inspector/chips; Hidden Items shows parent folder + offline badge (was basename-only) with a search filter; toast notifications alongside the persistent status line | ✅ Done, editor drafts **not** done — playlist/collection editors keep their existing fixed-geometry dialogs (see below) |
+| D | Dark/light/system appearance switch; shortcut help overlay; inspection mode (F11, fit-to-screen only) | ✅ Done, Narrator/high-contrast/multi-DPI verification **not** performed — needs real assistive-technology and multi-monitor hardware, same honesty gate notes_006 itself set |
+
+**New files:** `ui_components.py` — the four blueprint components from notes_006 §4 (`ActionButton`, `HoverHUD`, `ToastManager`, `TagSelector`), adopted close to verbatim (one bug fixed: an 8-digit `#RRGGBBAA` colour isn't valid Tk — Tk has no colour-alpha syntax — swapped for a solid token colour).
+
+**Keyboard remap (documented behaviour change, notes_006 §2.7):** Space now starts/stops the slideshow (was Next); Esc now closes the active panel — tag drawer, shortcut help, inspection mode — instead of stopping the slideshow. A one-time in-app notice fires on first launch after update (`cfg.ui.seen_shortcut_notice_v2`); the Playback page's Start/Stop button remains the always-visible non-keyboard way to stop the slideshow, as notes_006 required before making this change.
+
+**New `cfg["ui"]` namespace** (presentation-only preferences, validated like every other section): `selected_page`, `appearance`, `hud_always_visible`, `reduced_motion`, `seen_shortcut_notice_v2`.
+
+**Deliberately not done this release:**
+- Playlist/collection editor redesign (draft-copy-on-open, inline validation, two-line friendly/path display) — the dialogs are unchanged from v1.6; only Hidden Items got the specific fix (parent-folder disambiguation) because that was an actual functional gap (identical filenames on different drives were indistinguishable), not a polish item.
+- Interactive per-display output map (phase E) — still correctly blocked on notes_005 §2.1.4's Win32/COM display-identity reconciliation; the topology strip stays read-only.
+- Accent sync, ambient glow, drag-to-assign (phase F) — v2.1-scope polish, unstarted.
+- `_apply_path`'s COM call can still block the Tk thread up to 5s with no async dispatch — that's notes_005's v2.0 `ApplyQueue`, not a v1.7-sized fix.
+
+**Verification:** live-tested against this machine's real config/registry, not just constructed-in-isolation — page switching, HUD button dispatch (Favourite toggle round-tripped through `cfg["favourites"]`), the tag drawer (add/remove round-tripped through `cfg["tags"]`, confirmed the keyboard guard still holds inside its own Entry), the Escape chain, the Space→slideshow remap, inspection-mode Toplevel open/close, and `ui` preference persistence through a real save/reload — all via property-based checks (`grid_info()`/`winfo_viewable()`, not `winfo_ismapped()`, which is unreliable for `CTkScrollableFrame`'s own composite window — verified against a standalone repro). The full real subprocess (`python desktop_vista.py --minimized`) was also exercised end-to-end over the same IPC pipe as v1.6: `--next`/`--undo` correctly round-tripped a real wallpaper change through the rewritten stage and preview pipeline. No screenshots were used for verification after an early one accidentally captured the full physical screen (not just the app window) and briefly exposed unrelated on-screen content; deleted immediately, and no further screen/window capture was attempted for the rest of this pass.
+
+**Exit criteria:** all old actions remain reachable at the 980×560 minimum (✅, nothing was removed, only relocated); current settings round-trip unchanged (✅, 152/152 tests passing including new config-schema coverage for `cfg["ui"]`); exact canonical tag semantics preserved (✅, case-sensitive exact-string, live-verified); duplicate filenames/offline paths distinguishable in Hidden Items (✅, live-verified); editing tags never navigates/applies and Fit preview stays side-effect free (✅, carried from v1.6.1).
+
+---
+
+## Beyond this window — UI evolution (notes_006, phases E–F)
+
+Phases A–D above are done. What's left from notes_006's seven-track proposal:
+
+| Phase | Proposed release | Scope | Blocked on |
+| :---: | :--- | :--- | :--- |
+| E | v2.0 dependency | Interactive per-display output map, per-display applied thumbnails, span crop assistant | A reconciled Win32/COM display identity model and real per-target state — notes_005 §2.1.4's fingerprinting scheme, part of the v2.0 milestone itself |
+| F | v2.1 optional | Accent sync; ambient glow; drag-to-assign staging; advanced polish | Nothing structural — just sequenced after v2.0/v2.1 per notes_005's own plan |
+
+Also still open: `_apply_path`'s COM call can block the Tk thread for up to 5 seconds with no way to stay responsive during it (needs async dispatch — notes_005's v2.0 `ApplyQueue`); the playlist/collection editors' draft-state/inline-validation redesign (notes_006 §2.5) was scoped as part of phase C but not implemented — the dialogs work, they just don't have the proposed Save/Cancel-draft-copy or inline field errors yet; full Narrator/high-contrast/multi-DPI accessibility verification.
+
+---
+
 ## Beyond this window — v2.0 "One Perfect View"
 
 `IDesktopWallpaper` COM integration for true per-monitor wallpapers, panoramic/ultrawide span assist, independent per-monitor playback state, and a go/no-go decision on desktop crossfade. Solar cycles are wired into the applied wallpaper already (v1.6, against the single shared pipeline); v2.0's job is giving each display its own index/navigation/slideshow/solar state instead of one shared one. The legacy `SystemParametersInfoW` path stays live behind a `wallpaper_target` feature flag until the COM path is proven (see `notes/notes_002.txt` §5 cross-cutting notes).
@@ -175,5 +231,4 @@ Shipped ahead of the full milestone, gated behind `wallpaper_target: "com"` (def
 
 - Version numbers above are release numbers, not calendar dates — fit the cadence to actual capacity.
 - Update `notes/notes_002.txt`'s schema/wireframe sections as each release's config keys land, and keep `config.example.json` in sync. `config.json` itself stays gitignored.
-- Source backlog: `notes/notes_001.txt` (design intent), `notes/notes_002.txt` (feature matrix + phased plan), `notes/notes_003.txt` (v1.1 hardening audit), `notes/notes_004.txt` (v1.2 architecture/UX review + supplied icon assets), `notes/notes_005.txt` (v1.6 → v2.1 functional/systems architecture pack — viability matrix, module blueprints, DB schema, phased plan), `AGENT_1_FEATURE_INNOVATION.md`, `AGENT_5_FUNCTIONAL_ENHANCEMENTS.md` (the brief notes_005 was written against).
-- A companion UI/UX redesign pack (`AGENT_4_UI_IMPROVEMENTS.md`'s brief — sidebar/HUD/topology-widget rework) has not yet been produced under its own notes file; `PROMPTS_OVERVIEW.md` currently expects it as a distinct `notes_005.txt`/`notes_006.txt` pair with the functional pack, but only the functional pack exists so far.
+- Source backlog: `notes/notes_001.txt` (design intent), `notes/notes_002.txt` (feature matrix + phased plan), `notes/notes_003.txt` (v1.1 hardening audit), `notes/notes_004.txt` (v1.2 architecture/UX review + supplied icon assets), `notes/notes_005.txt` (v1.6 → v2.1 functional/systems architecture pack — viability matrix, module blueprints, DB schema, phased plan), `notes/notes_006.txt` (UI/UX audit + phases A–F redesign proposal, reviewed against v1.6/`ce8b849`), `AGENT_1_FEATURE_INNOVATION.md`, `AGENT_5_FUNCTIONAL_ENHANCEMENTS.md` (the brief notes_005 was written against), `AGENT_4_UI_IMPROVEMENTS.md` (the brief notes_006 was written against).

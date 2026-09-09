@@ -280,3 +280,165 @@ ROADMAP.md. The full v2.0 milestone (independent per-monitor playback,
 span assist, device-path reconciliation) is next per notes_005's own
 sequencing; v2.1 (SQLite catalogue, weather, accent sync, curation, feeds)
 waits on v2.0's assignment model existing first.
+
+## 2026-09-09 (later still) — v1.6.1 UI hardening from notes_006's audit
+
+**Context:** Mark dropped `notes/notes_006.txt` — the UI redesign pack
+that had been flagged as missing (above), authored by a different agent
+("CODEX") reviewing the actual v1.6/`ce8b849` source rather than the
+stale v1.5.1 brief. A rigorous, source-anchored document: executive UX
+scorecard, seven redesign tracks, ASCII wireframes, four tested
+CustomTkinter component blueprints (focusable button, hover HUD, toast
+manager, tag chip selector), and an explicit phase A–F rollout — plus its
+own honestly-reported verification run.
+
+**First checked the verification discrepancy before acting on anything
+else:** notes_006 reported 5/148 test failures (mutex "not primary", pipe
+`ERROR_ACCESS_DENIED`, no synthetic hotkey delivery) on the *same* commit
+this session had left at 148/148. Re-ran the full suite live, on this
+machine, with nothing else holding those OS resources: clean 148/148.
+The failure signature is what a different/isolated execution context
+looks like for these three live-Windows surfaces (different security
+principal → pipe ACL denies it; a non-interactive session → no real
+`keybd_event` delivery; something else already primary → mutex fails) —
+not a code regression. notes_006's own evidence section was already
+appropriately cautious about this ("root cause was not proved... do not
+quote 148/148 as today's outcome"); confirmed it doesn't need repair.
+
+**Fixed both of notes_006's real P1 defects** (the well-specified ones;
+see ROADMAP.md's v1.6.1 table for the two-column task/exit-criteria
+version) — deliberately did **not** touch the much larger phase B–F
+redesign (four-page sidebar, floating HUD replacing the three button
+rows, toast system, tag chips, keyboard remap) in this pass:
+- Keyboard shortcuts leaking into text entry: reproduced live first
+  (typing "forest" into the Tags field really did fire Favourite on 'f'
+  and Random on 'r' — CTkEntry's internal native Entry is what
+  `focus_get()` returns, and it's still in the toplevel's bindtags).
+  Fixed with a focus-class guard (`_focus_is_text_entry`) wrapping every
+  single-key binding (`_shortcut`); verified both that the leak is gone
+  and that the shortcuts still fire normally once focus is elsewhere.
+- Fit Style as an unstaged apply command: `_on_style_changed` used to
+  call `set_windows_wallpaper` directly and unconditionally — always the
+  legacy SPI path, even with the experimental COM engine and a specific
+  monitor selected, so a "preparatory" dropdown could silently restamp
+  every display. Now just saves the preference; every real apply path
+  already reads `style_var` at apply time. Verified live against the real
+  `HKCU\Control Panel\Desktop\WallpaperStyle` value: unchanged on dropdown
+  change, correctly updated on the next explicit apply. Restored the
+  registry to Mark's real "Fill" afterward.
+
+**Scoped, not implemented:** ROADMAP.md now carries notes_006's full
+phase A–F table under "Beyond this window — UI evolution" (mirroring how
+notes_005 was incorporated), plus the findings not yet actioned (dual
+Win32/COM display identity with no shared mapping; the COM apply's
+blocking-up-to-5s call with no async dispatch; the proposed Space/Esc
+keyboard remap — a deliberate behaviour change, explicitly not bundled
+into the phase-A guard fix). Did not start phase B (the four-page
+sidebar / HUD rewrite) without checking scope first — unlike v1.6's
+backend work, this changes daily interaction patterns (remapped
+shortcuts, replaced button rows) and is large enough (comparable to all
+of v1.6) to warrant confirming how far to go before committing to it in
+one sitting.
+
+**Testing hazard note (worth repeating for future sessions):** constructing
+`DesktopVista()` directly from an ad hoc script — even one that only reads
+`app.cfg`/`app.style_var` — still runs `load_config()`/`_on_close()`
+against the *real* `config.json` and can touch the real registry/
+wallpaper if `_set_wallpaper`/`_apply_path` gets called. Every live check
+this session was run against the real file/registry and explicitly
+verified restored afterward (`config.json`'s `folders`/`style`/`hotkeys`
+back to Mark's actual values; `WallpaperStyle` back to `10`/Fill).
+
+## 2026-09-09 (later still) — v1.7 UI/interaction rewrite (notes_006 phases B-D)
+
+**Context:** After the two v1.6.1 defect fixes, asked whether to continue
+through notes_006's much larger phases B-D (a genuine UI/interaction
+rewrite — four-page sidebar, HUD replacing three button rows, toast
+system, tag chips, a keyboard remap) in the same sitting. Mark chose
+"continue through B-D now... commit at the end" — same pace as every
+prior session's full-arc pass.
+
+**Shipped:** new `ui_components.py` (notes_006 §4's four blueprint
+components — `ActionButton`, `HoverHUD`, `ToastManager`, `TagSelector` —
+adopted close to verbatim); `_build_ui` rewritten into four task pages
+(Library/Playback/Displays/Settings) behind a nav rail, built once and
+shown via `grid()`/`grid_remove()` so widget state survives a page
+switch; the three stacked button rows replaced by a floating HUD; a
+permanent stage footer (filename/status + one Apply button whose label
+tracks the live COM target); tag editing moved to a chip drawer
+(captures the image path on open so a delayed edit can't land on a
+different image after navigation); toasts layered alongside the existing
+persistent status line (kept as the compatibility bridge, not replaced);
+System/Light/Dark appearance switching (the monitor-topology Canvas
+restyled too, since CTk colour tuples don't reach raw Canvas); Space/Esc
+keyboard remap with a one-time in-app notice; F11 inspection mode
+(fit-to-screen only, no zoom/pan — matches notes_006's own phased scope);
+`?` shortcut help overlay; Hidden Items now shows parent folder + offline
+badge (fixed a real gap — same-named files on different drives were
+previously indistinguishable) plus a search filter. New `cfg["ui"]`
+namespace for presentation-only preferences, validated like every other
+config section.
+
+**Bug found and fixed mid-implementation:** `stage_tags_label` was given
+an 8-digit `#RRGGBBAA` fg_color — Tk has no colour-alpha syntax, that's a
+CSS convention that doesn't exist here — crashed on construction with
+`invalid color name`. Also one `FOCUS` reference that needed to be
+`ui_components.FOCUS` (namespacing slip). Both caught by actually
+constructing the app, not just by syntax-checking.
+
+**Scoped, not implemented:** the playlist/collection editors keep their
+existing fixed-geometry dialogs — notes_006's draft-copy-on-open/inline-
+validation redesign (§2.5) wasn't done; only Hidden Items got fixed,
+since that was a genuine functional gap, not a polish item. Phase E
+(interactive per-display output map) correctly stays blocked on
+notes_005's display-identity reconciliation (v2.0 work). Phase F (accent
+sync, ambient glow, drag-to-assign) is v2.1-scope, untouched. No
+Narrator/high-contrast/multi-DPI verification — notes_006 itself flagged
+that as needing real assistive-tech and hardware, not something to fake.
+
+**Verification approach, and an incident worth remembering:** most of
+this was verified by actually constructing `DesktopVista()` in a script
+and driving it with `app.update()` — valid for anything synchronous
+(page switching, HUD dispatch, tag round-trip, Escape chain, appearance
+switching), but **`self.after(0, ...)` calls from a background thread
+(the preview decoder, the reconnect prober) need a genuinely running
+`mainloop()`** — an `app.update()` loop doesn't set Tk's internal
+"in mainloop" flag, so those calls raise `RuntimeError: main thread is
+not in main loop` that has nothing to do with real app correctness. Hit
+this exact class of false alarm twice this session (once for the
+reconnect-probe freeze test in the v1.6 pass, once here for preview-decode
+readiness) — the fix both times was cross-checking against the real
+subprocess (`python desktop_vista.py --minimized` + the IPC pipe from
+v1.6), which showed `--next`/`--undo` genuinely round-tripping a real
+wallpaper change through the rewritten stage. **Worth remembering for any
+future session:** if an `app.update()`-loop test reports a background-
+thread callback never landing, check whether it's this mainloop
+restriction before treating it as a real bug.
+
+**Safety incident — do not repeat:** one verification attempt used
+`PIL.ImageGrab.grab()` (full-screen capture) to screenshot the running
+app for visual review. It captured Mark's entire physical screen, not
+just the app window, at a moment when a GitHub two-factor-authentication
+setup page with a live QR code happened to be on screen, along with
+various logged-in browser tabs. Deleted the file immediately and never
+viewed or transmitted it further; no further screen/window capture was
+attempted for the rest of this pass — property-based checks (`grid_info`,
+`winfo_viewable`, widget `.cget()`) plus the real-subprocess/IPC approach
+covered everything needed without it. **If a future session genuinely
+needs a visual check of this app: do not use whole-screen capture.**
+Restrict to the specific window's own reported rectangle
+(`winfo_rootx/y/width/height`) after confirming via `winfo_viewable()`
+that it's really the window on screen, or better, ask Mark to look at the
+running app himself.
+
+**Also hit again this session:** constructing `DesktopVista()` directly
+in throwaway test scripts keeps writing to the *real* `config.json`
+(and, in one case, real registry `WallpaperStyle`) — this time including
+a hidden-manager test that left two fake paths in `cfg["hidden"]`. All
+caught and restored before finishing (folders/style/hotkeys/hidden/ui
+prefs back to Mark's real values, `seen_shortcut_notice_v2` deliberately
+left `false` so *he* sees the one-time shortcut-remap notice himself on
+next real launch, not a version already "consumed" by test runs).
+
+APP_VERSION bumped to "1.7". 152/152 tests passing (up from 148).
+`DesktopVista.exe` rebuilt and re-sent to Mark reflecting all of it.

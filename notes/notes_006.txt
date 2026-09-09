@@ -1,0 +1,837 @@
+DESKTOP VISTA — CODEX — UI/UX AUDIT AND INTERFACE EVOLUTION
+All my drives. One perfect view.
+9 September 2026 | Review baseline: v1.6, commit ce8b849
+Deliverable: notes_006.txt | Companion to notes_005.txt's functional architecture
+
+1. EXECUTIVE SUMMARY AND UX AUDIT SCORECARD
+==========================================
+
+Recommendation: retain the compact two-pane application, replace the continuous settings stack with four task pages, move Apply into a permanent preview footer, and consolidate browsing/curation into one keyboard-accessible floating toolbar. Keep the interface solid and crisp by default. Semi-transparent child widgets, desktop composition effects and independent per-monitor playback must not become prerequisites for a usable UI.
+
+This document fulfils the supplied v1.5.1 UI brief against the actual v1.6 source. The implementation has advanced: solar scheduling, applied-history undo, IPC and global hotkeys are present. The sidebar has grown correspondingly. Existing notes_005.txt is a functional/systems pack, so the next unoccupied sequential filename is notes_006.txt. The underscore convention follows existing files and the brief's final deliverable rule. No prior note is replaced.
+
+Scope: a technical design deliverable, with executable CustomTkinter component blueprints and explicit insertion points. Application implementation, probability/scheduling changes, COM backend changes and release renumbering are not performed. Code examples are tested component building blocks; they do not certify a completed or fully accessible application redesign.
+
+Evidence and limits
+-------------------
+Reviewed desktop_vista.py, windows_wallpaper_com.py, MEMORY.md, ROADMAP.md, requirements.txt, the UI brief, canonical tagging helpers and icon dimensions. Source anchors below refer to this commit, not the older line numbers in the uploaded brief. An isolated construction of _build_ui used copied defaults, suppressed monitor calls and an invisible Tk window; it did not run DesktopVista.__init__, startup registration, the app's IPC server, hotkeys or wallpaper setters. Geometry was measured at explicit 1.0 widget/window scaling. This is source-backed ergonomic analysis and widget measurement, not observation of the user's live window or a usability study. Multi-DPI screenshots and screen-reader testing remain release gates.
+
+Score scale: 1 = obstructive, 2 = frequent friction, 3 = usable with compromises, 4 = clear and consistent, 5 = strongly validated. Current scores are reviewer judgements, not survey data. Targets are acceptance ambitions, not measured outcomes.
+
+Dimension             Current  Target  Evidence and implication
+Ergonomics             2/5      4/5    Daily actions share a long stack with infrequent configuration.
+Visual hierarchy       2/5      4/5    Blue buttons repeat at every level; Apply competes with management.
+Screen efficiency      2/5      4/5    Three permanent action rows consume stage height.
+Windows 11 alignment   2/5      4/5    Rounded frames exist; typography, dialogs and glyphs are inconsistent.
+Keyboard safety        1/5      4/5    Unscoped root bindings can act while editing text.
+State clarity          2/5      4/5    Preview, applied image, fit scope and display target are separated.
+Accessibility          Unverified     Keyboard/contrast design can improve; Narrator/UIA support is unproven.
+
+Measured baseline at 1180 x 620, 100% test scaling:
+• Main panel: 816 x 596.
+• Allocated preview label: 784 x 416. A contained 16:9 image is approximately 739 x 416.
+• Sidebar content requested height: 1,534; Apply starts at y=492 within that content; status at y=1,492.
+• Under-preview metadata and three rows each request 28 pixels, with additional row spacing. The main panel's non-preview allocation is 180 pixels in this fixture.
+• Default minimum window is 980 x 560. The collection editor is 360 x 240; playlist editor 420 x 480; Hidden Images is actually 420 x 420, rather than the larger dimensions in the brief.
+
+Do not describe a 1080p screen as a 1080-pixel application workspace. Windows scaling, work area, title bar, taskbar and window size all matter. Measure layout from the actual client area in logical units.
+
+Priority findings
+-----------------
+P1 — Keyboard commands have no text-editing guard: desktop_vista.py:1658–1669. Space advances, Enter applies, H hides, F favourites and arrow/backspace bindings browse. Entry events can reach toplevel bindings; typing a tag can invoke an unrelated image action. Fix event routing before adding more hotkeys or tag autocomplete.
+
+P1 — Fit style is unexpectedly an output command: _on_style_changed at 2464 calls set_windows_wallpaper directly. A user changing a supposedly preparatory setting can alter the desktop globally, bypassing the selected COM route. Separate staged UI preference from explicit Apply; this is a small but intentional interaction-contract change requiring regression tests, not merely moving a dropdown.
+
+P1 — Display identity is presented twice without a shared mapping: _refresh_monitor_topology at 1687 uses Win32 enumeration; _refresh_com_monitor_menu at 1725 numbers a separate COM enumeration. Do not assume that visually labelled "2" identifies the same display in both lists. The new clickable map requires a reconciled identity model first.
+
+P1 — A busy indicator cannot stay responsive during a blocking backend call. _apply_path at 2549 synchronously waits on the COM backend, whose _call permits a five-second wait. UI-only feedback can announce the request but cannot repair blocking. Async dispatch is a separately tracked dependency for reliable progress/cancellation; never label a timeout as proof that nothing changed.
+
+P2 — Settings and management occupy the daily task path: _build_ui at 1405. The Apply button is near the fold even with defaults; status is far below it. Make both persistent outside scroll regions.
+
+P2 — Hard-coded widths, grey colours and 10–12px text complicate scale/theme parity. Metadata has no deliberate long-filename truncation strategy. Repeated generic Edit/Delete buttons are visible even when the active source is the wrong kind.
+
+P2 — Three stacked action rows, 1619–1655, reduce the preview. Random selection and persistent Shuffle mode are conceptually different and need distinct names/states.
+
+P2 — Playlist/collection dialogs use fixed geometry and raw paths/tag strings. Hidden manager at 2233 shows only basename, so identical filenames on different drives cannot be distinguished. Modal validation errors interrupt correction instead of appearing next to the invalid field.
+
+P2 — All feedback is funnelled through one small label (_set_status at 1794), making successes, errors and ongoing automatic pauses compete. Replacing it with disappearing toasts alone would hide persistent problems rather than solve them.
+
+P3 — Emoji and plain text glyphs mix visual systems. The application currently forces dark mode. The monitor canvas has a fixed dark background even if other widgets are later switched to light.
+
+2. COMPONENT-BY-COMPONENT REDESIGN SPECIFICATION
+==============================================
+
+2.1 Information architecture and primary action
+-----------------------------------------------
+Four destinations: Library, Playback, Displays, Settings. Use a vertical navigation group above the active page within a 280-logical-pixel sidebar. A 2 x 2 segmented presentation is acceptable at narrow widths; avoid four long tab labels squeezed into one 280px row. All four pages are created once or lazily retained, keeping widget state when switched. Switching a page never changes the active source, restarts playback or writes settings by itself.
+
+Option evaluation:
+• Four task pages: best separation and stable daily workspace. Cost: one extra navigation step for infrequent options. Recommended.
+• Accordion-only sidebar: smaller code change but retains vertical ambiguity and pushes controls around as sections open. Useful only inside Playback's advanced settings, not as the global structure.
+• Narrow icon rail plus independent drawer: maximises stage width but hides labels and adds drawer states. Defer until real narrow-window need is established.
+• CTkTabview: easy implementation, but tabs fit content rather than magically solving label width. Use if label measurement proves it fits; vertical text-labelled buttons are the safer baseline.
+
+Page contents and canonical bindings:
+
+Library
+  Search sources; expandable Folders, Playlists, Collections; Favourites view; Hidden Items entry.
+  Active source remains visibly selected with name, type and available/offline counts.
+  One contextual New menu: Add folder / New playlist / New collection.
+  Edit/Remove appear on the relevant row's menu, with an equivalent keyboard action.
+  Removing a folder means remove from Desktop Vista; never imply file deletion.
+  Existing _active_kind/_active_id and _load_source remain authoritative.
+  Favourites storage exists but a dedicated view needs a resolver/UI adapter; do not invent a persistent source kind the current validator rejects.
+
+Playback
+  Start/Stop user intent; Shuffle mode; Interval / Daily / Solar selection.
+  Only relevant editors are expanded: interval + unit, daily time chips, or solar coordinates and fallback description.
+  Battery Saver and fullscreen policies in an Advanced disclosure, preserving existing independent pause reasons.
+  Solar coordinates receive separate Latitude/Longitude labels and validation; represent existing values without changing schedule math.
+  Surface effective mode and next due time, including "Using fallback times" and "Waiting for available images".
+
+Displays
+  Interactive topology/accessible list, selected output scope, global Fit Style, optional crop preview.
+  Capability explanation: "Choose a display (experimental)"; COM terminology is in technical details, not the main control label.
+  Standard backend exposes All displays only. A disabled action explains what is unavailable.
+  Span is an all-displays mode; choosing it never silently switches output targets.
+
+Settings
+  Appearance: System / Light / Dark; motion; always-show preview controls.
+  Startup and close-to-tray preferences; global hotkeys and actual conflict status.
+  Local shortcut reference separated from global registered bindings.
+  Diagnostic details and version; no duplicate playback settings.
+
+Primary action alternatives:
+• Floating Apply: visually close to the image but disappears with the HUD and may obscure crops. Reject as the sole Apply control.
+• Header Apply: good discoverability, but competes with target/source context at narrow widths.
+• Permanent stage footer: recommended. Explicit target, stable location, keyboard-reachable even while the sidebar scrolls or the HUD is hidden.
+
+Footer: left two-line filename + dimensions/size/index or status; right "Apply to all displays" / "Apply to Display 2". Button min-height 36 (40 preferred), stable min-width around 176. At compact width use "Apply" with a nearby visible target label, never omit target context entirely. Disable without a decodable selection or during an accepted in-flight apply. Do not call wallpaper APIs on mere target selection or tab navigation.
+
+Preview navigation remains selection-only. The user presses Apply to commit. Start Slideshow keeps its existing immediate-apply behaviour and states that clearly. The HUD's Random action selects a random candidate; persistent Shuffle belongs to playback settings and is indicated separately. Applied-history Undo remains distinct from Previous preview navigation. Do not remap tray Previous away from its v1.6 applied-history semantics.
+
+2.2 Preview stage, responsive geometry and floating HUD
+------------------------------------------------------
+Main panel is three rows: 44px context header, expanding stage, 52px persistent footer. Limit internal vertical padding to roughly 24px total. Do not add a separate full-width status bar and then count it as recovered preview space. With sidebar 280, 24px outer horizontal margins and a 12px gutter, a 1180px client width yields an 864px main panel and approximately 832px image width after 16px inner margins. At 620px height, main height about 596 minus header44/footer52/padding24 gives a 476px stage; a 16:9 image can reach about 832 x 468. Against the measured baseline's ~739 x 416, that is a projected ~27% area gain, not a measured redesign result. HUD coverage temporarily obscures some pixels and must be reported separately from allocated image area.
+
+Window rules:
+• >=1100 logical pixels: 280px sidebar; full footer metadata; full text-labelled toolbar when space permits.
+• 980–1099: sidebar 240; shorten metadata through middle ellipsis; keep Apply and target visible; overflow secondary curation commands into a labelled More menu.
+• Below the existing minimum: no support promise in phase one. At high Windows scale, permit collapsing the sidebar to a labelled Library button rather than raising minimum height beyond available work area.
+• Sidebar page content may scroll; root and primary action do not scroll. Editors use their own scroll regions with fixed Save/Cancel footer.
+• Use logical dimensions consistently; decoded image buffers use physical-pixel targets where needed. CTk scaling is not identical to raw Tk Canvas coordinates.
+
+Stage styling: neutral matte, 10px outer frame radius, 1px keyline. A rounded CTkFrame does not automatically clip a rectangular image child. Either use a square image inside rounded matte padding or create a rounded alpha mask for the preview derivative; leave the source image untouched. A subtle painted offset shadow may be used on solid backgrounds. Avoid pretending a widget-level CSS shadow or backdrop-filter exists in Tk.
+
+HUD placement: bottom-centre within stage, 12–16px above the stage edge. It contains Previous, Random, Next; separator; Favourite, Hide, Tags. A small More menu holds Reveal, Copy Path, Undo Last Applied and Hidden Items. Keep Hide non-destructive with Undo. Use a solid theme-aware toolbar with a keyline initially. CTk's "transparent" background paints a matching parent colour, not per-widget alpha over an image; top-level -alpha would fade every control in that window. A second translucent Toplevel has focus, stacking, DPI and capture costs and is not recommended.
+
+HUD interaction state machine:
+1. Show on stage pointer entry/movement, focused toolbar control, F6, keyboard navigation to the region, or explicit always-visible preference.
+2. Stay visible while pointer is on toolbar, a toolbar button has focus, a related popover/menu is open, or a drag is active.
+3. Hide after ~2.5 seconds of no stage activity, only if no hold condition remains.
+4. Never move focus because of a mouse reveal or hide. Never hide a focused control. Esc closes the active popover first.
+5. When app is hidden/minimized, stop animation work and keep only low-frequency state service; if no stage interaction is happening, do not decode ambient effects.
+6. For accessibility/high contrast/reduced motion, offer Always show controls and no animation. A visible Controls button provides a non-hover route.
+
+Ambient glow: optional and off by default. Derive a blurred 64–128px backdrop once per image generation in the existing decode worker, composite a dark/light matte for adequate contrast, cache only the derivative, and discard stale results. Do not recalculate dominant colours on every pointer move or resize. Disable in high contrast and on explicit reduced-effects policy. It must not change the wallpaper source, crop or colour rendering.
+
+Inspection mode: double-click stage or F11 opens a borderless preview on the chosen inspection monitor; Esc exits. Save/restore normal geometry and focus, retain a persistent "Preview only · Esc to exit" affordance, and keep output target unchanged. Distinguish inspection monitor from apply monitor. First implement fit-to-screen; optional 100% zoom and panning need a separate bounded higher-resolution decode request, cursor-centred zoom and visible Fit/100% controls. F11 is not a wallpaper command. Use a single owned window where practical; no shell desktop reparenting.
+
+2.3 Interactive monitor topology and visual picker
+--------------------------------------------------
+Reuse compute_topology_layout at desktop_vista.py:687 for the initial coordinate maths, but extend its presentation adapter with stable-in-session display identities and hit regions. Input rectangle fields are desktop pixels, including negative origins. Translate by min(left/top), scale uniformly to fit, centre the union, and preserve orientation/gaps. Do not resize native monitor positions or invoke Display Settings as a side effect of moving a card.
+
+Cards show a number/name, a primary label, resolution and optional applied-thumbnail. Prefer sufficient card size in the Displays page/stage inspector; the current 260 x 80 strip cannot contain all badges legibly. A tiny monitor receives a minimum-size click target outside the geometry and an equivalent list row; never falsify its displayed aspect ratio just to fit text. Primary is a labelled badge, not colour alone. Selected has a 2px contrasting ring and a check marker.
+
+Selection semantics:
+• Click/Enter selects a target and updates footer wording; it does not apply.
+• The current Win32 map and COM list MUST be reconciled to the same display model before map clicks can target output. Enumeration indexes are not identities. If matching is unresolved, keep topology read-only and use the verified COM picker.
+• Preserve disconnected assignments as unavailable entries; disable Apply to a stale selected display. Never silently default that action to All displays.
+• In v1.6, "last applied" history stores paths in one shared pipeline. It cannot reliably supply distinct per-display applied thumbnails. Use "Assignment unknown" or clearly labelled selected-image previews until v2.0 owns per-target results.
+• Current fit mode is global. A per-monitor image request can still affect everyone's positioning policy. Label "Fit style · all displays" explicitly. Independent crop policies require pre-rendering and a separate design decision.
+• Span requires All displays; the panorama assistant overlays seams/unused desktop regions over the bounding-rectangle composition. Mixed DPI and dissimilar aspect ratios need live visual verification, not just correct rectangle maths.
+
+Drag-to-assign is phase-two optional. Prefer drag to STAGE an assignment, show "Apply to Display 2" on drop, then explicit Apply. Do not silently apply on hover. Support Esc cancellation, pointer capture release, invalid/offline target feedback and a click/keyboard alternative. Dragging from Explorer requires additional native drop integration; in-app dragging is the smaller first scope.
+
+2.4 Tag chips, favourites and Hidden Items
+-----------------------------------------
+Keep canonical cfg['tags'][path] and set_tags/get_tags; preserve existing strip + exact-string deduplication semantics. Current matching is case-sensitive. Do not silently casefold stored tags or merge "Nature" with "nature" as a UI polish change. Autocomplete may search case-insensitively while inserting the exact existing spelling; suggest the existing spelling first and clearly label creation of a new tag.
+
+Tag inspector opens from Tags in the HUD into an in-app drawer. Show up to two subdued read-only badges on the stage plus "+N"; full editable chips live in the drawer. Each chip has separate actions: label filters; remove button removes membership for this image. Removal never deletes the tag from other images. Long chips truncate visually but expose full text on focus/selection in the inspector. Enter commits one tag, Down enters suggestions, Esc closes suggestions before closing the drawer, and Backspace in an empty input focuses the last Remove control instead of immediately deleting data. IME composition must not be interrupted by global character bindings.
+
+Autocomplete: derive sorted unique known tags from loaded metadata, cap visible results to six, search without disk I/O; show New tag only when applicable. Commit additions immediately to the explicit image being edited and schedule one debounced save. The widget emits tuples to its controller, not file writes. The controller captures the image path and load generation when opening the inspector: navigation cannot redirect a delayed tag edit to another image. set_tags during preview refresh is silent and must not emit writes. Collection editor reuses the selector, retaining its current ANY-tag semantics; adding ALL/NOT filters is functional scope, not a cosmetic relabel.
+
+Favourite is a toggle with outline/filled icon and text or tooltip describing its current state. Red is optional; selected state must not depend on red alone or look like a destructive action. Preserve cfg['favourites']; a sidebar Favourites view uses existing filtering semantics via a deliberate adapter. Do not add a new persisted kind without updating validators/restoration.
+
+Hidden Items becomes a Library subview/drawer, default compact list with 64px thumbnails, filename, shortened source path, offline state and Restore. A responsive grid is optional at large sizes. Two identical basenames always show differentiating drive/folder context. Lazy-load only visible thumbnails; start with paged results (e.g. 40 per page), not thousands of CTk widgets. Provide search, multi-select Restore selected and a persistent count; no Delete file action in this redesign. Hiding shows "Hidden from Desktop Vista" with Undo captured against that exact path. Close/reopen remains possible if a transient toast expires. Deletion/restore of membership preserves selection identity or chooses the next eligible image deterministically through the existing controller; never retain an out-of-range index.
+
+2.5 Playlist/collection managers, dialogs and notifications
+----------------------------------------------------------
+Manager layout: resizable in-app inspector or owned CTkToplevel, preferred 640 x 520, minimum 480 x 360 where work area permits. Clamp to owner work area and provide internal scrolling at high scale. Name at top, searchable membership in the middle, fixed Save/Cancel footer. Folder row has checkbox, friendly basename and a secondary middle-elided full path plus online badge. Full path is available through focus details/Copy Path. Counts distinguish selected sources from currently available sources. Offline membership remains selected and savable.
+
+Draft state is copied on open. Save validates in place, focuses the first invalid field and makes one canonical mutation. Cancel/Esc returns focus to the launching control and discards draft changes. Reopening an already open editor focuses it rather than creating competing dialogs. Confirm discard only if a draft is dirty and the loss would be meaningful. Do not mutate live playlist objects on each checkbox toggle.
+
+Dialog framework: owned/transient, modal only when a decision is required, local grab after visibility, initial focus, Tab traversal, Escape/close handling, and grab release in every exit path. A confirmation offers a specific verb (Remove playlist), plain consequence text and Cancel as safe default. Hide/favourite toggles are reversible and usually need no modal. File-picker OS dialogs remain native. Retain a native messagebox fallback when constructing a custom error sheet itself fails.
+
+Notification routing is by semantic event, not searching substrings in _set_status text:
+• Success: short non-blocking toast, normally 4 seconds, mirrored in recent activity.
+• Validation: inline beside the relevant entry, persists until corrected; not a toast.
+• Ongoing state: persistent badge/footer: "Running", "Paused: Battery Saver", "Stopped", "Scanning", "Source offline". Automatic pause is not an error.
+• Recoverable failure: toast plus persistent issue/Retry when relevant. Full detail expandable or in activity history. A timed-out apply says outcome unknown pending reconciliation.
+• Decision or dangerous consequence: modal sheet. A toast never substitutes for an answer to askyesno.
+• Tray-hidden operation: no stolen foreground window; aggregate state and optionally notify on meaningful failure, respecting existing notification policy.
+
+Toast location: upper-right of stage, below its context header; maximum one visible compact card and a bounded pending queue. Never cover Apply or overlap the lower HUD. Minimum 4 seconds for passive success; action/error messages remain until dismissed in the blueprint. Pause expiry while hovered, keyboard-focused or window unmapped. Never steal focus on arrival. Expose an Activity button and keyboard path to notification actions; CTk labels are not automatically UI Automation live regions. Deduplicate repeated pause/source errors upstream by event key, keep logs, and show aggregate counts instead of a notification storm.
+
+Micro-interactions: immediate pressed/selected state, 120–160ms optional visual easing, no animation under reduced motion; no synthetic fake percent progress for an unknown-duration OS call. A spinner means work is pending, and should stop on a matched completion. Use request IDs so a late success cannot describe the newly selected image. Render updates on Tk only; do not use sleep or nested update loops in production handlers.
+
+2.6 Fluent-inspired design system, themes and branding
+-----------------------------------------------------
+Use a restrained shared token set rather than recolouring each control independently. Values below are starting values; test actual foreground/background combinations and focus rings, including system accent variants.
+
+Token                   Light          Dark
+Window/matte            #F3F3F3        #181818
+Panel                    #FFFFFF        #232323
+Raised surface/HUD      #F7F7F7        #2C2C2C
+Text primary             #1A1A1A        #F5F5F5
+Text secondary           #505050        #BDBDBD
+Decorative keyline       #D4D4D4        #454545
+Interactive boundary     #737373        #949494
+Focus/accent default     #005FB8        #75B6FF
+Accent button fill       #005FB8        #005FB8
+Accent button text       #FFFFFF        #FFFFFF
+Error text               #A4262C        #FFB4AB
+
+Spacing scale: 4, 8, 12, 16, 24, 32. Radius: 6 buttons/chips, 10 panels, 12 HUD. Controls: 36–40px touch/click height; small glyph artwork 16 or 20 within a larger hit box. Reserve saturated primary fill for Apply and selected navigation; playback is secondary, not a competing green primary block. Keylines alone need not carry semantic distinctions; focused/selected controls do.
+
+Type hierarchy: app title 20–22px semibold; page title 18; section label 13 semibold in sentence case; body/control 14; secondary metadata 12–13. Use CTkFont sizes in the toolkit's pixel model, not unlabelled point assumptions. Detect installed font families: prefer Segoe UI Variable Text for body if available, Display for larger titles if available, otherwise Segoe UI. Tk's handling of variable axes/optical sizing should be inspected visually; specifying a family string does not guarantee WinUI-equivalent shaping. Avoid forcing the Small face for 10px grey text. [Microsoft typography guidance](https://learn.microsoft.com/en-us/windows/apps/design/signature-experiences/typography).
+
+Iconography: Segoe Fluent Icons is supplied on Windows 11, not by default on Windows 10. Its private-use codepoints require the intended font; never assume a fallback font will draw the same icon. Keep icon and text in separate widgets/fonts, or use licensed authored PNG assets via CTkImage. Runtime SVG loading is not provided by CTkImage; rasterise controlled vector assets at build time into 1x/2x sizes. Text-labelled fallback always works. Verify each codepoint/fallback pair rather than copying random Unicode arrows. [Microsoft Segoe Fluent Icons reference](https://learn.microsoft.com/en-us/windows/apps/design/iconography/segoe-fluent-icons-font).
+
+Branding has been integrated since the earlier review: load_brand_icon and _apply_window_icon exist. The current desktop_vista.ico contains 16, 24, 32, 48, 64, 128 and 256px frames; desktop_vista.png remains 96 x 96 RGBA. Preserve the supplied blue monitor-and-cog mark. Its utility identity is appropriate; do not regenerate it for this layout task. Use 24/32px header artwork and avoid scaling the 96px raster as a large hero. Old notes_004's single-frame ICO finding is no longer current.
+
+Theme: expose System/Light/Dark via ctk.set_appearance_mode and light/dark colour tuples. CTk documents runtime OS appearance tracking in System mode. Update raw Canvas backgrounds and any derived Pillow matte images when appearance changes; tuple support in CTk does not automatically theme native Canvas primitives. Do not reset global appearance when opening each dialog. [CustomTkinter appearance mode](https://customtkinter.tomschimansky.com/documentation/appearancemode/).
+
+Accent: preserve blue as default. Prefer the documented UISettings.GetColorValue(Accent) adapter if WinRT is already available. The requested HKCU\Software\Microsoft\Windows\DWM values can be read as a best-effort fallback, but their value names/packing are not a stable application-theme contract: validate REG_DWORD/type/alpha, test channel order against the known machine accent, and fall back on missing values or ambiguity. Never write those registry values. Do not assume title-bar ColorizationColor exactly equals the current app accent. Choose contrasting text algorithmically and reserve error/paused semantics from accent changes. Existing roadmap defers accent synchronisation to v2.1; retain that boundary. [UISettings colour API](https://learn.microsoft.com/en-us/uwp/api/windows.ui.viewmanagement.uisettings.getcolorvalue?view=winrt-26100).
+
+High contrast is a separate mode from dark. Detect the Windows contrast setting through a supported adapter, use system colours where needed, remove glow/translucency, keep visible outlines and pin HUD controls. Measure a design target of >=4.5:1 for normal text and >=3:1 for meaningful UI boundaries/focus marks, without claiming platform-wide certification. Narrator, keyboard order and high-contrast settings need real Windows checks. [Microsoft contrast themes](https://learn.microsoft.com/en-us/windows/apps/design/accessibility/high-contrast-themes), [accessibility overview](https://learn.microsoft.com/en-us/windows/apps/design/accessibility/accessibility-overview).
+
+Mica/Acrylic: not required. MEMORY/ROADMAP already rejected them as disproportionate risk/value for this Tk app. Recreating the old proposal in a visual review would undo that decision without evidence. Fluent alignment comes first from hierarchy, spacing, typography, restrained surfaces and clear interactions.
+
+2.7 Keyboard navigation and accessibility contract
+-------------------------------------------------
+Local shortcuts only run when no modal editor owns input and focus is not Entry/Text/Spinbox/Combobox or their internal child widget. Check native widget class and ancestor chain, because CTkEntry wraps a real Tk Entry. Only consume recognised commands with "break"; return normally for text editing and platform accelerators. Avoid bind_all/unbind_all that replace library handlers. Respect held modifier keys and IME composition. Keep per-component bindings scoped; root commands are the last fallback.
+
+Proposed mapping (explicit change from current behaviour):
+Left/Right    Previous/Next selected preview, no wallpaper apply.
+R             Random preview selection; does not toggle Shuffle mode.
+F             Toggle favourite for selected image.
+H             Hide selected image with Undo.
+Enter         Apply selection, only outside an editor and when enabled.
+Space         Start/Stop slideshow user intent, only outside interactive controls.
+F6            Reveal toolbar and focus first enabled transport control; subsequent region navigation follows documented focus order.
+F11           Enter/leave inspection mode.
+?             Open shortcut help; typing '?' in an entry still types it.
+Esc           Close suggestions -> close popover/drawer -> leave inspection -> close help; otherwise no destructive/global action.
+Ctrl+Z        Undo last applied wallpaper only outside text editors; text editors retain their own Undo.
+
+Space currently advances and Esc currently stops slideshow. Switching to the mapping above is a documented UI behaviour change: ship a one-time shortcut notice and keep a clearly visible Stop control. Do not change global hotkeys as part of this work. Display their actual configured bindings and conflicts (v1.6 default Win+Alt+N/P/L/H/Z/S), not a stale assumed Win+Alt+F mapping. No hotkey should become active merely because its label exists.
+
+Focus route: navigation -> active sidebar page -> context/target -> Controls/HUD -> footer Apply -> Activity. Tab/Shift+Tab are reversible; hidden controls are not focus stops. Focusing HUD pins it. Moving focus to an editor never lets a root shortcut trigger curation. Restore focus after a sheet/drawer closes. All icon-only controls have meaningful labels/tooltips and a text-equivalent route; adding tooltip text does not prove screen-reader exposure.
+
+CustomTkinter's canvas-drawn widgets are not automatically native WinUI accessibility elements. The helper below explicitly supplies keyboard focus and activation for its CTkButton composites, but UI Automation names/roles/state and toast announcements still require inspection with Narrator/Accessibility Insights. If a required action remains inaccessible, provide a tested native accessible alternative or revisit that control; do not declare compliance from visual focus rings alone.
+
+3. ASCII / TEXT WIREFRAMES
+==========================
+
+Main window, expanded Library. All captions are explanatory; actual glyphs use the icon system.
+
++------------------------+-------------------------------------------------------------+
+| [brand] Desktop Vista  | Workday · 320 images      Target: [All displays v] [Controls] |
+| All my drives.         +-------------------------------------------------------------+
+| One perfect view.      |                                                             |
+|                        |                  neutral preview stage                      |
+| [Library] [Playback]   |                                                             |
+| [Displays] [Settings]  |   +-----------------------------------------------------+   |
+|                        |   |                                                     |   |
+| [Search sources...]    |   |                   WALLPAPER                         |   |
+| + New                  |   |                                                     |   |
+|                        |   |  [Nature] [Minimal] +2                               |   |
+| Folders                |   |                                                     |   |
+|   Photos  C:    Online |   |   +---------------------------------------------+   |   |
+|   Travel  F:   Offline |   |   | Prev  Random  Next | Heart  Hide  Tags  More |   |   |
+| Playlists              |   |   +---------------------------------------------+   |   |
+| > Workday              |   +-----------------------------------------------------+   |
+|   Weekends             |                                                             |
+| Collections            +-------------------------------------------------------------+
+|   Nature               | coast.jpg · 3840 x 2160 · 4.2 MB    [Apply to all displays]  |
+| Favourites             | Selected 14/320 · Running · next 14:32          [Activity]  |
+| Hidden Items (12)      +-------------------------------------------------------------+
++------------------------+
+
+Playback page: [Start/Stop] [Shuffle] [Mode v]
+  Interval: [15] [minutes v]
+  OR Daily: [08:00 x] [18:00 x] [+ Add time]
+  OR Solar: [Use location] Latitude [...] Longitude [...] [Save location]
+  Effective schedule/fallback summary
+  > Advanced: Battery Saver / fullscreen policies
+
+Interactive monitor stage (geometry follows real coordinates):
+
+  [All displays]  [Independent images]  [Span preview]  [Refresh]
+      +------------+  +-------------------------------+
+      | Display 2  |  | Display 1 · Primary            |
+      | 1440x2560  |  | 3840x2160                      |
+      | Portrait   |  | [applied thumbnail if known]   |
+      | [selected] |  +-------------------------------+
+      +------------+
+  Selected: Display 2       Fit: [Fill v] applies to all displays
+  [Keyboard-accessible display list]       [Apply selection to Display 2]
+  Disconnected: Office monitor · assignment retained (v2.0 capability)
+
+Floating toolbar states:
+
+  Normal:    [Previous] [Random] [Next] | [Favourite] [Hide] [Tags] [More]
+  Compact:   [Prev] [Random] [Next] [Favourite] [More: Hide/Tags/...]
+  Pinned:    same toolbar + "Always show controls" preference
+  No image:  disabled transport/curation; Library Add folder stays available
+  Popover:   toolbar pinned until its owned popover closes
+  Focus:     outlined button; Enter/Space activate; no idle hiding
+
+Playlist / collection inspector:
+
++-------------------------------------------------------------------+
+| Edit Workday                                             [Close]  |
+| Name [Workday...................................................]  |
+| [Folders | Filter tags]     (Collection editor uses Filter tags)   |
+| [Search folders or paths........................................]  |
+| [x] Landscapes                  Online                             |
+|     D:\Photography\Landscapes                                    |
+| [x] Travel                      Offline · membership retained      |
+|     F:\Albums\Travel                                             |
+| [ ] Shared photos               Online                             |
+|     \\NAS\Photos\Shared                                           |
+|                                                                   |
+| Match ANY: [Nature x] [Minimal x] [+ Add tag...]                    |
+| Suggestions: Nature / Natural light / Create "Nautical"            |
+| 2 sources selected · 1 currently available                         |
+| Field error appears here, without opening another dialog           |
+|                                          [Cancel] [Save changes]  |
++-------------------------------------------------------------------+
+
+Hidden Items:
+  [Search...] [Restore selected]   12 hidden
+  [thumb] coast.jpg     D:\Landscapes\...      [Restore]
+  [thumb] coast.jpg     F:\Travel\... Offline [Restore]
+  Pages/virtualised rows; paths distinguish names; no source deletion.
+
+4. CUSTOMTKINTER CODE BLUEPRINTS
+================================
+
+Compatibility target: Python 3.10+, CustomTkinter 5.2.2 and existing Tk runtime. Three requested components share the first support block. Concatenate the four Python blocks in order into a proposed ui_components.py when implementation is authorised. They import no Desktop Vista engine and cannot set wallpaper or write config. All widget methods run on Tk's owning thread. The toast post() method alone is safe for worker producers and returns False if its bounded inbox is full.
+
+Implementation locations:
+• Add ui_components imports near other UI imports in desktop_vista.py.
+• In _build_ui, create a dedicated stage frame in self.main row 1, place self.preview inside it, and construct HoverHUD as a child of that stage. Replace the three old rows only after their commands are all represented.
+• Map toolbar callbacks to _prev, _random, _next, _toggle_favourite, _hide_current and a new tag-inspector opener. Keep self.fav_btn referencing the toolbar's Favourite button until _update_favourite_button is adapted. Hidden count moves to Library; retain self.hidden_btn or update its two callers together.
+• Construct ToastManager under self.main after stage creation. Convert semantic success/error call sites incrementally; retain _set_status as a compatibility bridge to persistent status until callers are classified.
+• TagSelector.set_tags(get_tags(cfg, captured_path)) replaces _update_tags_field's visual refresh. on_change calls set_tags(cfg, captured_path, list(tags)) and the existing save debounce, with path/generation validation. Do not read self.index in a delayed callback.
+• In _on_close before parent destruction, call destroy() on these components. Their timer cleanup is also invoked by normal parent-driven widget destruction. No bind_all or global unbind is used.
+
+4.1 Shared support: focusable CTk action button and ownership helpers
+--------------------------------------------------------------------
+CTkButton 5.2.2 delegates focus to a text label and does not expose a normal takefocus constructor argument. The adapter deliberately puts focus on the native outer Frame using standard Tk APIs; it never reaches into CTk's private _canvas/_entry fields. CTk mouse bindings are retained with additive binding. Keyboard events on the outer frame return 'break' to prevent duplicate root commands. Call set_enabled rather than configuring only state so traversal stays consistent.
+
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Iterable
+import logging
+import queue
+import threading
+import time
+import tkinter as tk
+import customtkinter as ctk
+
+LOG = logging.getLogger("desktop_vista.ui")
+SURFACE = ("#F7F7F7", "#2C2C2C")
+TEXT = ("#1A1A1A", "#F5F5F5")
+BORDER = ("#737373", "#949494")
+FOCUS = ("#005FB8", "#75B6FF")
+
+
+def contains_widget(parent: tk.Misc, child: tk.Misc | None) -> bool:
+    while child is not None:
+        if child is parent:
+            return True
+        child = getattr(child, "master", None)
+    return False
+
+
+def pointer_inside(widget: tk.Misc) -> bool:
+    if not widget.winfo_ismapped():
+        return False
+    x, y = widget.winfo_pointerxy()
+    return contains_widget(widget, widget.winfo_containing(x, y))
+
+
+class ActionButton(ctk.CTkButton):
+    def __init__(self, master, *, text: str, command: Callable[[], None],
+                 width: int = 72):
+        super().__init__(master, text=text, command=command, width=width,
+                         height=36, corner_radius=6, border_width=2,
+                         border_color=SURFACE, fg_color=SURFACE,
+                         hover_color=("#E5E5E5", "#3D3D3D"), text_color=TEXT)
+        tk.Frame.configure(self, takefocus=1)
+        tk.Misc.bind(self, "<FocusIn>", self._focus_in, add="+")
+        tk.Misc.bind(self, "<FocusOut>", self._focus_out, add="+")
+        tk.Misc.bind(self, "<Return>", self._activate, add="+")
+        tk.Misc.bind(self, "<space>", self._activate, add="+")
+        self.bind("<Button-1>", self._mouse_focus, add="+")
+
+    def focus_set(self):
+        return tk.Misc.focus_set(self)
+
+    def _mouse_focus(self, event):
+        if self.cget("state") == "normal":
+            self.focus_set()
+
+    def _focus_in(self, event):
+        if event.widget is self:
+            self.configure(border_color=FOCUS)
+
+    def _focus_out(self, event):
+        if event.widget is self:
+            self.configure(border_color=SURFACE)
+
+    def _activate(self, event):
+        if self.cget("state") == "normal":
+            self.invoke()
+        return "break"
+
+    def set_enabled(self, enabled: bool) -> None:
+        self.configure(state="normal" if enabled else "disabled")
+        tk.Frame.configure(self, takefocus=1 if enabled else 0)
+```
+
+4.2 Floating hover HUD: bounded polling, focus pinning and teardown
+------------------------------------------------------------------
+Stage is the parent; overlay is placed rather than gridded, so it does not reserve an extra row. Polling the pointer/focus avoids CTk child enter/leave flicker and avoids replacing another widget's bindings. Six labelled controls fit the intended desktop stage; use an explicit compact/More variant below that width rather than allowing overflow. Controls can be pinned while a tag popover is open. The sample is deliberately solid, not falsely advertised as alpha-translucent.
+
+```python
+class HoverHUD(ctk.CTkFrame):
+    def __init__(self, stage, actions: dict[str, Callable[[], None]],
+                 *, idle_seconds: float = 2.5, always_visible: bool = False):
+        super().__init__(stage, fg_color=SURFACE, corner_radius=12,
+                         border_width=1, border_color=BORDER)
+        self.stage = stage
+        self.idle_seconds = max(0.1, idle_seconds)
+        self.always_visible = always_visible
+        self.pinned = False
+        self.visible = False
+        self._closed = False
+        self._pointer = None
+        self._last_activity = time.monotonic()
+        self.buttons: dict[str, ActionButton] = {}
+        for column, (name, callback) in enumerate(actions.items()):
+            button = ActionButton(self, text=name, command=callback)
+            button.grid(row=0, column=column, padx=3, pady=6)
+            self.buttons[name] = button
+        self._job = self.after(80, self._tick)
+
+    def reveal(self, *, keyboard: bool = False) -> None:
+        if self._closed:
+            return
+        self._last_activity = time.monotonic()
+        if not self.visible:
+            self.place(relx=0.5, rely=1.0, anchor="s", y=-12)
+            self.lift()
+            self.visible = True
+        if keyboard:
+            for button in self.buttons.values():
+                if button.cget("state") == "normal":
+                    button.focus_set()
+                    break
+
+    def _tick(self) -> None:
+        self._job = None
+        if self._closed:
+            return
+        now = time.monotonic()
+        point = self.stage.winfo_pointerxy() if self.stage.winfo_ismapped() else None
+        over_stage = pointer_inside(self.stage)
+        if over_stage and point != self._pointer:
+            self._last_activity = now
+        self._pointer = point if over_stage else None
+        held = (self.always_visible or self.pinned or pointer_inside(self)
+                or contains_widget(self, self.focus_get()))
+        if held or ((over_stage or self.visible)
+                    and now - self._last_activity < self.idle_seconds):
+            if not self.visible:
+                self.reveal()
+        elif self.visible:
+            self.place_forget()
+            self.visible = False
+        self._job = self.after(80 if self.stage.winfo_ismapped() else 400, self._tick)
+
+    def destroy(self) -> None:
+        if not self._closed:
+            self._closed = True
+            if self._job is not None:
+                self.after_cancel(self._job)
+                self._job = None
+        super().destroy()
+```
+
+4.3 Toast manager: one visible card, bounded backlog, persistent actions
+----------------------------------------------------------------------
+This manager implements presentation, not decisions. log/Activity ingestion should happen at the event source. Overflow returns False; the caller must retain a persistent error indicator/log rather than assume a dropped toast was shown. Accepted queued items are FIFO. Dedupe by semantic event key belongs in the event router before post(). Action/error notices are sticky, preserving access to Undo/Retry. Callback exceptions are logged and shown as a sticky failure. A UI action must not perform blocking I/O.
+
+```python
+@dataclass(frozen=True)
+class Notice:
+    text: str
+    error: bool = False
+    action_text: str = ""
+    action: Callable[[], None] | None = None
+    seconds: float = 4.0
+
+
+class ToastManager(ctk.CTkFrame):
+    def __init__(self, parent):
+        super().__init__(parent, fg_color=SURFACE, corner_radius=10,
+                         border_width=1, border_color=BORDER)
+        self._inbox: queue.Queue[Notice] = queue.Queue(maxsize=32)
+        self._closed_event = threading.Event()
+        self._active: Notice | None = None
+        self._remaining = 0.0
+        self._last_tick = time.monotonic()
+        self.grid_columnconfigure(0, weight=1)
+        self.label = ctk.CTkLabel(self, text="", text_color=TEXT,
+                                 justify="left", anchor="w", wraplength=250)
+        self.label.grid(row=0, column=0, padx=12, pady=(10, 4), sticky="ew")
+        self.close_button = ActionButton(self, text="Dismiss", command=self.dismiss)
+        self.close_button.grid(row=0, column=1, padx=(0, 8), pady=8)
+        self.action_button = ActionButton(self, text="Action", command=self._act)
+        self.action_button.grid(row=1, column=0, padx=12, pady=(0, 8), sticky="w")
+        self.action_button.grid_remove()
+        self._job = self.after(100, self._tick)
+
+    def post(self, notice: Notice) -> bool:
+        if self._closed_event.is_set():
+            return False
+        try:
+            self._inbox.put_nowait(notice)
+        except queue.Full:
+            LOG.warning("Toast backlog full: %s", notice.text)
+            return False
+        return True
+
+    def _show(self, notice: Notice) -> None:
+        self._active = notice
+        self._remaining = max(4.0, notice.seconds)
+        self.label.configure(text=notice.text,
+                             text_color=("#A4262C", "#FFB4AB") if notice.error else TEXT)
+        if notice.action is not None:
+            self.action_button.configure(text=notice.action_text or "Action")
+            self.action_button.grid()
+        else:
+            self.action_button.grid_remove()
+        self.place(relx=1.0, x=-12, y=48, anchor="ne")
+        self.lift()
+
+    def _tick(self) -> None:
+        self._job = None
+        if self._closed_event.is_set():
+            return
+        now = time.monotonic()
+        elapsed = min(now - self._last_tick, 0.25)
+        self._last_tick = now
+        if self._active is None:
+            try:
+                self._show(self._inbox.get_nowait())
+            except queue.Empty:
+                pass
+        elif not self._active.error and self._active.action is None:
+            held = (not self.winfo_toplevel().winfo_ismapped() or pointer_inside(self)
+                    or contains_widget(self, self.focus_get()))
+            if not held:
+                self._remaining -= elapsed
+                if self._remaining <= 0:
+                    self.dismiss()
+        self._job = self.after(100, self._tick)
+
+    def dismiss(self) -> None:
+        if contains_widget(self, self.focus_get()):
+            self.master.focus_set()  # Integration may restore the Activity button instead.
+        self._active = None
+        self.place_forget()
+
+    def focus_notice(self) -> None:
+        if self._active is not None:
+            button = self.action_button if self._active.action else self.close_button
+            button.focus_set()
+
+    def _act(self) -> None:
+        notice = self._active
+        self.dismiss()  # Avoid reusing an action during a callback.
+        if notice is not None and notice.action is not None:
+            try:
+                notice.action()
+            except Exception:
+                LOG.exception("Notification action failed")
+                self._show(Notice("Action failed. See activity details.", error=True))
+
+    def destroy(self) -> None:
+        if not self._closed_event.is_set():
+            self._closed_event.set()
+            if self._job is not None:
+                self.after_cancel(self._job)
+                self._job = None
+            self._active = None
+            while not self._inbox.empty():
+                try:
+                    self._inbox.get_nowait()
+                except queue.Empty:
+                    break
+        super().destroy()
+```
+
+For narrow layouts, put the toast into the inspector's notification slot and set wraplength from available width. The above fixed card is for a >=620px stage. Always-visible errors should also appear in the Activity/issue list, because a queued error can wait behind another sticky action. The sample never invokes an OS toast or starts a modal wait.
+
+4.4 Tag chip selector: exact canonical strings, autocomplete and callbacks
+--------------------------------------------------------------------------
+One chip row per tag is intentionally used inside a bounded scroll region: this avoids unreliable text-width approximations and scales to long/localised names. Each row is a rounded pill with a label/filter action and a Remove action. A later horizontal flow adapter can reuse the same canonical model after its resize/focus behaviour is tested. Suggestions are capped at six. The component accepts a caller-owned list of existing tags and refreshes silently; storage remains external.
+
+```python
+class TagSelector(ctk.CTkFrame):
+    def __init__(self, parent, *, known: Iterable[str] = (),
+                 on_change: Callable[[tuple[str, ...]], None],
+                 on_filter: Callable[[str], None] = lambda tag: None,
+                 on_close_requested: Callable[[], None] = lambda: None):
+        super().__init__(parent, fg_color="transparent")
+        self._tags: list[str] = []
+        self._known = tuple(dict.fromkeys(known))
+        self._on_change = on_change
+        self._on_filter = on_filter
+        self._on_close_requested = on_close_requested
+        self._remove_buttons: list[ActionButton] = []
+        self._suggestion_buttons: list[ActionButton] = []
+        self.grid_columnconfigure(0, weight=1)
+        self.chips = ctk.CTkScrollableFrame(self, height=112)
+        self.chips.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.chips.grid_columnconfigure(0, weight=1)
+        self.entry = ctk.CTkEntry(self, placeholder_text="Add a tag")
+        self.entry.grid(row=1, column=0, padx=(0, 6), pady=8, sticky="ew")
+        self.add_button = ActionButton(self, text="Add", command=self._commit)
+        self.add_button.grid(row=1, column=1, pady=8)
+        self.hint = ctk.CTkLabel(self, text="", anchor="w", justify="left",
+                                wraplength=300, text_color=TEXT)
+        self.hint.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.suggestions = ctk.CTkFrame(self, fg_color="transparent")
+        self.suggestions.grid(row=3, column=0, columnspan=2, sticky="ew")
+        self.suggestions.grid_columnconfigure(0, weight=1)
+        self.entry.bind("<KeyRelease>", self._search, add="+")
+        self.entry.bind("<Return>", self._commit_event, add="+")
+        self.entry.bind("<Down>", self._down, add="+")
+        self.entry.bind("<Escape>", self._escape, add="+")
+        self.entry.bind("<BackSpace>", self._backspace, add="+")
+
+    def get_tags(self) -> tuple[str, ...]:
+        return tuple(self._tags)
+
+    def set_tags(self, values: Iterable[str]) -> None:
+        if (contains_widget(self.chips, self.focus_get())
+                or contains_widget(self.suggestions, self.focus_get())):
+            self.entry.focus_set()
+        self._tags = list(dict.fromkeys(v.strip() for v in values if v.strip()))
+        self.entry.delete(0, "end")
+        self.hint.configure(text="")
+        self._clear_suggestions()
+        self._render()
+
+    def set_known(self, values: Iterable[str]) -> None:
+        self._known = tuple(dict.fromkeys(values))
+
+    def _render(self) -> None:
+        for child in self.chips.winfo_children():
+            child.destroy()
+        self._remove_buttons.clear()
+        for row, tag in enumerate(self._tags):
+            pill = ctk.CTkFrame(self.chips, corner_radius=12, fg_color=SURFACE)
+            pill.grid(row=row, column=0, sticky="ew", pady=3)
+            pill.grid_columnconfigure(0, weight=1)
+            label = tag if len(tag) <= 24 else tag[:21] + "..."
+            choose = ActionButton(pill, text=label,
+                                  command=lambda value=tag: self._filter(value))
+            choose.grid(row=0, column=0, sticky="ew", padx=(4, 2))
+            remove = ActionButton(pill, text="Remove",
+                                  command=lambda value=tag: self.remove_tag(value))
+            remove.grid(row=0, column=1, padx=(0, 4))
+            tk.Misc.bind(choose, "<FocusIn>",
+                         lambda event, value=tag: self.hint.configure(text=value), add="+")
+            tk.Misc.bind(remove, "<FocusIn>",
+                         lambda event, value=tag: self.hint.configure(text="Remove tag: " + value), add="+")
+            self._remove_buttons.append(remove)
+
+    def _filter(self, tag: str) -> None:
+        self.hint.configure(text=tag)
+        self._on_filter(tag)
+
+    def add_tag(self, value: str) -> None:
+        value = value.strip()
+        if not value:
+            self.hint.configure(text="Enter a tag first.")
+            return
+        if value in self._tags:
+            self.hint.configure(text="This tag is already selected.")
+            return
+        self._tags.append(value)
+        self._render()
+        self.entry.delete(0, "end")
+        self._clear_suggestions()
+        self.hint.configure(text="Added: " + value)
+        self.entry.focus_set()
+        self._on_change(self.get_tags())
+
+    def remove_tag(self, value: str) -> None:
+        if value not in self._tags:
+            return
+        self._tags.remove(value)
+        self.entry.focus_set()  # Move focus before destroying its old Remove button.
+        self._render()
+        self.hint.configure(text="Removed: " + value)
+        self._on_change(self.get_tags())
+
+    def _commit(self) -> None:
+        self.add_tag(self.entry.get())
+
+    def _commit_event(self, event):
+        self._commit()
+        return "break"
+
+    def _clear_suggestions(self) -> None:
+        for child in self.suggestions.winfo_children():
+            child.destroy()
+        self._suggestion_buttons.clear()
+
+    def _search(self, event=None):
+        if event is not None and event.keysym in ("Down", "Escape", "Return", "Tab"):
+            return
+        self._clear_suggestions()
+        query = self.entry.get().strip().casefold()
+        matches = [] if not query else sorted(
+            (tag for tag in self._known if query in tag.casefold() and tag not in self._tags),
+            key=str.casefold,
+        )[:6]
+        for row, tag in enumerate(matches):
+            label = tag if len(tag) <= 24 else tag[:21] + "..."
+            button = ActionButton(self.suggestions, text=label,
+                                  command=lambda value=tag: self.add_tag(value))
+            button.grid(row=row, column=0, sticky="ew", pady=2)
+            tk.Misc.bind(button, "<Escape>", self._escape_suggestions, add="+")
+            tk.Misc.bind(button, "<FocusIn>",
+                         lambda event, value=tag: self.hint.configure(text=value), add="+")
+            self._suggestion_buttons.append(button)
+        if query and not matches:
+            self.hint.configure(text="Enter or Add creates this tag.")
+
+    def _down(self, event):
+        if self._suggestion_buttons:
+            self._suggestion_buttons[0].focus_set()
+        return "break"
+
+    def _escape(self, event):
+        if self._suggestion_buttons:
+            self._clear_suggestions()
+        else:
+            self._on_close_requested()
+        return "break"
+
+    def _escape_suggestions(self, event):
+        self.entry.focus_set()
+        self._clear_suggestions()
+        return "break"
+
+    def _backspace(self, event):
+        if not self.entry.get() and self._remove_buttons:
+            self._remove_buttons[-1].focus_set()
+            return "break"
+        return None
+```
+
+Blueprint limits that must remain visible to implementers: the tag example does not implement a complete screen-reader provider or multi-select bulk editor; the toast manager does not replace decision dialogs; the HUD has no per-child alpha; all three depend on the application-level shortcut guard. Wire on_close_requested to dismiss the owning tag popover and release HUD pinning. Large tag catalogues may need search indexing, but that is not needed for a small in-memory vocabulary. Callback code must be fast and validate current image ownership before persistence.
+
+5. IMPLEMENTATION PHASING AND COMPLEXITY MATRIX
+===============================================
+
+Keep the functional roadmap authoritative. v1.6 is already shipped. The v1.6.x and v1.7 labels below are proposed UI releases, not changes made to ROADMAP.md; v2.0/v2.1 dependencies follow the existing notes_005 plan. A UI-focused release can run before v2.0 without claiming independent per-monitor playback exists.
+
+Phase / release      Work                                            Complexity  Risk    Gate
+A / v1.6.x proposed  Scope shortcuts; stable Apply/status;             Medium      Medium  Editing tags never navigates/applies;
+                     distinguish staged Fit from Apply;                        fit preview is side-effect free.
+                     icon/text labels; inline validation.
+B / v1.7 proposed    Four-page sidebar; 3-row main layout;             Medium      Medium  All old actions reachable at 980x560;
+                     consolidated HUD; contextual management.                  current settings round-trip unchanged.
+C / v1.7 proposed    Tag inspector/chips; Hidden Items;               Medium      Medium  Exact canonical tag semantics, Undo,
+                     editor drafts; toasts/activity.                           duplicate filenames and offline paths.
+D / v1.7 proposed    Dark/light/system parity; focus and              Medium      Medium  Mixed-DPI layout, keyboard traversal,
+                     shortcut help; inspection mode.                           contrast and Narrator checks recorded.
+E / v2.0 dependency  Interactive output map, per-display              High        High    Shared identity mapping, actual per-
+                     applied thumbnails, span crop assistant.                  target state and physical screen tests.
+F / v2.1 optional    Accent sync; ambient glow; drag staging;         Medium–High Medium  Feature-off parity; resource budget;
+                     advanced polish after core acceptance.                    no required action depends on effects.
+
+Quick wins: sentence-case labels, unified spacing/colours, remove emoji, move Hide manager to Library, scope shortcuts and inline validation. Some quick-looking changes have behaviour implications: Fit staging, Space/Esc remapping and toast success timing require explicit tests. Do not bundle them invisibly with aesthetic tweaks.
+
+Larger UI shifts: sidebar paging, context-aware footer, reusable inspector and focus router. Preserve source IDs and config schema. Add only presentation preferences under a namespaced ui object with defaults (selected_page, appearance, hud_always_visible, reduced_motion, inspection preference); update the validator and config.example.json together during implementation. Current validation may discard unknown keys, so merely adding JSON in a write path does not establish persistence. Never store temporary focus, animation progress or widget objects in config.
+
+Functional dependencies: reconciled monitor IDs; per-monitor applied state; asynchronous apply completion; correct command guards; source-aware curation refresh. Each needs its own implementation/review rather than a mock UI that implies completion. No scheduler, shuffle calibration, solar mathematics or wallpaper backend rewrite is part of phases A–D except the explicitly scoped command-routing fixes.
+
+Suggested implementation sequence and reviewable checkpoints
+-----------------------------------------------------------
+1. Add a presentation event router and editing-focus guard; retain current layout. Verify text entry, mouse button actions, local commands and configured global hotkeys independently.
+2. Introduce shared tokens/action labels and permanent Apply/status footer. Stage Fit changes; cover current SPI/COM routing and user-visible target wording.
+3. Move existing controls into four page builders without recreating variables. Contextual mode sections simply show/hide; inactive stored values survive.
+4. Replace transport/curation rows with HUD after confirming every old action has an accessible route. Add a pin preference and compact overflow.
+5. Add tag inspector, draft managers and Hidden Items view, preserving canonical helpers and image ownership.
+6. Introduce typed notification categories, inline validation and custom decision sheets; retain native fallback for unrecoverable UI construction errors.
+7. Complete light/system/contrast and scale tests; add inspection mode and shortcut help. Only then consider glow/accent experiments.
+8. Implement interactive output map when v2.0 dependencies are real and verified; keep honest read-only topology until then.
+
+6. VERIFICATION PLAN, EVIDENCE AND COMPLETION RECORD
+===================================================
+
+Required interaction tests:
+• Type 'forest, photo' in tags; Space, F, H, R, arrows, Backspace and Enter must not apply/hide/browse. Test CTk's actual internal Entry target, not only the outer frame.
+• Tab into HUD, wait beyond idle timeout, confirm focused button remains visible; tab out and confirm idle hiding. Pointer transitions between labels/buttons must not flicker. Always-visible preference works without motion.
+• Open tag popover and keep HUD pinned; dismiss through Escape hierarchy. Close parent with timers pending; no invalid-command callbacks afterwards.
+• Enqueue repeated notifications, overflow the bounded queue, exercise sticky Retry/Undo, dismiss by keyboard and reopen Activity. Errors remain discoverable. Hover/focus/minimize pauses expiration.
+• Add/duplicate/remove tags; refresh selection silently; case-sensitive tags remain distinct; editing captured image A cannot write onto image B after navigation.
+• Wrong-type source selected: no irrelevant Delete/Edit call. Manager Cancel keeps canonical state unchanged; long/offline paths stay readable and retained.
+• Single, portrait, negative-coordinate and disconnected displays: map selection matches verified identity; missing COM shows a useful unavailable state; stale target never means All displays.
+• Fit preview has no OS side effect; Apply success corresponds to its captured image/target; timeout/late completion cannot display a misleading success.
+
+Visual acceptance grid:
+• Client sizes 980x560, 1180x620, 1440x900, maximised 1920x1080 work area; do not equate those with physical-monitor pixel counts at all scales.
+• Windows scale 100%, 125%, 150%, 200%; transfer window between different-DPI monitors; large text and long translated labels.
+• Dark, light, follow-system changed while open, Windows contrast theme; keyboard-only and Narrator/Accessibility Insights inspection.
+• 16:9, portrait, square, 21:9 and 32:9 sources; transparent PNG, tiny source, corrupt file, unavailable NAS; empty and 5,000-image libraries.
+• All primary controls remain visible or accessible through a labelled compact route; no clipped Save/Cancel; no per-monitor independence claim from simulated rectangles alone.
+
+Performance budget to validate, not achieved claims: no image decode or disk probe on hover; no unbounded thumbnail/widget list; HUD polling about 12.5Hz while mapped and 2.5Hz unmapped in the sample; no animation when hidden; UI reacts within 100ms to local interactions excluding separately identified blocking backend work. Record p95 responsiveness, stage allocation, visible-image area minus HUD coverage, working set, and idle CPU on named hardware. Do not promise a percentage RAM improvement merely by removing button rows.
+
+Verification performed for this review:
+• Source and required project context reviewed at ce8b849; current version is 1.6.
+• Isolated baseline layout metrics collected, as listed in section 1.
+• Current icon frame inventory checked with Pillow; previous single-size ICO issue is fixed.
+• Full existing test suite: 143 passed, 5 failed in 9.64 seconds. Failures: test_listener_registers_and_fires (no synthetic hotkey delivery); test_try_become_primary_second_caller_is_not_primary and test_release_primary_lets_a_later_caller_become_primary (first mutex claim was not primary); test_ipc_server_round_trip (WinError 5 access denied); test_ipc_server_invalid_json_gets_error_reply (pipe open failed). These are real-session integration surfaces with environmental contention/access symptoms. Root cause was not proved or repaired in this UI review; do not quote the historical 148/148 result as today's outcome. No running application was stopped or registry changed to force these tests green.
+• All four Python blocks parse and execute together against CustomTkinter 5.2.2 in an isolated component harness. Successful checks covered action dispatch, disabled action suppression, exact-string tag round-trip/deduplication/removal, filter callbacks, suggestion matching, Escape handling, toast action execution, bounded-queue overflow reporting, light/dark switching and parent teardown with no Tk callback exceptions.
+• Additional controlled HUD state checks passed: idle grace after pointer exit, expiration, always-visible mode, keyboard-focus pinning and popover pinning. These checks inject pointer/focus state and validate the component logic; they are not a substitute for physical pointer/keyboard usability testing.
+• Proposed colour-token calculations passed for nine representative pairs: light/dark primary text 17.40:1 / 14.42:1; secondary text 8.06:1 / 8.37:1; white on default accent button 6.31:1; error text 6.78:1 / 8.23:1; focus marks 5.89:1 / 6.58:1. These validate the listed solid-colour pairs only, not all rendered states, user-selected accents or accessibility conformance.
+• Final working-tree inspection before delivery showed only notes/notes_006.txt added. No application source, live config, branding asset, previous note or roadmap was edited.
+
+Completed deliverables: executive summary/scorecard; seven-track component specification; four requested wireframe families; working HUD/toast/tag component blueprints with shared keyboard support; phased release/complexity matrix; verification evidence and explicit acceptance gaps.
+
+Review completion does not mean implementation completion. Phases A–F, real multi-monitor output validation and comprehensive screen-reader validation remain pending. The only intended project write from this task is this notes_006.txt deliverable.

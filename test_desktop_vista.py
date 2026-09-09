@@ -156,6 +156,13 @@ def test_load_config_valid_values_kept(tmp_path):
             "undo": "Win+Alt+Z",
             "toggle": "Win+Alt+S",
         },
+        "ui": {
+            "selected_page": "library",
+            "appearance": "dark",
+            "hud_always_visible": False,
+            "reduced_motion": False,
+            "seen_shortcut_notice_v2": False,
+        },
     }
 
 
@@ -700,6 +707,47 @@ def test_load_config_hotkeys_invalid_block_falls_back(tmp_path):
     cfg_path.write_text(json.dumps({"hotkeys": "not-a-dict"}), encoding="utf-8")
     cfg = dv.load_config(cfg_path)
     assert cfg["hotkeys"] == dv.DEFAULT_CONFIG["hotkeys"]
+
+
+def test_load_config_ui_defaults_when_missing(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["ui"] == dv.DEFAULT_CONFIG["ui"]
+
+
+def test_load_config_ui_valid_values_kept(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {"ui": {"selected_page": "displays", "appearance": "light", "hud_always_visible": True}}
+        ),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["ui"]["selected_page"] == "displays"
+    assert cfg["ui"]["appearance"] == "light"
+    assert cfg["ui"]["hud_always_visible"] is True
+    assert cfg["ui"]["reduced_motion"] is False  # untouched key keeps its default
+
+
+def test_load_config_ui_invalid_values_fall_back(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"ui": {"selected_page": "nowhere", "appearance": "purple", "reduced_motion": "yes"}}),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["ui"]["selected_page"] == "library"
+    assert cfg["ui"]["appearance"] == "dark"
+    assert cfg["ui"]["reduced_motion"] is False
+
+
+def test_load_config_ui_invalid_block_falls_back(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"ui": "not-a-dict"}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["ui"] == dv.DEFAULT_CONFIG["ui"]
 
 
 def test_is_valid_time_string():

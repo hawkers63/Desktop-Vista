@@ -8,7 +8,7 @@
 # See the LICENSE file in the project root for the full proprietary notice.
 """
 Desktop Vista  —  All my drives. One perfect view.
-Version 1.6  (September 2026)
+Version 1.7  (September 2026)
 
 A lightweight Windows wallpaper manager.
 
@@ -150,6 +150,72 @@ before the multi-monitor rewrite; nothing here requires a second display:
       completion; the 15s reconnect poll now probes folder reachability
       off the Tk thread so an unreachable NAS/UNC path can no longer
       freeze the window
+
+v1.6.1 — UI hardening addendum (notes/notes_006.txt Phase A defects):
+    - Keyboard shortcuts (Space/Enter/arrows/p/r/f/h/Esc) no longer leak
+      into text-entry widgets: typing "forest" into the Tags field used to
+      also trigger Favourite (on 'f') and Random (on 'r') because CTkEntry
+      wraps a real Tk Entry and toplevel bindings still see those keys.
+      See _shortcut/_focus_is_text_entry.
+    - Fit Style is a staged preference again, not an apply command:
+      _on_style_changed used to call set_windows_wallpaper directly and
+      unconditionally — always through the legacy global SPI path, even
+      with the experimental per-monitor COM engine and a specific target
+      monitor selected. The new style now takes effect on the next
+      explicit apply, same as everywhere else style_var is read.
+
+New in v1.7 (notes/notes_006.txt phases B-D — UI/interaction rewrite):
+    - Four task pages (Library / Playback / Displays / Settings) replace
+      the single 11-section sidebar stack, via a small vertical nav rail;
+      pages are built once and shown/hidden with grid()/grid_remove(),
+      never rebuilt, so widget state and scroll position survive a switch
+    - The three stacked button rows under the preview are gone. A floating
+      HoverHUD (new ui_components.py) — Previous/Random/Next, Favourite/
+      Hide/Tags/More — reveals on stage hover/focus/F6 and hides after
+      ~2.5s idle; a permanent stage footer (filename/status left, one
+      "Apply to <target>" button right) is the single, stable primary
+      action, outside any scroll region
+    - Tag editing moved from a raw comma-separated Entry to a chip-based
+      TagSelector drawer (exact-string, case-sensitive — unchanged
+      semantics) with autocomplete; the stage shows a subdued read-only
+      summary badge. Editing captures the image path when the drawer
+      opens, so navigating away mid-edit can't redirect the write onto a
+      different image
+    - A bounded ToastManager posts transient confirmations (wallpaper
+      applied, favourited, hidden) alongside the existing persistent
+      status line, which stays authoritative — this is additive, not a
+      replacement
+    - Appearance is switchable (System/Light/Dark, Settings page) instead
+      of hard-coded dark; the raw Tk monitor-topology Canvas is restyled
+      to match since CTk's colour tuples don't reach native Canvas
+      primitives
+    - Keyboard remap (documented, one-time in-app notice on first launch
+      after update): Space now starts/stops the slideshow (was Next);
+      Esc now closes the active panel — tag drawer, shortcut help,
+      inspection mode — instead of stopping the slideshow (the Playback
+      page's Start/Stop button is the always-visible non-keyboard way to
+      stop it). New: F6 reveals the HUD, F11 toggles a borderless fit-to-
+      screen inspection preview (no zoom/pan yet), ? shows a shortcut
+      reference, Ctrl+Z undoes the last applied wallpaper
+    - Hidden Items manager now shows each item's parent folder (with an
+      offline badge) alongside the filename, so two same-named files on
+      different drives are distinguishable, plus a search filter
+    - Presentation-only preferences live under a new namespaced cfg["ui"]
+      key (selected_page, appearance, hud_always_visible, reduced_motion,
+      seen_shortcut_notice_v2) — never engine state, independently
+      validated and defaulted like every other config section
+
+    Deliberately not done this release (see ROADMAP.md): the playlist/
+    collection editors keep their existing fixed-geometry dialogs rather
+    than the proposed draft-state/inline-validation redesign; the Win32
+    topology strip and the COM monitor picker are still two independently
+    enumerated, unreconciled identity spaces, so the topology view stays
+    read-only rather than becoming a clickable per-display target (that
+    needs notes_005's fingerprinting scheme — v2.0 work); no accent-colour
+    sync, ambient glow, or drag-to-assign (v2.1-scope polish); no
+    Narrator/high-contrast/multi-DPI verification performed — this needs
+    real assistive-technology and multi-monitor hardware, which notes_006
+    itself flags as unverified in its own review.
 """
 
 from __future__ import annotations
@@ -201,11 +267,12 @@ except ImportError:
 
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageOps
-from tkinter import Canvas, filedialog, messagebox, simpledialog
+from tkinter import Canvas, Menu, filedialog, messagebox, simpledialog
 
 import hotkeys
 import ipc
 import schedule
+import ui_components
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -222,7 +289,7 @@ log = logging.getLogger("desktop_vista")
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Desktop Vista"
-APP_VERSION = "1.6"
+APP_VERSION = "1.7"
 TAGLINE = "All my drives. One perfect view."
 
 # Frozen (PyInstaller) builds extract bundled files under a temporary
@@ -330,11 +397,28 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "undo": "Win+Alt+Z",
         "toggle": "Win+Alt+S",
     },
+    # v1.7 — presentation-only preferences (notes_006 §5): never store
+    # temporary focus, animation progress or widget objects here, only
+    # durable choices. Namespaced so it can grow without touching the
+    # engine keys above; validated the same as every other section.
+    "ui": {
+        "selected_page": "library",  # "library"|"playback"|"displays"|"settings"
+        "appearance": "dark",  # "system"|"light"|"dark" — matches the pre-v1.7 forced-dark default
+        "hud_always_visible": False,
+        "reduced_motion": False,
+        "seen_shortcut_notice_v2": False,
+    },
 }
 
 HOTKEY_ACTIONS = ("next", "prev", "favourite", "hide", "undo", "toggle")
 # Stable per-action ids for RegisterHotKey/WM_HOTKEY (arbitrary but fixed).
 HOTKEY_ACTION_IDS = {action: i + 1 for i, action in enumerate(HOTKEY_ACTIONS)}
+
+UI_PAGES = ("library", "playback", "displays", "settings")
+UI_PAGE_LABELS = {"library": "Library", "playback": "Playback", "displays": "Displays", "settings": "Settings"}
+UI_APPEARANCE_VALUES = ("system", "light", "dark")
+UI_APPEARANCE_LABELS = {"system": "System", "light": "Light", "dark": "Dark"}
+UI_APPEARANCE_LABEL_TO_VALUE = {label: value for value, label in UI_APPEARANCE_LABELS.items()}
 
 STARTUP_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "DesktopVista"
@@ -1006,6 +1090,26 @@ def _validate_config(raw: dict) -> dict[str, Any]:
         log.warning("Invalid 'hotkeys' in config; using default.")
         cfg["hotkeys"] = copy.deepcopy(hotkeys_defaults)
 
+    # ---- v1.7 additions (all additive; absent/invalid -> safe defaults) ----
+
+    ui_raw = raw.get("ui", DEFAULT_CONFIG["ui"])
+    ui_defaults = DEFAULT_CONFIG["ui"]
+    if isinstance(ui_raw, dict):
+        selected_page = ui_raw.get("selected_page")
+        appearance = ui_raw.get("appearance")
+        bool_keys = ("hud_always_visible", "reduced_motion", "seen_shortcut_notice_v2")
+        cfg["ui"] = {
+            "selected_page": selected_page if selected_page in UI_PAGES else ui_defaults["selected_page"],
+            "appearance": appearance if appearance in UI_APPEARANCE_VALUES else ui_defaults["appearance"],
+            **{
+                key: ui_raw[key] if isinstance(ui_raw.get(key), bool) else ui_defaults[key]
+                for key in bool_keys
+            },
+        }
+    else:
+        log.warning("Invalid 'ui' in config; using default.")
+        cfg["ui"] = copy.deepcopy(ui_defaults)
+
     return cfg
 
 
@@ -1354,6 +1458,9 @@ class DesktopVista(ctk.CTk):
         self._com_backend: Any = None
         self._target_monitor_label_to_id: dict[str, Optional[str]] = {"All Displays": None}
         self._preview_ref = None  # keep CTkImage alive
+        self._inspecting = False
+        self._inspection_window: Any = None
+        self._pre_inspection_geometry: Optional[str] = None
         self._slideshow_job: Any = None
         # A 1 Hz heartbeat polls these due-times rather than arming one long
         # single-shot after() — that way a sleep/hibernate gap finds "due"
@@ -1400,6 +1507,44 @@ class DesktopVista(ctk.CTk):
                     "--minimized requested but the tray icon isn't ready; showing window."
                 )
 
+    # ---------------- Keyboard shortcuts ----------------
+
+    # winfo_class() names for widgets that consume typed characters.
+    # CTkEntry/CTkTextbox are composites that wrap a real Tk Entry/Text as
+    # an internal child — focus_get() during typing returns that child
+    # directly (class "Entry"/"Text"), not the CTk wrapper (notes_006 §2.7).
+    _TEXT_ENTRY_CLASSES = frozenset({"Entry", "TEntry", "Text", "Spinbox", "TSpinbox", "TCombobox"})
+
+    def _focus_is_text_entry(self) -> bool:
+        """True if the currently focused widget is a text-entry control (or
+        a child of one, walking a bounded number of ancestors to cover a
+        composite's internal wrapping)."""
+        widget = self.focus_get()
+        for _ in range(6):
+            if widget is None:
+                return False
+            try:
+                if widget.winfo_class() in self._TEXT_ENTRY_CLASSES:
+                    return True
+            except Exception:
+                return False
+            widget = getattr(widget, "master", None)
+        return False
+
+    def _shortcut(self, action: Callable[[], None]) -> Callable[[Any], Optional[str]]:
+        """Wrap a single-key/no-modifier toplevel shortcut so it's a no-op
+        while focus is inside a text-entry control, instead of also firing
+        on every keystroke typed there. Returning None (not "break") lets
+        the keystroke continue on to the entry normally in that case."""
+
+        def handler(event: Any) -> Optional[str]:
+            if self._focus_is_text_entry():
+                return None
+            action()
+            return "break"
+
+        return handler
+
     # ---------------- UI construction ----------------
 
     def _build_ui(self) -> None:
@@ -1407,38 +1552,127 @@ class DesktopVista(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # ---- Left sidebar: scrollable control panel ----
-        # A CTkScrollableFrame rather than a fixed-height CTkFrame: v1.3+
-        # keeps adding sections (playlists, and later power/schedule,
-        # monitor topology) and a fixed sidebar would either clip them or
-        # force renumbering every row index each time. `row()` hands out
-        # sequential grid rows so new sections just call it again.
-        side = ctk.CTkScrollableFrame(self, width=300, corner_radius=12)
-        side.grid(row=0, column=0, sticky="nsw", padx=(12, 6), pady=12)
-        side.grid_columnconfigure(0, weight=1)
-        self._sidebar_row = 0
+        self._build_sidebar()
+        self._build_stage()
 
+        # Keyboard shortcuts — guarded against text-entry focus (see
+        # _shortcut/_focus_is_text_entry): CTkEntry/CTkTextbox wrap a real
+        # Tk Entry/Text internally, and a plain self.bind() on the toplevel
+        # still fires on every keystroke typed there too (notes_006 P1 —
+        # typing "forest" into the tag field used to also trigger Favourite
+        # on 'f' and Random on 'r'). Mapping per notes_006 §2.7: Space now
+        # starts/stops the slideshow (was Next) and Esc closes the popover
+        # chain (was Stop) — a deliberate, documented behaviour change; see
+        # _maybe_show_shortcut_notice for the one-time notice this ships
+        # with, and the Playback page's Start/Stop button for the always-
+        # visible non-keyboard Stop control notes_006 asks to keep.
+        self.bind("<Left>", self._shortcut(self._prev))
+        self.bind("<Right>", self._shortcut(self._next))
+        self.bind("<Return>", self._shortcut(self._set_wallpaper))
+        self.bind("<space>", self._shortcut(self._toggle_slideshow))
+        self.bind("<BackSpace>", self._shortcut(self._prev))
+        self.bind("p", self._shortcut(self._prev))
+        self.bind("<Escape>", self._shortcut(self._on_escape))
+        self.bind("r", self._shortcut(self._random))
+        self.bind("R", self._shortcut(self._random))
+        self.bind("f", self._shortcut(self._toggle_favourite))
+        self.bind("F", self._shortcut(self._toggle_favourite))
+        self.bind("h", self._shortcut(self._hide_current))
+        self.bind("<F6>", self._shortcut(lambda: self.hud.reveal(keyboard=True)))
+        self.bind("<F11>", self._shortcut(self._toggle_inspection_mode))
+        self.bind("?", self._shortcut(self._toggle_shortcut_help))
+        self.bind("<Control-z>", self._shortcut(self._history_back))
+        self.bind("<Control-Z>", self._shortcut(self._history_back))
+
+        # Dynamic 16:9 preview sizing
+        self.preview.bind("<Configure>", self._on_preview_configure)
+        self.main.bind("<Configure>", self._on_preview_configure)
+
+        self._show_page(self.cfg["ui"]["selected_page"])
+        self._update_apply_button_label()
+        self.after(200, self._maybe_show_shortcut_notice)
+
+    # ---------------- Sidebar: nav rail + four task pages ----------------
+
+    def _build_sidebar(self) -> None:
+        sidebar = ctk.CTkFrame(self, width=300, corner_radius=12)
+        sidebar.grid(row=0, column=0, sticky="nsw", padx=(12, 6), pady=12)
+        sidebar.grid_columnconfigure(0, weight=1)
+        sidebar.grid_rowconfigure(2, weight=1)
+        sidebar.grid_propagate(False)
+
+        ctk.CTkLabel(sidebar, text=APP_NAME, font=ctk.CTkFont(size=22, weight="bold")).grid(
+            row=0, column=0, padx=16, pady=(16, 0), sticky="w")
+        ctk.CTkLabel(sidebar, text=TAGLINE, font=ctk.CTkFont(size=12), text_color="gray70").grid(
+            row=1, column=0, padx=16, pady=(0, 10), sticky="w")
+
+        # Primary navigation (notes_006 §2.1): four task pages, created once
+        # and kept alive — switching pages never restarts playback or
+        # writes settings by itself, it only changes which page is raised.
+        navrow = ctk.CTkFrame(sidebar, fg_color="transparent")
+        navrow.grid(row=2, column=0, padx=12, pady=(2, 8), sticky="new")
+        navrow.grid_columnconfigure((0, 1), weight=1)
+        self.nav_buttons: dict[str, ctk.CTkButton] = {}
+        for i, page in enumerate(UI_PAGES):
+            btn = ctk.CTkButton(
+                navrow, text=UI_PAGE_LABELS[page], height=32,
+                fg_color="gray30", hover_color="gray25",
+                command=lambda p=page: self._show_page(p),
+            )
+            btn.grid(row=i // 2, column=i % 2, padx=3, pady=3, sticky="ew")
+            self.nav_buttons[page] = btn
+        sidebar.grid_rowconfigure(3, weight=1)
+
+        page_area = ctk.CTkFrame(sidebar, fg_color="transparent")
+        page_area.grid(row=3, column=0, sticky="nsew")
+        page_area.grid_columnconfigure(0, weight=1)
+        page_area.grid_rowconfigure(0, weight=1)
+
+        # Root/nav stay fixed; each page scrolls independently if its own
+        # content exceeds the available height (notes_006 §2.2 window rules).
+        self.pages: dict[str, ctk.CTkScrollableFrame] = {}
+        for page in UI_PAGES:
+            frame = ctk.CTkScrollableFrame(page_area, fg_color="transparent")
+            frame.grid(row=0, column=0, sticky="nsew")
+            frame.grid_columnconfigure(0, weight=1)
+            self.pages[page] = frame
+
+        self._build_library_page(self.pages["library"])
+        self._build_playback_page(self.pages["playback"])
+        self._build_displays_page(self.pages["displays"])
+        self._build_settings_page(self.pages["settings"])
+
+    def _show_page(self, page: str) -> None:
+        if page not in self.pages:
+            page = "library"
+        for name, frame in self.pages.items():
+            if name == page:
+                frame.grid()
+            else:
+                frame.grid_remove()
+        for name, btn in self.nav_buttons.items():
+            btn.configure(fg_color=ui_components.FOCUS if name == page else "gray30")
+        self.cfg["ui"]["selected_page"] = page
+        self._schedule_save()
+
+    @staticmethod
+    def _section_label(parent, text: str, *, first: bool = False) -> None:
+        ctk.CTkLabel(parent, text=text, font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="gray60").grid(
+            row=parent.grid_size()[1], column=0, padx=16, pady=(4 if first else 18, 0), sticky="w")
+
+    def _build_library_page(self, page) -> None:
         def row() -> int:
-            r = self._sidebar_row
-            self._sidebar_row += 1
-            return r
+            return page.grid_size()[1]
 
-        ctk.CTkLabel(side, text=APP_NAME, font=ctk.CTkFont(size=22, weight="bold")).grid(
-            row=row(), column=0, padx=16, pady=(16, 0), sticky="w")
-        ctk.CTkLabel(side, text=TAGLINE, font=ctk.CTkFont(size=12), text_color="gray70").grid(
-            row=row(), column=0, padx=16, pady=(0, 14), sticky="w")
-
-        # Playback source: folders and playlists share one dropdown — the
-        # active source, whichever kind it is, drives preview/nav/slideshow.
-        ctk.CTkLabel(side, text="PLAYBACK SOURCE", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=row(), column=0, padx=16, sticky="w")
+        self._section_label(page, "PLAYBACK SOURCE", first=True)
         self.source_var = ctk.StringVar(value="(no sources yet)")
         self.source_menu = ctk.CTkOptionMenu(
-            side, variable=self.source_var, values=["(no sources yet)"],
+            page, variable=self.source_var, values=["(no sources yet)"],
             command=self._on_source_selected, dynamic_resizing=False)
         self.source_menu.grid(row=row(), column=0, padx=16, pady=(4, 6), sticky="ew")
 
-        fbtns = ctk.CTkFrame(side, fg_color="transparent")
+        fbtns = ctk.CTkFrame(page, fg_color="transparent")
         fbtns.grid(row=row(), column=0, padx=16, sticky="ew")
         fbtns.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(fbtns, text="+ Add folder", command=self._add_folder).grid(
@@ -1446,13 +1680,11 @@ class DesktopVista(ctk.CTk):
         ctk.CTkButton(fbtns, text="Remove", fg_color="gray30", hover_color="gray25",
                       command=self._remove_folder).grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
-        # Playlists: named groups of folders, aggregated as one source.
-        ctk.CTkLabel(side, text="PLAYLISTS", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(14, 0), sticky="w")
-        ctk.CTkButton(side, text="+ New Playlist",
+        self._section_label(page, "PLAYLISTS")
+        ctk.CTkButton(page, text="+ New Playlist",
                       command=lambda: self._open_playlist_editor()).grid(
             row=row(), column=0, padx=16, pady=(4, 4), sticky="ew")
-        pbtns = ctk.CTkFrame(side, fg_color="transparent")
+        pbtns = ctk.CTkFrame(page, fg_color="transparent")
         pbtns.grid(row=row(), column=0, padx=16, sticky="ew")
         pbtns.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(pbtns, text="Edit", fg_color="gray30", hover_color="gray25",
@@ -1460,13 +1692,11 @@ class DesktopVista(ctk.CTk):
         ctk.CTkButton(pbtns, text="Delete", fg_color="gray30", hover_color="gray25",
                       command=self._delete_active_playlist).grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
-        # Collections: saved tag filters, spanning any tagged image cross-drive.
-        ctk.CTkLabel(side, text="COLLECTIONS", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(14, 0), sticky="w")
-        ctk.CTkButton(side, text="+ New Collection",
+        self._section_label(page, "COLLECTIONS")
+        ctk.CTkButton(page, text="+ New Collection",
                       command=lambda: self._open_collection_editor()).grid(
             row=row(), column=0, padx=16, pady=(4, 4), sticky="ew")
-        cbtns = ctk.CTkFrame(side, fg_color="transparent")
+        cbtns = ctk.CTkFrame(page, fg_color="transparent")
         cbtns.grid(row=row(), column=0, padx=16, sticky="ew")
         cbtns.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(cbtns, text="Edit", fg_color="gray30", hover_color="gray25",
@@ -1474,84 +1704,105 @@ class DesktopVista(ctk.CTk):
         ctk.CTkButton(cbtns, text="Delete", fg_color="gray30", hover_color="gray25",
                       command=self._delete_active_collection).grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
-        # Fit style
-        ctk.CTkLabel(side, text="FIT STYLE", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(18, 0), sticky="w")
-        self.style_var = ctk.StringVar(value=self.cfg["style"])
-        ctk.CTkOptionMenu(side, variable=self.style_var, values=list(WALLPAPER_STYLES),
-                          command=self._on_style_changed).grid(
-            row=row(), column=0, padx=16, pady=(4, 0), sticky="ew")
+        self._section_label(page, "CURATION")
+        self.hidden_btn = ctk.CTkButton(page, text="Hidden Items (0)", fg_color="gray30",
+                                         hover_color="gray25", command=self._open_hidden_manager)
+        self.hidden_btn.grid(row=row(), column=0, padx=16, pady=(4, 4), sticky="ew")
 
-        # Primary action
-        self.set_btn = ctk.CTkButton(
-            side, text="Set as Wallpaper", height=44,
-            font=ctk.CTkFont(size=15, weight="bold"), command=self._set_wallpaper)
-        self.set_btn.grid(row=row(), column=0, padx=16, pady=(22, 0), sticky="ew")
+    def _build_playback_page(self, page) -> None:
+        def row() -> int:
+            return page.grid_size()[1]
 
-        # Slideshow
-        ctk.CTkLabel(side, text="SLIDESHOW", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
+        self._section_label(page, "SLIDESHOW", first=True)
         self.interval_var = ctk.StringVar(value=self.cfg["interval"])
-        ctk.CTkOptionMenu(side, variable=self.interval_var,
+        ctk.CTkOptionMenu(page, variable=self.interval_var,
                           values=list(SLIDESHOW_INTERVALS) + [CUSTOM_INTERVAL_LABEL],
                           command=self._on_interval_changed).grid(
             row=row(), column=0, padx=16, pady=(4, 6), sticky="ew")
         self.shuffle_var = ctk.BooleanVar(value=self.cfg["shuffle"])
-        ctk.CTkSwitch(side, text="Shuffle", variable=self.shuffle_var,
+        ctk.CTkSwitch(page, text="Shuffle", variable=self.shuffle_var,
                       command=self._on_shuffle_changed).grid(row=row(), column=0, padx=16, sticky="w")
         self.slide_btn = ctk.CTkButton(
-            side, text="Start Slideshow", height=40, fg_color="#2e7d32", hover_color="#27682a",
+            page, text="Start Slideshow", height=40, fg_color="#2e7d32", hover_color="#27682a",
             command=self._toggle_slideshow)
         self.slide_btn.grid(row=row(), column=0, padx=16, pady=(12, 0), sticky="ew")
 
-        # Power & schedule
-        ctk.CTkLabel(side, text="POWER & SCHEDULE", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
-        self.battery_pause_var = ctk.BooleanVar(value=self.cfg["power"]["pause_on_battery_saver"])
-        ctk.CTkSwitch(side, text="Pause on Battery Saver", variable=self.battery_pause_var,
-                      command=self._on_power_settings_changed).grid(
-            row=row(), column=0, padx=16, pady=(4, 0), sticky="w")
-        self.fullscreen_pause_var = ctk.BooleanVar(value=self.cfg["power"]["pause_on_fullscreen"])
-        ctk.CTkSwitch(side, text="Pause during fullscreen/games", variable=self.fullscreen_pause_var,
-                      command=self._on_power_settings_changed).grid(
-            row=row(), column=0, padx=16, pady=(4, 6), sticky="w")
+        self._section_label(page, "SCHEDULE")
         self.schedule_mode_var = ctk.StringVar(
             value=SCHEDULE_MODE_LABELS.get(self.cfg["schedule"]["mode"], "Fixed interval"))
-        ctk.CTkOptionMenu(side, variable=self.schedule_mode_var,
+        ctk.CTkOptionMenu(page, variable=self.schedule_mode_var,
                           values=list(SCHEDULE_MODE_LABELS.values()),
                           command=self._on_schedule_mode_changed).grid(
-            row=row(), column=0, padx=16, pady=(0, 4), sticky="ew")
+            row=row(), column=0, padx=16, pady=(4, 4), sticky="ew")
         self.daily_times_var = ctk.StringVar(value=", ".join(self.cfg["schedule"]["daily_times"]))
         self.daily_times_entry = ctk.CTkEntry(
-            side, textvariable=self.daily_times_var, placeholder_text="e.g. 08:00, 18:00")
+            page, textvariable=self.daily_times_var, placeholder_text="e.g. 08:00, 18:00")
         self.daily_times_entry.grid(row=row(), column=0, padx=16, sticky="ew")
-        ctk.CTkButton(side, text="Apply times", fg_color="gray30", hover_color="gray25",
+        ctk.CTkButton(page, text="Apply times", fg_color="gray30", hover_color="gray25",
                       command=self._on_daily_times_apply).grid(
-            row=row(), column=0, padx=16, pady=(4, 0), sticky="ew")
-
-        # Solar mode's location — only consulted when schedule mode is
-        # "Solar"; an unset/disabled location falls back to the fallback
-        # times above at run time rather than blocking the mode switch.
+            row=row(), column=0, padx=16, pady=(4, 6), sticky="ew")
         self.solar_enabled_var = ctk.BooleanVar(value=self.cfg["solar"]["enabled"])
-        ctk.CTkSwitch(side, text="Use solar location (else fallback times)",
+        ctk.CTkSwitch(page, text="Use solar location (else fallback times)",
                       variable=self.solar_enabled_var,
                       command=self._on_solar_settings_changed).grid(
-            row=row(), column=0, padx=16, pady=(6, 0), sticky="w")
+            row=row(), column=0, padx=16, pady=(2, 0), sticky="w")
         self.solar_coords_var = ctk.StringVar(value=self._format_solar_coords())
         self.solar_coords_entry = ctk.CTkEntry(
-            side, textvariable=self.solar_coords_var,
+            page, textvariable=self.solar_coords_var,
             placeholder_text="latitude, longitude e.g. 51.5074, -0.1278")
         self.solar_coords_entry.grid(row=row(), column=0, padx=16, sticky="ew")
-        ctk.CTkButton(side, text="Apply location", fg_color="gray30", hover_color="gray25",
+        ctk.CTkButton(page, text="Apply location", fg_color="gray30", hover_color="gray25",
                       command=self._on_solar_coords_apply).grid(
             row=row(), column=0, padx=16, pady=(4, 0), sticky="ew")
 
-        # Monitor topology (read-only; v1.5 groundwork — no per-monitor apply yet)
-        ctk.CTkLabel(side, text="MONITORS (read-only)", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
-        self.monitor_canvas = Canvas(side, width=260, height=80, highlightthickness=0, bg="#2b2b2b")
+        # Advanced disclosure (notes_006 §2.1): battery/fullscreen pause
+        # policies are infrequent configuration, kept out of the daily path.
+        self._power_advanced_visible = False
+        self.power_advanced_toggle_btn = ctk.CTkButton(
+            page, text="▸ Advanced (Battery Saver / fullscreen)", fg_color="transparent",
+            hover_color="gray20", anchor="w", command=self._toggle_power_advanced)
+        self.power_advanced_toggle_btn.grid(row=row(), column=0, padx=12, pady=(14, 0), sticky="ew")
+        self.power_advanced_frame = ctk.CTkFrame(page, fg_color="transparent")
+        self.power_advanced_frame.grid(row=row(), column=0, padx=4, pady=(0, 4), sticky="ew")
+        self.power_advanced_frame.grid_columnconfigure(0, weight=1)
+        self.battery_pause_var = ctk.BooleanVar(value=self.cfg["power"]["pause_on_battery_saver"])
+        ctk.CTkSwitch(self.power_advanced_frame, text="Pause on Battery Saver",
+                      variable=self.battery_pause_var,
+                      command=self._on_power_settings_changed).grid(
+            row=0, column=0, padx=12, pady=(4, 0), sticky="w")
+        self.fullscreen_pause_var = ctk.BooleanVar(value=self.cfg["power"]["pause_on_fullscreen"])
+        ctk.CTkSwitch(self.power_advanced_frame, text="Pause during fullscreen/games",
+                      variable=self.fullscreen_pause_var,
+                      command=self._on_power_settings_changed).grid(
+            row=1, column=0, padx=12, pady=(4, 6), sticky="w")
+        self.power_advanced_frame.grid_remove()
+
+    def _toggle_power_advanced(self) -> None:
+        self._power_advanced_visible = not self._power_advanced_visible
+        if self._power_advanced_visible:
+            self.power_advanced_frame.grid()
+            self.power_advanced_toggle_btn.configure(text="▾ Advanced (Battery Saver / fullscreen)")
+        else:
+            self.power_advanced_frame.grid_remove()
+            self.power_advanced_toggle_btn.configure(text="▸ Advanced (Battery Saver / fullscreen)")
+
+    def _build_displays_page(self, page) -> None:
+        def row() -> int:
+            return page.grid_size()[1]
+
+        self._section_label(page, "FIT STYLE", first=True)
+        self.style_var = ctk.StringVar(value=self.cfg["style"])
+        ctk.CTkOptionMenu(page, variable=self.style_var, values=list(WALLPAPER_STYLES),
+                          command=self._on_style_changed).grid(
+            row=row(), column=0, padx=16, pady=(4, 0), sticky="ew")
+        ctk.CTkLabel(page, text="Applies to all displays — a per-monitor fit\npolicy needs pre-rendered crops (v2.0).",
+                     font=ctk.CTkFont(size=10), text_color="gray60", justify="left").grid(
+            row=row(), column=0, padx=16, pady=(2, 0), sticky="w")
+
+        self._section_label(page, "MONITORS (read-only)")
+        self.monitor_canvas = Canvas(page, width=268, height=110, highlightthickness=0, bg="#2b2b2b")
         self.monitor_canvas.grid(row=row(), column=0, padx=16, pady=(4, 0), sticky="ew")
-        ctk.CTkButton(side, text="Refresh", fg_color="gray30", hover_color="gray25", width=80,
+        ctk.CTkButton(page, text="Refresh", fg_color="gray30", hover_color="gray25", width=80,
                       command=self._refresh_monitor_topology).grid(
             row=row(), column=0, padx=16, pady=(4, 0), sticky="w")
         self._refresh_monitor_topology()
@@ -1560,117 +1811,201 @@ class DesktopVista(ctk.CTk):
         # Verified on this development machine's single display that the
         # COM plumbing itself works (object creation, enumeration, apply);
         # true per-monitor independence needs real multi-monitor hardware
-        # to confirm, which this build has not had access to.
-        ctk.CTkLabel(side, text="DISPLAY ENGINE (experimental)",
-                     font=ctk.CTkFont(size=11, weight="bold"), text_color="gray60").grid(
-            row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
+        # to confirm, which this build has not had access to. The Win32
+        # topology strip above and this COM picker enumerate independently
+        # and are NOT reconciled to the same display identity (notes_006
+        # P1) — do not assume a visually-matching number is the same
+        # display in both; that reconciliation is why the topology strip
+        # stays read-only rather than becoming a clickable target picker.
+        self._section_label(page, "DISPLAY ENGINE (experimental)")
         self.com_target_var = ctk.BooleanVar(value=self.cfg.get("wallpaper_target") == "com")
         self.com_target_switch = ctk.CTkSwitch(
-            side, text="Per-monitor engine (COM)", variable=self.com_target_var,
+            page, text="Per-monitor engine (COM)", variable=self.com_target_var,
             command=self._on_wallpaper_target_changed)
         self.com_target_switch.grid(row=row(), column=0, padx=16, pady=(4, 4), sticky="w")
         if windows_wallpaper_com is None:
             self.com_target_switch.configure(state="disabled")
         self.target_monitor_var = ctk.StringVar(value="All Displays")
         self.target_monitor_menu = ctk.CTkOptionMenu(
-            side, variable=self.target_monitor_var, values=["All Displays"],
+            page, variable=self.target_monitor_var, values=["All Displays"],
             command=self._on_target_monitor_selected)
         self.target_monitor_menu.grid(row=row(), column=0, padx=16, pady=(0, 4), sticky="ew")
         if self.cfg.get("wallpaper_target") == "com":
             self._refresh_com_monitor_menu()
 
-        # Global hotkeys (v1.6) — fixed default bindings (see HOTKEY_ACTIONS);
-        # per-binding rebinding UI is not in scope, only enable/disable.
-        ctk.CTkLabel(side, text="HOTKEYS", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
+    def _build_settings_page(self, page) -> None:
+        def row() -> int:
+            return page.grid_size()[1]
+
+        self._section_label(page, "APPEARANCE", first=True)
+        self.appearance_var = ctk.StringVar(
+            value=UI_APPEARANCE_LABELS.get(self.cfg["ui"]["appearance"], "Dark"))
+        ctk.CTkOptionMenu(page, variable=self.appearance_var,
+                          values=[UI_APPEARANCE_LABELS[v] for v in UI_APPEARANCE_VALUES],
+                          command=self._on_appearance_changed).grid(
+            row=row(), column=0, padx=16, pady=(4, 4), sticky="ew")
+        self.hud_always_visible_var = ctk.BooleanVar(value=self.cfg["ui"]["hud_always_visible"])
+        ctk.CTkSwitch(page, text="Always show preview controls", variable=self.hud_always_visible_var,
+                      command=self._on_hud_always_visible_changed).grid(
+            row=row(), column=0, padx=16, pady=(2, 6), sticky="w")
+
+        self._section_label(page, "HOTKEYS")
         self.hotkeys_enabled_var = ctk.BooleanVar(value=self.cfg["hotkeys"]["enabled"])
         self.hotkeys_switch = ctk.CTkSwitch(
-            side, text="Global hotkeys enabled", variable=self.hotkeys_enabled_var,
+            page, text="Global hotkeys enabled", variable=self.hotkeys_enabled_var,
             command=self._on_hotkeys_enabled_changed)
         self.hotkeys_switch.grid(row=row(), column=0, padx=16, pady=(4, 0), sticky="w")
         if not hotkeys.is_available():
             self.hotkeys_switch.configure(state="disabled")
         self.hotkeys_status_label = ctk.CTkLabel(
-            side, text="", text_color="gray60", font=ctk.CTkFont(size=10),
+            page, text="", text_color="gray60", font=ctk.CTkFont(size=10),
             wraplength=260, justify="left")
         self.hotkeys_status_label.grid(row=row(), column=0, padx=16, pady=(2, 0), sticky="w")
+        ctk.CTkButton(page, text="Local shortcut reference (?)", fg_color="gray30", hover_color="gray25",
+                      command=self._toggle_shortcut_help).grid(
+            row=row(), column=0, padx=16, pady=(6, 0), sticky="ew")
 
-        # Startup
-        ctk.CTkLabel(side, text="STARTUP", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
+        self._section_label(page, "STARTUP")
         self.startup_var = ctk.BooleanVar(value=False)
         self.startup_switch = ctk.CTkSwitch(
-            side, text="Start with Windows (minimised)", variable=self.startup_var,
+            page, text="Start with Windows (minimised)", variable=self.startup_var,
             command=self._on_startup_toggle)
         self.startup_switch.grid(row=row(), column=0, padx=16, pady=(4, 0), sticky="w")
         if winreg is None or sys.platform != "win32":
             self.startup_switch.configure(state="disabled")
 
-        # Status
-        self.status = ctk.CTkLabel(side, text="Ready.", text_color="gray60",
-                                   font=ctk.CTkFont(size=11), wraplength=260, justify="left")
-        self.status.grid(row=row(), column=0, padx=16, pady=(20, 14), sticky="w")
+        self._section_label(page, "ABOUT")
+        ctk.CTkLabel(
+            page, text=f"{APP_NAME} {APP_VERSION}" + ("  (frozen)" if FROZEN else ""),
+            text_color="gray60", font=ctk.CTkFont(size=11),
+        ).grid(row=row(), column=0, padx=16, pady=(4, 14), sticky="w")
 
-        # ---- Right main area: the canvas ----
+    # ---------------- Main stage: header / preview / HUD / footer ----------------
+
+    def _build_stage(self) -> None:
         self.main = ctk.CTkFrame(self, corner_radius=12)
         self.main.grid(row=0, column=1, sticky="nsew", padx=(6, 12), pady=12)
         self.main.grid_columnconfigure(0, weight=1)
-        self.main.grid_rowconfigure(0, weight=1)
+        self.main.grid_rowconfigure(1, weight=1)
 
-        self.preview = ctk.CTkLabel(self.main, text="Add a folder to begin", text_color="gray50",
-                                    font=ctk.CTkFont(size=16))
-        self.preview.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="nsew")
+        # Context header (44px): active source + a non-hover HUD reveal
+        # route (notes_006 §2.2 HUD state machine point 6).
+        header = ctk.CTkFrame(self.main, fg_color="transparent", height=44)
+        header.grid(row=0, column=0, sticky="ew", padx=16, pady=(12, 4))
+        header.grid_columnconfigure(0, weight=1)
+        header.grid_propagate(False)
+        self.source_context_label = ctk.CTkLabel(
+            header, text="", anchor="w", font=ctk.CTkFont(size=13, weight="bold"))
+        self.source_context_label.grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(header, text="Controls", width=90, height=28, fg_color="gray30",
+                      hover_color="gray25", command=lambda: self.hud.reveal(keyboard=True)).grid(
+            row=0, column=1, sticky="e", padx=(8, 0))
 
-        self.meta = ctk.CTkLabel(self.main, text="", text_color="gray60", font=ctk.CTkFont(size=12))
-        self.meta.grid(row=1, column=0, padx=16, sticky="ew")
+        # Stage (expands): preview + floating HUD/toast/tag-drawer overlays.
+        self.stage = ctk.CTkFrame(self.main, fg_color="transparent")
+        self.stage.grid(row=1, column=0, sticky="nsew", padx=16, pady=4)
+        self.stage.grid_columnconfigure(0, weight=1)
+        self.stage.grid_rowconfigure(0, weight=1)
 
-        nav = ctk.CTkFrame(self.main, fg_color="transparent")
-        nav.grid(row=2, column=0, pady=(8, 4))
-        ctk.CTkButton(nav, text="◀  Previous", width=130, command=self._prev).grid(row=0, column=0, padx=6)
-        ctk.CTkButton(nav, text="Random", width=110, fg_color="gray30", hover_color="gray25",
-                      command=self._random).grid(row=0, column=1, padx=6)
-        ctk.CTkButton(nav, text="Next  ▶", width=130, command=self._next).grid(row=0, column=2, padx=6)
+        self.preview = ctk.CTkLabel(
+            self.stage, text="Add a folder to begin", text_color="gray50",
+            font=ctk.CTkFont(size=16), corner_radius=10, fg_color=("#ECECEC", "#202020"))
+        self.preview.grid(row=0, column=0, sticky="nsew")
 
-        # Favourite / hide — non-destructive curation of the active source
-        curate = ctk.CTkFrame(self.main, fg_color="transparent")
-        curate.grid(row=3, column=0, pady=(0, 16))
-        self.fav_btn = ctk.CTkButton(curate, text="♡ Favourite", width=130, fg_color="gray30",
-                                      hover_color="gray25", command=self._toggle_favourite)
-        self.fav_btn.grid(row=0, column=0, padx=6)
-        ctk.CTkButton(curate, text="🙈 Hide", width=110, fg_color="gray30", hover_color="gray25",
-                      command=self._hide_current).grid(row=0, column=1, padx=6)
-        self.hidden_btn = ctk.CTkButton(curate, text="Hidden (0)", width=130, fg_color="gray30",
-                                         hover_color="gray25", command=self._open_hidden_manager)
-        self.hidden_btn.grid(row=0, column=2, padx=6)
+        self.stage_tags_label = ctk.CTkLabel(
+            self.stage, text="", text_color=("gray30", "gray80"), font=ctk.CTkFont(size=11),
+            fg_color=ui_components.SURFACE, corner_radius=8)
+        self.stage_tags_label.place(relx=0.0, rely=0.0, x=10, y=10, anchor="nw")
 
-        # Tags — freeform per-image labels; collections filter playback by these
-        tagrow = ctk.CTkFrame(self.main, fg_color="transparent")
-        tagrow.grid(row=4, column=0, pady=(0, 16))
-        ctk.CTkLabel(tagrow, text="Tags:").grid(row=0, column=0, padx=(0, 6))
-        self.tags_var = ctk.StringVar(value="")
-        self.tags_entry = ctk.CTkEntry(tagrow, textvariable=self.tags_var, width=220,
-                                        placeholder_text="nature, minimal")
-        self.tags_entry.grid(row=0, column=1, padx=(0, 6))
-        ctk.CTkButton(tagrow, text="Apply", width=70, command=self._on_tags_apply).grid(
-            row=0, column=2)
+        self.hud = ui_components.HoverHUD(
+            self.stage,
+            {
+                "◀ Prev": self._prev,
+                "Random": self._random,
+                "Next ▶": self._next,
+                "♡ Favourite": self._toggle_favourite,
+                "Hide": self._hide_current,
+                "Tags": self._open_tag_inspector,
+                "More": self._open_more_menu,
+            },
+            always_visible=self.cfg["ui"]["hud_always_visible"],
+        )
+        self.fav_btn = self.hud.buttons["♡ Favourite"]
 
-        # Keyboard shortcuts
-        self.bind("<Left>", lambda e: self._prev())
-        self.bind("<Right>", lambda e: self._next())
-        self.bind("<Return>", lambda e: self._set_wallpaper())
-        self.bind("<space>", lambda e: self._next())
-        self.bind("<BackSpace>", lambda e: self._prev())
-        self.bind("p", lambda e: self._prev())
-        self.bind("<Escape>", lambda e: self._stop_slideshow())
-        self.bind("r", lambda e: self._random())
-        self.bind("R", lambda e: self._random())
-        self.bind("f", lambda e: self._toggle_favourite())
-        self.bind("F", lambda e: self._toggle_favourite())
-        self.bind("h", lambda e: self._hide_current())
+        self.toasts = ui_components.ToastManager(self.stage)
 
-        # Dynamic 16:9 preview sizing
-        self.preview.bind("<Configure>", self._on_preview_configure)
-        self.main.bind("<Configure>", self._on_preview_configure)
+        self._build_tag_drawer(self.stage)
+        self._build_shortcut_help(self.stage)
+
+        # Footer (52px): filename/status left, Apply right (notes_006 §2.1
+        # "permanent stage footer" — stable, keyboard-reachable, outside
+        # any scroll region, never a side effect of navigation alone).
+        footer = ctk.CTkFrame(self.main, fg_color="transparent", height=56)
+        footer.grid(row=2, column=0, sticky="ew", padx=16, pady=(4, 12))
+        footer.grid_columnconfigure(0, weight=1)
+        footer.grid_propagate(False)
+        meta_col = ctk.CTkFrame(footer, fg_color="transparent")
+        meta_col.grid(row=0, column=0, sticky="w")
+        self.meta = ctk.CTkLabel(meta_col, text="", text_color="gray60",
+                                 font=ctk.CTkFont(size=12), anchor="w")
+        self.meta.grid(row=0, column=0, sticky="w")
+        self.status = ctk.CTkLabel(meta_col, text="Ready.", text_color="gray60",
+                                   font=ctk.CTkFont(size=11), anchor="w", wraplength=440, justify="left")
+        self.status.grid(row=1, column=0, sticky="w")
+        self.set_btn = ctk.CTkButton(
+            footer, text="Apply to all displays", height=40, width=176,
+            font=ctk.CTkFont(size=14, weight="bold"), command=self._set_wallpaper)
+        self.set_btn.grid(row=0, column=1, rowspan=2, sticky="e")
+
+    def _build_tag_drawer(self, stage) -> None:
+        self._tag_drawer_path: Optional[str] = None
+        self.tag_drawer = ctk.CTkFrame(
+            stage, width=300, fg_color=ui_components.SURFACE, corner_radius=12,
+            border_width=1, border_color=ui_components.BORDER)
+        title_row = ctk.CTkFrame(self.tag_drawer, fg_color="transparent")
+        title_row.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
+        title_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(title_row, text="Tags", font=ctk.CTkFont(size=13, weight="bold")).grid(
+            row=0, column=0, sticky="w")
+        ui_components.ActionButton(title_row, text="Close", width=60,
+                                   command=self._close_tag_inspector).grid(row=0, column=1)
+        self.tag_selector = ui_components.TagSelector(
+            self.tag_drawer, on_change=self._on_tag_selector_change,
+            on_close_requested=self._close_tag_inspector)
+        self.tag_selector.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
+
+    def _build_shortcut_help(self, stage) -> None:
+        self.shortcut_help = ctk.CTkFrame(
+            stage, fg_color=ui_components.SURFACE, corner_radius=12,
+            border_width=1, border_color=ui_components.BORDER)
+        title_row = ctk.CTkFrame(self.shortcut_help, fg_color="transparent")
+        title_row.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 4))
+        title_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(title_row, text="Keyboard shortcuts",
+                     font=ctk.CTkFont(size=14, weight="bold")).grid(row=0, column=0, sticky="w")
+        ui_components.ActionButton(title_row, text="Close", width=60,
+                                   command=self._toggle_shortcut_help).grid(row=0, column=1)
+        lines = [
+            ("Left / Right", "Previous / Next selected preview (no apply)"),
+            ("R", "Random preview selection"),
+            ("F", "Toggle favourite"),
+            ("H", "Hide selected image"),
+            ("Enter", "Apply selection"),
+            ("Space", "Start / Stop slideshow"),
+            ("F6", "Reveal preview controls"),
+            ("F11", "Inspection mode (fullscreen preview)"),
+            ("Ctrl+Z", "Undo last applied wallpaper"),
+            ("Esc", "Close this / the active panel"),
+            ("?", "Toggle this help"),
+        ]
+        body = ctk.CTkFrame(self.shortcut_help, fg_color="transparent")
+        body.grid(row=1, column=0, padx=14, pady=(0, 14), sticky="ew")
+        for i, (key, desc) in enumerate(lines):
+            ctk.CTkLabel(body, text=key, font=ctk.CTkFont(size=12, weight="bold"), width=90,
+                         anchor="w").grid(row=i, column=0, sticky="w", pady=1)
+            ctk.CTkLabel(body, text=desc, font=ctk.CTkFont(size=12), text_color="gray70",
+                         anchor="w").grid(row=i, column=1, sticky="w", pady=1)
+        self._shortcut_help_visible = False
 
     # ---------------- Branding ----------------
 
@@ -1752,9 +2087,10 @@ class DesktopVista(ctk.CTk):
             )
         else:
             self._set_status("Wallpaper engine: standard (all displays).")
+        self._update_apply_button_label()
 
     def _on_target_monitor_selected(self, _label: str) -> None:
-        pass  # read at apply time in _set_wallpaper; nothing to do eagerly
+        self._update_apply_button_label()
 
     # ---------------- Debounced save ----------------
 
@@ -1792,7 +2128,174 @@ class DesktopVista(ctk.CTk):
         self._schedule_save()
 
     def _set_status(self, text: str) -> None:
+        """Persistent status line in the stage footer — running/paused/
+        offline state, always visible outside any scroll region. Kept as
+        the compatibility bridge notes_006 §4 describes: most call sites
+        are unclassified between "ongoing state" and "transient result",
+        so this stays authoritative and _toast() is layered on top for the
+        subset of call sites that are clearly one-off confirmations."""
         self.status.configure(text=text)
+
+    def _toast(self, text: str, *, error: bool = False) -> None:
+        """Post a transient confirmation alongside the persistent status
+        line above — never a replacement for it. Silently no-ops if the
+        toast manager doesn't exist yet (very early startup) or its bounded
+        queue is full; the persistent status line is always the fallback
+        record, so a dropped toast never loses information."""
+        toasts = getattr(self, "toasts", None)
+        if toasts is not None:
+            toasts.post(ui_components.Notice(text, error=error))
+
+    def _update_apply_button_label(self) -> None:
+        if self.cfg.get("wallpaper_target") == "com":
+            target = self.target_monitor_var.get()
+            text = "Apply to all displays" if target == "All Displays" else f"Apply to {target}"
+        else:
+            text = "Apply to all displays"
+        self.set_btn.configure(text=text)
+
+    def _update_header_context(self) -> None:
+        if self._active_id is None:
+            label = "No source selected"
+        else:
+            label = source_display_label(self.cfg, self._active_kind, self._active_id, self._folder_online_cache)
+        count = f"{len(self.images)} images" if self.images else "no images"
+        self.source_context_label.configure(text=f"{label} · {count}")
+
+    def _restyle_canvas_widgets(self) -> None:
+        """Update raw-Tk Canvas widgets when appearance changes — CTk's
+        colour tuples don't reach native Canvas primitives (notes_006
+        §2.6)."""
+        is_dark = ctk.get_appearance_mode() == "Dark"
+        bg = "#2b2b2b" if is_dark else "#e5e5e5"
+        try:
+            self.monitor_canvas.configure(bg=bg)
+        except Exception:
+            pass
+
+    def _on_appearance_changed(self, value: str) -> None:
+        mode = UI_APPEARANCE_LABEL_TO_VALUE.get(value, "dark")
+        self.cfg["ui"]["appearance"] = mode
+        self._flush_save()
+        ctk.set_appearance_mode(mode)
+        self._restyle_canvas_widgets()
+
+    def _on_hud_always_visible_changed(self) -> None:
+        value = bool(self.hud_always_visible_var.get())
+        self.cfg["ui"]["hud_always_visible"] = value
+        self._flush_save()
+        self.hud.set_always_visible(value)
+
+    def _open_more_menu(self) -> None:
+        """A small overflow menu for infrequent stage actions (notes_006
+        §2.2): a plain native tk.Menu, not a CTk widget — this is a
+        discrete action list, not something that benefits from a custom
+        popover, and native menus already have working keyboard/Narrator
+        support that a hand-rolled one would have to rebuild."""
+        menu = Menu(self, tearoff=False)
+        menu.add_command(label="Reveal in Explorer", command=self._reveal_current_in_explorer)
+        menu.add_command(label="Copy Path", command=self._copy_current_path)
+        menu.add_command(label="Undo Last Applied", command=self._history_back)
+        menu.add_command(label="Hidden Items", command=self._open_hidden_manager)
+        more_btn = self.hud.buttons.get("More")
+        if more_btn is None:
+            return
+        x = more_btn.winfo_rootx()
+        y = more_btn.winfo_rooty()
+        try:
+            menu.tk_popup(x, y - 8)
+        finally:
+            menu.grab_release()
+
+    def _copy_current_path(self) -> None:
+        if not (0 <= self.index < len(self.images)):
+            self._toast("Nothing selected.", error=True)
+            return
+        path = self.images[self.index]
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        self._toast(f"Copied path: {Path(path).name}")
+
+    # ---------------- Shortcut help, inspection mode, Escape chain ----------------
+
+    def _toggle_shortcut_help(self) -> None:
+        self._shortcut_help_visible = not self._shortcut_help_visible
+        if self._shortcut_help_visible:
+            self.shortcut_help.place(relx=0.5, rely=0.5, anchor="c")
+            self.shortcut_help.lift()
+        else:
+            self.shortcut_help.place_forget()
+            self.focus_set()
+
+    def _maybe_show_shortcut_notice(self) -> None:
+        """One-time notice for the Space/Esc remap (notes_006 §2.7: "ship
+        a one-time shortcut notice"). Space now starts/stops the slideshow
+        instead of advancing; Esc now closes panels instead of stopping
+        the slideshow — the Playback page's Start/Stop button remains the
+        always-visible non-keyboard way to stop it."""
+        if self.cfg["ui"]["seen_shortcut_notice_v2"]:
+            return
+        self.cfg["ui"]["seen_shortcut_notice_v2"] = True
+        self._schedule_save()
+        self._toast(
+            "Shortcuts updated: Space now Starts/Stops the slideshow (was Next); "
+            "Esc now closes panels (was Stop). Press ? for the full list.",
+            error=False,
+        )
+
+    def _on_escape(self) -> None:
+        """Esc closes the active panel/popover, innermost first, rather
+        than stopping the slideshow (notes_006 §2.7 — a deliberate remap;
+        see _maybe_show_shortcut_notice). Falls through to nothing rather
+        than a destructive/global action if nothing is open."""
+        if self._inspecting:
+            self._toggle_inspection_mode()
+        elif self._shortcut_help_visible:
+            self._toggle_shortcut_help()
+        elif self._tag_drawer_path is not None:
+            self._close_tag_inspector()
+
+    def _toggle_inspection_mode(self) -> None:
+        """Borderless fit-to-screen preview (notes_006 §2.2). Zoom/pan is
+        explicitly out of scope for this pass — the document itself
+        defers it behind a separate bounded higher-resolution decode
+        request; this only ever shows the already-decoded preview image
+        scaled to the inspection window."""
+        if self._inspecting:
+            self._close_inspection_mode()
+        else:
+            self._open_inspection_mode()
+
+    def _open_inspection_mode(self) -> None:
+        if not (0 <= self.index < len(self.images)) or self._preview_ref is None:
+            self._toast("Nothing to inspect.", error=True)
+            return
+        self._inspecting = True
+        self._pre_inspection_geometry = self.geometry()
+        win = ctk.CTkToplevel(self)
+        win.attributes("-fullscreen", True)
+        win.configure(fg_color="black")
+        win.title(f"{APP_NAME} — Inspection")
+        label = ctk.CTkLabel(win, text="", image=self._preview_ref)
+        label.pack(expand=True, fill="both")
+        hint = ctk.CTkLabel(win, text="Preview only · Esc to exit", text_color="gray70",
+                            font=ctk.CTkFont(size=12), fg_color="black")
+        hint.place(relx=0.5, rely=1.0, anchor="s", y=-14)
+        win.bind("<Escape>", lambda e: self._close_inspection_mode())
+        win.bind("<F11>", lambda e: self._close_inspection_mode())
+        win.focus_force()
+        self._inspection_window = win
+
+    def _close_inspection_mode(self) -> None:
+        win = getattr(self, "_inspection_window", None)
+        if win is not None:
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            self._inspection_window = None
+        self._inspecting = False
+        self.focus_set()
 
     # ---------------- State ----------------
 
@@ -1894,6 +2397,7 @@ class DesktopVista(ctk.CTk):
             self.cfg["current_folder"] = source_id  # kept in sync for v1.2 readers
         self._refresh_source_menu()
         self.images = resolve_source_images(self.cfg, kind, source_id)
+        self._update_header_context()
         self._shuffle_order = []
         self._shuffle_cursor = 0
         if not self.images:
@@ -2175,6 +2679,7 @@ class DesktopVista(ctk.CTk):
         is_fav = path in self.cfg.get("favourites", [])
         set_membership(self.cfg, "favourites", path, not is_fav)
         self._update_favourite_button()
+        self._toast("Removed from Favourites" if is_fav else "Added to Favourites")
         self._schedule_save()
 
     def _update_favourite_button(self) -> None:
@@ -2188,23 +2693,58 @@ class DesktopVista(ctk.CTk):
             self.fav_btn.configure(text="♡ Favourite", fg_color="gray30", hover_color="gray25")
 
     def _update_hidden_count_label(self) -> None:
-        self.hidden_btn.configure(text=f"Hidden ({len(self.cfg.get('hidden', []))})")
+        self.hidden_btn.configure(text=f"Hidden Items ({len(self.cfg.get('hidden', []))})")
 
     def _update_tags_field(self) -> None:
-        if 0 <= self.index < len(self.images):
-            self.tags_var.set(", ".join(get_tags(self.cfg, self.images[self.index])))
-        else:
-            self.tags_var.set("")
-
-    def _on_tags_apply(self) -> None:
-        if not (0 <= self.index < len(self.images)):
+        """Refresh the stage's subdued read-only tag summary (up to two
+        tags plus "+N" — notes_006 §2.4). The editable chip list lives in
+        the tag drawer (see _open_tag_inspector) and is refreshed there,
+        not here, so this never emits a write."""
+        tags = get_tags(self.cfg, self.images[self.index]) if 0 <= self.index < len(self.images) else []
+        if not tags:
+            self.stage_tags_label.configure(text="")
             return
-        path = self.images[self.index]
-        tags = [t.strip() for t in self.tags_var.get().split(",")]
-        set_tags(self.cfg, path, tags)
-        self.tags_var.set(", ".join(get_tags(self.cfg, path)))
-        self._flush_save()
-        self._set_status("Tags updated.")
+        shown = tags[:2]
+        extra = len(tags) - len(shown)
+        text = "  ·  ".join(shown) + (f"   +{extra}" if extra > 0 else "")
+        self.stage_tags_label.configure(text=f"  {text}  ")
+
+    def _all_known_tags(self) -> list[str]:
+        known: set[str] = set()
+        for tag_list in self.cfg.get("tags", {}).values():
+            known.update(tag_list)
+        return sorted(known, key=str.casefold)
+
+    def _open_tag_inspector(self) -> None:
+        if not (0 <= self.index < len(self.images)):
+            self._toast("Nothing selected.", error=True)
+            return
+        # Capture the path now: navigation while the drawer stays open must
+        # not redirect a delayed tag edit onto a different image
+        # (notes_006 §2.4) — every write below targets this captured path,
+        # never self.images[self.index] at write time.
+        self._tag_drawer_path = self.images[self.index]
+        self.tag_selector.set_known(self._all_known_tags())
+        self.tag_selector.set_tags(get_tags(self.cfg, self._tag_drawer_path))
+        self.tag_drawer.place(relx=1.0, rely=0.0, x=-10, y=10, anchor="ne")
+        self.tag_drawer.lift()
+        self.hud.pinned = True
+        self.hud.reveal()
+        self.tag_selector.entry.focus_set()
+
+    def _close_tag_inspector(self) -> None:
+        self.tag_drawer.place_forget()
+        self.hud.pinned = False
+        self._tag_drawer_path = None
+        self.focus_set()
+
+    def _on_tag_selector_change(self, tags: tuple[str, ...]) -> None:
+        if self._tag_drawer_path is None:
+            return
+        set_tags(self.cfg, self._tag_drawer_path, list(tags))
+        self._schedule_save()
+        if 0 <= self.index < len(self.images) and self.images[self.index] == self._tag_drawer_path:
+            self._update_tags_field()
 
     def _hide_current(self) -> None:
         if not (0 <= self.index < len(self.images)):
@@ -2226,31 +2766,56 @@ class DesktopVista(ctk.CTk):
             self.meta.configure(text="")
             self._update_favourite_button()
             self._update_tags_field()
-        self._set_status(f"Hidden {name}. Use \"Hidden\" to restore it.")
+        self._set_status(f"Hidden {name}. Use \"Hidden Items\" to restore it.")
+        self._toast(f"Hidden: {name}")
         self._update_hidden_count_label()
+        self._update_header_context()
         self._flush_save()
 
     def _open_hidden_manager(self) -> None:
+        # notes_006 §2.4 P2: showing only the basename meant two files
+        # named the same thing on different drives were indistinguishable.
+        # Each row now shows the parent folder (with an offline badge) too,
+        # plus a search filter for a long hidden list.
         win = ctk.CTkToplevel(self)
-        win.title("Hidden Images")
-        win.geometry("420x420")
+        win.title("Hidden Items")
+        win.geometry("460x460")
+        win.minsize(360, 300)
         win.transient(self)
         win.grab_set()
-        scroll = ctk.CTkScrollableFrame(win)
-        scroll.pack(padx=16, pady=16, fill="both", expand=True)
 
-        def rebuild() -> None:
+        search_var = ctk.StringVar(value="")
+        ctk.CTkEntry(win, textvariable=search_var, placeholder_text="Search hidden items…").pack(
+            padx=16, pady=(16, 0), fill="x")
+        count_label = ctk.CTkLabel(win, text="", text_color="gray60", font=ctk.CTkFont(size=11), anchor="w")
+        count_label.pack(padx=16, pady=(4, 0), fill="x")
+        scroll = ctk.CTkScrollableFrame(win)
+        scroll.pack(padx=16, pady=12, fill="both", expand=True)
+
+        def rebuild(*_args) -> None:
             for w in scroll.winfo_children():
                 w.destroy()
             hidden = self.cfg.get("hidden", [])
-            if not hidden:
-                ctk.CTkLabel(scroll, text="No hidden images.", text_color="gray60").pack(pady=8)
+            query = search_var.get().strip().lower()
+            shown = [p for p in hidden if query in p.lower()] if query else hidden
+            count_label.configure(
+                text=f"{len(shown)} of {len(hidden)} hidden" if query else f"{len(hidden)} hidden")
+            if not shown:
+                ctk.CTkLabel(scroll, text="No hidden items.", text_color="gray60").pack(pady=8)
                 return
-            for path in hidden:
+            for path in shown:
                 item = ctk.CTkFrame(scroll, fg_color="transparent")
                 item.pack(fill="x", pady=2)
-                ctk.CTkLabel(item, text=Path(path).name, anchor="w").pack(
-                    side="left", fill="x", expand=True)
+                text_col = ctk.CTkFrame(item, fg_color="transparent")
+                text_col.pack(side="left", fill="x", expand=True)
+                ctk.CTkLabel(text_col, text=Path(path).name, anchor="w").pack(fill="x")
+                folder = str(Path(path).parent)
+                online = is_folder_online(folder)
+                folder_text = folder if online else f"{folder}  (offline)"
+                ctk.CTkLabel(
+                    text_col, text=folder_text, anchor="w", font=ctk.CTkFont(size=10),
+                    text_color="gray60" if online else "#d98c3f",
+                ).pack(fill="x")
 
                 def unhide(p=path) -> None:
                     set_membership(self.cfg, "hidden", p, False)
@@ -2260,10 +2825,12 @@ class DesktopVista(ctk.CTk):
                         )
                     self._flush_save()
                     self._update_hidden_count_label()
+                    self._update_header_context()
                     rebuild()
 
                 ctk.CTkButton(item, text="Unhide", width=70, command=unhide).pack(side="right")
 
+        search_var.trace_add("write", rebuild)
         rebuild()
 
     # ---------------- Drive reconnect watcher ----------------
@@ -2347,6 +2914,7 @@ class DesktopVista(ctk.CTk):
     def _show_current(self) -> None:
         if self._closing or not (0 <= self.index < len(self.images)):
             return
+        self._update_header_context()
         path = self.images[self.index]
         self._load_token += 1
         token = self._load_token
@@ -2462,15 +3030,21 @@ class DesktopVista(ctk.CTk):
     # ---------------- Wallpaper ----------------
 
     def _on_style_changed(self, _value: str) -> None:
+        """Fit Style is a staged preference, not an apply command. It used
+        to call set_windows_wallpaper directly here — always through the
+        legacy global SPI path, regardless of whether the experimental
+        per-monitor COM engine and a specific target monitor were selected
+        (notes_006 P1: a supposedly preparatory setting could silently
+        restamp every display, bypassing the chosen COM route). style_var
+        is already read at apply time by _apply_path/_set_wallpaper, so
+        the new value takes effect on the next explicit apply — Set as
+        Wallpaper, Enter, a slideshow tick, tray Next/Previous, IPC/hotkey
+        next, etc. — with no separate propagation needed here.
+        """
         self._flush_save()
-        if 0 <= self.index < len(self.images):
-            try:
-                set_windows_wallpaper(self.images[self.index], self.style_var.get())
-                self._set_status(f"Style applied: {self.style_var.get()}")
-            except Exception as exc:
-                # On non-Windows, just save the preference.
-                log.info("Style change wallpaper reapply skipped: %s", exc)
-                self._set_status(f"Style saved: {self.style_var.get()}")
+        self._set_status(
+            f"Fit style set to {self.style_var.get()} — used next time the wallpaper is applied."
+        )
 
     def _on_shuffle_changed(self) -> None:
         self._shuffle_order = []
@@ -2560,9 +3134,11 @@ class DesktopVista(ctk.CTk):
                 backend.set_wallpaper(monitor_id, ensure_wallpaper_path(path), self.style_var.get())
                 target_desc = "all displays" if monitor_id is None else self.target_monitor_var.get()
                 self._set_status(f"Wallpaper set on {target_desc}: {Path(path).name}")
+                self._toast(f"Wallpaper set on {target_desc}: {Path(path).name}")
             else:
                 set_windows_wallpaper(path, self.style_var.get())
                 self._set_status(f"Wallpaper set: {Path(path).name}")
+                self._toast(f"Wallpaper set: {Path(path).name}")
             return True
         except Exception as exc:
             if silent:
@@ -3165,6 +3741,16 @@ class DesktopVista(ctk.CTk):
         self._stop_hotkeys()
         ipc.release_primary(self._mutex_handle)
         self._mutex_handle = None
+        self._close_inspection_mode()
+        # Both own periodic after() jobs; their own destroy() cancels those
+        # before the parent's own teardown proceeds (notes_006 §4: "no
+        # bind_all or global unbind is used", timer cleanup owned locally).
+        for component in (getattr(self, "hud", None), getattr(self, "toasts", None)):
+            if component is not None:
+                try:
+                    component.destroy()
+                except Exception:
+                    pass
         if self._com_backend is not None:
             try:
                 self._com_backend.close()
