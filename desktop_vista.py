@@ -289,7 +289,7 @@ log = logging.getLogger("desktop_vista")
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Desktop Vista"
-APP_VERSION = "1.7"
+APP_VERSION = "1.8"
 TAGLINE = "All my drives. One perfect view."
 
 # Frozen (PyInstaller) builds extract bundled files under a temporary
@@ -917,6 +917,90 @@ def is_fullscreen_active(state: Optional[int] = None) -> bool:
     return state in FULLSCREEN_NOTIFICATION_STATES if state is not None else False
 
 
+class _HIGHCONTRASTW(ctypes.Structure if ctypes is not None else object):
+    _fields_ = (
+        [
+            ("cbSize", ctypes.c_uint),
+            ("dwFlags", ctypes.c_uint),
+            ("lpszDefaultScheme", ctypes.c_void_p),
+        ]
+        if ctypes is not None
+        else []
+    )
+
+
+SPI_GETHIGHCONTRAST = 0x0042
+HCF_HIGHCONTRASTON = 0x00000001
+
+
+def query_high_contrast_flags() -> Optional[int]:
+    """Raw SPI_GETHIGHCONTRAST dwFlags, or None if unavailable."""
+    if ctypes is None or sys.platform != "win32":
+        return None
+    info = _HIGHCONTRASTW()
+    info.cbSize = ctypes.sizeof(_HIGHCONTRASTW)
+    try:
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST, ctypes.sizeof(info), ctypes.byref(info), 0
+        )
+    except OSError:
+        return None
+    return info.dwFlags if ok else None
+
+
+def is_high_contrast_active(flags: Optional[int] = None) -> bool:
+    """Pure predicate over SPI_GETHIGHCONTRAST's dwFlags — pass one
+    explicitly in tests; real callers omit it to query live. Windows'
+    Ease of Access > High contrast is a separate setting from our own
+    dark/light/system choice; notes_007 §1.4 says to honour it rather than
+    invent a fourth appearance mode — see _apply_appearance_mode."""
+    if flags is None:
+        flags = query_high_contrast_flags()
+    return flags is not None and bool(flags & HCF_HIGHCONTRASTON)
+
+
+MDT_EFFECTIVE_DPI = 0
+
+
+def enumerate_monitor_dpi() -> list[dict]:
+    """Per-monitor effective DPI via Shcore's GetDpiForMonitor (Windows
+    8.1+), same enumeration order as enumerate_monitors(). Returns
+    [{"device": str, "dpi_x": int|None, "dpi_y": int|None}, ...], or []
+    off Windows or on API failure. --selftest diagnostic only — nothing in
+    the apply path reads this yet; it exists so the v2.0 mixed-DPI span
+    work starts from a measurement rather than an assumption (notes_007
+    §5.2)."""
+    if ctypes is None or sys.platform != "win32":
+        return []
+    results: list[dict] = []
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_RECT), ctypes.c_void_p
+    )
+
+    def _callback(hmonitor, _hdc, _lprect, _data):
+        info = _MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(_MONITORINFOEXW)
+        device = info.szDevice if ctypes.windll.user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)) else ""
+        dpi_x, dpi_y = ctypes.c_uint(0), ctypes.c_uint(0)
+        try:
+            hresult = ctypes.windll.shcore.GetDpiForMonitor(
+                hmonitor, MDT_EFFECTIVE_DPI, ctypes.byref(dpi_x), ctypes.byref(dpi_y)
+            )
+        except OSError:
+            hresult = -1
+        if hresult == 0:  # S_OK
+            results.append({"device": device, "dpi_x": dpi_x.value, "dpi_y": dpi_y.value})
+        else:
+            results.append({"device": device, "dpi_x": None, "dpi_y": None})
+        return 1  # non-zero: keep enumerating
+
+    try:
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, MonitorEnumProc(_callback), 0)
+    except OSError:
+        return []
+    return results
+
+
 def resolve_interval_seconds(interval_key: str, custom_seconds: Any) -> int:
     """Resolve a slideshow interval selection (label or custom) to seconds."""
     if interval_key == CUSTOM_INTERVAL_LABEL:
@@ -1529,7 +1613,6 @@ class DesktopVista(ctk.CTk):
         self._mutex_handle = mutex_handle
         self._ipc_server: Optional[ipc.IpcServer] = None
         self._hotkey_listener: Optional[hotkeys.HotkeyListener] = None
-        ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         self.title(f"{APP_NAME}  —  {TAGLINE}")
@@ -1537,6 +1620,12 @@ class DesktopVista(ctk.CTk):
         self.minsize(980, 560)
 
         self.cfg = load_config()
+        # Must follow cfg load (the saved preference) but precede any
+        # widget construction below (CTk reads appearance mode per-widget
+        # at creation time). Previously hardcoded to "dark" regardless of
+        # the saved preference — folded into the same fix that honours
+        # SPI_GETHIGHCONTRAST (notes_007 §1.4).
+        self._apply_appearance_mode()
         self.images: list[str] = []
         self.index: int = -1
         self._active_kind: str = "folder"
@@ -2300,11 +2389,25 @@ class DesktopVista(ctk.CTk):
         except Exception:
             pass
 
+    def _apply_appearance_mode(self) -> None:
+        """Resolve and apply the live CTk appearance mode. Windows' Ease of
+        Access > High contrast is a separate, OS-level setting; when it's
+        on we defer to CTk's own "system" mode rather than fight it with a
+        saved light/dark preference the user picked before turning high
+        contrast on — the preference itself is left untouched in cfg and
+        takes effect again as soon as high contrast is turned off
+        (notes_007 §1.4: honour it, don't invent a fourth appearance
+        mode)."""
+        if is_high_contrast_active():
+            ctk.set_appearance_mode("system")
+        else:
+            ctk.set_appearance_mode(self.cfg["ui"]["appearance"])
+
     def _on_appearance_changed(self, value: str) -> None:
         mode = UI_APPEARANCE_LABEL_TO_VALUE.get(value, "dark")
         self.cfg["ui"]["appearance"] = mode
         self._flush_save()
-        ctk.set_appearance_mode(mode)
+        self._apply_appearance_mode()
         self._restyle_canvas_widgets()
 
     def _on_hud_always_visible_changed(self) -> None:
@@ -4111,6 +4214,17 @@ def run_selftest() -> int:
     print(f"COM backend module: {windows_wallpaper_com is not None}")
     win32_monitors = enumerate_monitors()
     print(f"Win32 monitor enumeration: {len(win32_monitors)} monitor(s) -> {win32_monitors}")
+    monitor_dpi = enumerate_monitor_dpi()
+    print(f"Per-monitor DPI (GetDpiForMonitor): {monitor_dpi}")
+    print(f"High contrast active (SPI_GETHIGHCONTRAST): {is_high_contrast_active()}")
+    try:
+        probe_root = ctk.CTk()
+        probe_root.withdraw()
+        tk_scaling = probe_root.tk.call("tk", "scaling")
+        probe_root.destroy()
+        print(f"Tk scaling factor: {tk_scaling}")
+    except Exception as exc:
+        print(f"Tk scaling factor: unavailable ({exc})")
 
     # v1.6 — single-instance mutex, named-pipe IPC, global hotkeys, solar math.
     print(f"ipc available:      {ipc.is_available()}")

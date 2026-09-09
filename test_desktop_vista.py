@@ -646,6 +646,28 @@ def test_join_monitor_topology_empty_com_list():
 
 
 # ---------------------------------------------------------------------------
+# is_high_contrast_active (notes_007 §1.4 — a11y prep)
+# ---------------------------------------------------------------------------
+
+def test_is_high_contrast_active_flag_set():
+    assert dv.is_high_contrast_active(dv.HCF_HIGHCONTRASTON) is True
+    assert dv.is_high_contrast_active(dv.HCF_HIGHCONTRASTON | 0x2) is True  # other bits too
+
+
+def test_is_high_contrast_active_flag_clear():
+    assert dv.is_high_contrast_active(0) is False
+    assert dv.is_high_contrast_active(0x2) is False  # some other SPI flag, not high-contrast
+
+
+def test_is_high_contrast_active_falls_back_to_live_query():
+    # None falls through to a live SPI_GETHIGHCONTRAST query rather than
+    # crashing; this dev/CI machine isn't expected to be in Windows high
+    # contrast mode (same assumption test_is_fullscreen_active_pure_predicate
+    # makes about fullscreen state).
+    assert dv.is_high_contrast_active(None) is False
+
+
+# ---------------------------------------------------------------------------
 # resolve_rebuilt_index (notes_007 §1.2 — Hidden Items playback invariants)
 # ---------------------------------------------------------------------------
 

@@ -197,7 +197,7 @@ gated plans:
 
 | Release | Theme | Readiness |
 | :--- | :--- | :--- |
-| **v1.8** | Leftover closure (single pipeline) | ✅ Ready — no hardware/human gate, buildable now |
+| **v1.8** | Leftover closure (single pipeline) | ✅ Done (2026-09-10) |
 | **v1.8.1** | Accessibility verification gate | ⏳ Blocked — needs Mark + real Narrator on Windows 11 |
 | **v2.0** | "One Perfect View" display rewrite | ⏳ Blocked — needs 2+ physical displays + a dock/undock cycle |
 | **v2.1** | Intelligence & scale | ⏳ Blocked — depends on v2.0's assignment model existing |
@@ -206,7 +206,7 @@ gated plans:
 Only v1.8 is unblocked by anything other than engineering time, so it's the release under
 active development this session.
 
-## v1.8 — Leftover closure (single pipeline)
+## v1.8 — Leftover closure (single pipeline) ✅ Done (2026-09-10)
 
 Closes the five items Mark named plus two prep items, all correctness/UI work that does **not**
 require a second physical display. Explicitly excludes ApplyQueue, SQLite, a clickable topology
@@ -214,16 +214,21 @@ map, and anything else that belongs to v2.0+ (notes_007 §6.5).
 
 | Priority | Item | Status |
 | :---: | :--- | :--- |
-| P0/P1 | Hidden Items playback-invariant rebuild (`_rebuild_playback_after_filter_change`) — hide/unhide no longer desyncs `self.images`/index/shuffle deck | ⏳ In progress |
-| P1 | Hide-of-applied advances the desktop through the existing silent apply path (or honestly leaves the last image if the source is now empty) | ⏳ In progress |
-| P2 | Hidden manager hygiene: `_folder_online_cache` instead of a Tk-thread probe, Reveal in Explorer per row, explicit off-thread "Remove missing" | ⏳ In progress |
-| P1/P2 | Playlist/collection `EditorSheet` + `TagSelector` reuse + playlist "Browse…" + live match-count + inline validation | ⏳ Planned |
-| Low | About/copyright block on Settings + tray "About Desktop Vista…" entry | ⏳ Planned |
-| Med | Read-only topology: session RECT join for display labels, unresolved (ambiguous) displays flagged — still no click handler | ⏳ Planned |
-| Med | Keyboard tab-order audit + `SPI_GETHIGHCONTRAST` honour + `--selftest` DPI dump + Narrator test script written into `VERIFICATION.md` | ⏳ Planned |
+| P0/P1 | Hidden Items playback-invariant rebuild (`_rebuild_playback_after_filter_change`) — hide/unhide no longer desyncs `self.images`/index/shuffle deck | ✅ Done |
+| P1 | Hide-of-applied advances the desktop through the existing silent apply path (or honestly leaves the last image if the source is now empty) | ✅ Done |
+| P2 | Hidden manager hygiene: `_folder_online_cache` instead of a Tk-thread probe, Reveal in Explorer per row, explicit off-thread "Remove missing" | ✅ Done |
+| P1/P2 | Playlist/collection `EditorSheet` + `TagSelector` reuse + playlist "Browse…" + live match-count + inline validation | ✅ Done |
+| Low | About/copyright block on Settings + tray "About Desktop Vista…" entry | ✅ Done |
+| Med | Read-only topology: session RECT join (`join_monitor_topology`) for display labels, unresolved (ambiguous) displays flagged — still no click handler | ✅ Done |
+| Med | Keyboard tab-order audit + `SPI_GETHIGHCONTRAST` honour + `--selftest` DPI dump + Narrator test script written into `VERIFICATION.md` | ✅ Done — tab order audited via a standalone Tk traversal probe (no code change needed, see `VERIFICATION.md`); high-contrast honour and per-monitor DPI dump implemented; Narrator/contrast/multi-DPI hardware pass itself is v1.8.1 |
 
-**Exit criteria:** 152 existing tests stay green plus new Hidden/editor/About coverage;
-`APP_VERSION` → `"1.8"`.
+**Exit criteria (all met):** 171/171 tests passing (was 152); `APP_VERSION` → `"1.8"`.
+
+**Implementation note:** also fixed a latent pre-existing bug found while wiring high-contrast
+honour — the app always launched in dark mode regardless of the saved `cfg["ui"]["appearance"]`
+preference, because `ctk.set_appearance_mode("dark")` was hardcoded before config load and never
+re-applied at startup (only on an explicit dropdown change). Folded into `_apply_appearance_mode`,
+called once after config load and again on every appearance change.
 
 ## v1.8.1 — Accessibility verification gate
 
