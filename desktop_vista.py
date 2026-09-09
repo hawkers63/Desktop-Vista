@@ -8,7 +8,7 @@
 # See the LICENSE file in the project root for the full proprietary notice.
 """
 Desktop Vista  —  All my drives. One perfect view.
-Version 1.5.0  (September 2026)
+Version 1.5.1  (September 2026)
 
 A lightweight Windows wallpaper manager.
 
@@ -96,9 +96,29 @@ New in v1.5 "Foundations for v2.0":
       times) — validated and stored, not yet wired into the live
       schedule; that wiring, like per-monitor apply, is v2.0's job
 
-Planned for v2.0: multi-monitor (IDesktopWallpaper COM), built behind an
-opt-in experimental flag — see ROADMAP.md for what's been verified versus
-what still needs multi-monitor hardware to confirm.
+v1.5.1 — v2.0 groundwork, not v2.0 itself:
+    - windows_wallpaper_com.py: a real IDesktopWallpaper COM backend
+      (comtypes), imported lazily and only ever touched when
+      config.wallpaper_target is switched to "com" (default stays "spi",
+      the existing global SystemParametersInfoW path — zero behaviour
+      change unless a user opts in)
+    - UI: "Per-monitor engine (COM)" toggle + a target-monitor picker;
+      "Set as Wallpaper" applies to the chosen display via COM when
+      enabled, otherwise the unchanged global path
+    - This is a manual per-monitor APPLY, not independent per-monitor
+      slideshows — there is one shared index/navigation/slideshow state
+      still. Verified on the development machine (single display): COM
+      object creation, monitor enumeration, and SetWallpaper/SetPosition
+      for both the all-displays and the one real monitor's specific
+      target all succeed and visibly change the desktop. NOT verified
+      anywhere: two different images actually showing independently on
+      two different physical displays — that needs real multi-monitor
+      hardware. Treat the per-monitor claim as unconfirmed until checked.
+
+Still ahead for the full v2.0 milestone: independent per-monitor
+slideshow/navigation state, the span crop assistant, wiring solar/tags
+into the *applied* wallpaper (not just the UI), and a go/no-go decision
+on desktop crossfade — see ROADMAP.md.
 """
 
 from __future__ import annotations
@@ -137,6 +157,15 @@ try:
 except ImportError:
     pystray = None  # type: ignore[assignment]
 
+try:
+    import windows_wallpaper_com
+except ImportError:
+    # Missing comtypes, non-Windows, or (Desktop Vista's own guard) any
+    # platform windows_wallpaper_com itself declines to load on. The
+    # experimental per-monitor toggle stays disabled in the UI when this
+    # is None; the default "spi" wallpaper_target never touches it.
+    windows_wallpaper_com = None  # type: ignore[assignment]
+
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageOps
 from tkinter import Canvas, filedialog, messagebox, simpledialog
@@ -156,7 +185,7 @@ log = logging.getLogger("desktop_vista")
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Desktop Vista"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 TAGLINE = "All my drives. One perfect view."
 
 # Frozen (PyInstaller) builds extract bundled files under a temporary
@@ -234,6 +263,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "longitude": None,
         "fallback_times": ["06:00", "08:00", "18:00", "21:00"],  # dawn/day/dusk/night
     },
+    # v2.0 experimental — "spi" (default, global SystemParametersInfoW) never
+    # touches windows_wallpaper_com; "com" opts into the per-monitor engine.
+    "wallpaper_target": "spi",
 }
 
 STARTUP_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -845,6 +877,11 @@ def _validate_config(raw: dict) -> dict[str, Any]:
         log.warning("Invalid 'solar' in config; using default.")
         cfg["solar"] = copy.deepcopy(DEFAULT_CONFIG["solar"])
 
+    # ---- v2.0 experimental (additive) ----
+
+    wallpaper_target = raw.get("wallpaper_target", DEFAULT_CONFIG["wallpaper_target"])
+    cfg["wallpaper_target"] = wallpaper_target if wallpaper_target in ("spi", "com") else "spi"
+
     return cfg
 
 
@@ -1138,6 +1175,10 @@ class DesktopVista(ctk.CTk):
         self._slideshow_running: bool = False
         self._auto_pause_reasons: set[str] = set()
         self._power_job: Any = None
+        # v2.0 experimental — lazily constructed only if wallpaper_target
+        # is switched to "com"; never touched by the default "spi" path.
+        self._com_backend: Any = None
+        self._target_monitor_label_to_id: dict[str, Optional[str]] = {"All Displays": None}
         self._preview_ref = None  # keep CTkImage alive
         self._slideshow_job: Any = None
         self._save_job: Any = None
@@ -1311,6 +1352,29 @@ class DesktopVista(ctk.CTk):
             row=row(), column=0, padx=16, pady=(4, 0), sticky="w")
         self._refresh_monitor_topology()
 
+        # Experimental per-monitor engine (v2.0) — opt-in, defaults off.
+        # Verified on this development machine's single display that the
+        # COM plumbing itself works (object creation, enumeration, apply);
+        # true per-monitor independence needs real multi-monitor hardware
+        # to confirm, which this build has not had access to.
+        ctk.CTkLabel(side, text="DISPLAY ENGINE (experimental)",
+                     font=ctk.CTkFont(size=11, weight="bold"), text_color="gray60").grid(
+            row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
+        self.com_target_var = ctk.BooleanVar(value=self.cfg.get("wallpaper_target") == "com")
+        self.com_target_switch = ctk.CTkSwitch(
+            side, text="Per-monitor engine (COM)", variable=self.com_target_var,
+            command=self._on_wallpaper_target_changed)
+        self.com_target_switch.grid(row=row(), column=0, padx=16, pady=(4, 4), sticky="w")
+        if windows_wallpaper_com is None:
+            self.com_target_switch.configure(state="disabled")
+        self.target_monitor_var = ctk.StringVar(value="All Displays")
+        self.target_monitor_menu = ctk.CTkOptionMenu(
+            side, variable=self.target_monitor_var, values=["All Displays"],
+            command=self._on_target_monitor_selected)
+        self.target_monitor_menu.grid(row=row(), column=0, padx=16, pady=(0, 4), sticky="ew")
+        if self.cfg.get("wallpaper_target") == "com":
+            self._refresh_com_monitor_menu()
+
         # Startup
         ctk.CTkLabel(side, text="STARTUP", font=ctk.CTkFont(size=11, weight="bold"),
                      text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
@@ -1422,6 +1486,55 @@ class DesktopVista(ctk.CTk):
                 (x0 + x1) // 2, (y0 + y1) // 2, text=label, fill="white",
                 font=("Segoe UI", 9, "bold"),
             )
+
+    # ---------------- Experimental per-monitor engine (v2.0) ----------------
+
+    def _get_com_backend(self):
+        """Lazily construct the COM backend's dedicated STA thread — only
+        ever called once wallpaper_target is switched to "com"."""
+        if windows_wallpaper_com is None:
+            return None
+        if self._com_backend is None:
+            try:
+                self._com_backend = windows_wallpaper_com.ComWallpaperBackend()
+            except Exception as exc:
+                log.warning("Could not start COM wallpaper backend: %s", exc)
+                return None
+        return self._com_backend
+
+    def _refresh_com_monitor_menu(self) -> None:
+        backend = self._get_com_backend()
+        labels = ["All Displays"]
+        mapping: dict[str, Optional[str]] = {"All Displays": None}
+        if backend is not None:
+            try:
+                for i, (device_id, _rect) in enumerate(backend.enumerate_monitors(), start=1):
+                    label = f"Display {i}"
+                    labels.append(label)
+                    mapping[label] = device_id
+            except Exception as exc:
+                log.warning("Could not enumerate COM monitors: %s", exc)
+        self._target_monitor_label_to_id = mapping
+        self.target_monitor_menu.configure(values=labels)
+        if self.target_monitor_var.get() not in labels:
+            self.target_monitor_var.set(labels[0])
+
+    def _on_wallpaper_target_changed(self) -> None:
+        enabled = bool(self.com_target_var.get())
+        self.cfg["wallpaper_target"] = "com" if enabled else "spi"
+        self._flush_save()
+        if enabled:
+            self._refresh_com_monitor_menu()
+            self._set_status(
+                "Experimental per-monitor engine on — verified on this build's own "
+                "hardware only for the all-displays target; check a specific-monitor "
+                "target carefully on yours."
+            )
+        else:
+            self._set_status("Wallpaper engine: standard (all displays).")
+
+    def _on_target_monitor_selected(self, _label: str) -> None:
+        pass  # read at apply time in _set_wallpaper; nothing to do eagerly
 
     # ---------------- Debounced save ----------------
 
@@ -2141,8 +2254,17 @@ class DesktopVista(ctk.CTk):
             return
         path = self.images[self.index]
         try:
-            set_windows_wallpaper(path, self.style_var.get())
-            self._set_status(f"Wallpaper set: {Path(path).name}")
+            if self.cfg.get("wallpaper_target") == "com":
+                backend = self._get_com_backend()
+                if backend is None:
+                    raise RuntimeError("Experimental per-monitor engine is unavailable.")
+                monitor_id = self._target_monitor_label_to_id.get(self.target_monitor_var.get())
+                backend.set_wallpaper(monitor_id, ensure_wallpaper_path(path), self.style_var.get())
+                target_desc = "all displays" if monitor_id is None else self.target_monitor_var.get()
+                self._set_status(f"Wallpaper set on {target_desc}: {Path(path).name}")
+            else:
+                set_windows_wallpaper(path, self.style_var.get())
+                self._set_status(f"Wallpaper set: {Path(path).name}")
         except Exception as exc:
             if silent:
                 # Unattended slideshow: never block on a modal dialog — most
@@ -2473,6 +2595,11 @@ class DesktopVista(ctk.CTk):
         self._cancel_after_jobs()
         self._write_config()
         self._stop_tray_icon()
+        if self._com_backend is not None:
+            try:
+                self._com_backend.close()
+            except Exception:
+                pass
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
@@ -2481,7 +2608,36 @@ class DesktopVista(ctk.CTk):
         self.destroy()
 
 
+def run_selftest() -> int:
+    """
+    Print diagnostic info about the optional Windows integrations and exit
+    without opening a window. Mainly for confirming a packaged build
+    bundled everything correctly (e.g. after changing build_exe.spec).
+    """
+    print(f"Desktop Vista {APP_VERSION}  (frozen={FROZEN}, platform={sys.platform})")
+    print(f"winreg available:   {winreg is not None}")
+    print(f"pystray available:  {pystray is not None}")
+    print(f"COM backend module: {windows_wallpaper_com is not None}")
+    win32_monitors = enumerate_monitors()
+    print(f"Win32 monitor enumeration: {len(win32_monitors)} monitor(s) -> {win32_monitors}")
+    if windows_wallpaper_com is None:
+        return 0
+    try:
+        backend = windows_wallpaper_com.ComWallpaperBackend()
+        try:
+            com_monitors = backend.enumerate_monitors()
+            print(f"COM monitor enumeration:   {len(com_monitors)} monitor(s) -> {com_monitors}")
+        finally:
+            backend.close()
+    except Exception as exc:
+        print(f"COM monitor enumeration FAILED: {exc}")
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv[1:]:
+        sys.exit(run_selftest())
     if sys.platform != "win32":
         print("Desktop Vista is designed for Windows.")
     start_minimized = "--minimized" in sys.argv[1:]

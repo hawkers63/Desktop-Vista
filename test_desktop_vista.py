@@ -146,6 +146,7 @@ def test_load_config_valid_values_kept(tmp_path):
             "longitude": None,
             "fallback_times": ["06:00", "08:00", "18:00", "21:00"],
         },
+        "wallpaper_target": "spi",
     }
 
 
@@ -754,6 +755,47 @@ def test_compute_topology_layout_negative_coordinates_handled():
     layout = dv.compute_topology_layout(monitors, 400, 100)
     assert all(m["layout"]["x"] >= 0 and m["layout"]["y"] >= 0 for m in layout)
     assert layout[1]["layout"]["x"] < layout[0]["layout"]["x"]
+
+
+# ---------------------------------------------------------------------------
+# v2.0 experimental — wallpaper_target flag, COM backend module
+# ---------------------------------------------------------------------------
+
+def test_load_config_wallpaper_target_defaults_to_spi(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["wallpaper_target"] == "spi"
+
+
+def test_load_config_wallpaper_target_invalid_falls_back_to_spi(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"wallpaper_target": "gpu-shader"}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["wallpaper_target"] == "spi"
+
+
+def test_load_config_wallpaper_target_com_kept(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"wallpaper_target": "com"}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["wallpaper_target"] == "com"
+
+
+@pytest.mark.skipif(dv.windows_wallpaper_com is None, reason="requires comtypes on Windows")
+def test_com_position_values_cover_all_fit_styles():
+    import windows_wallpaper_com as wc
+    # Every style Desktop Vista's UI offers must map to a real position enum
+    # value, or the "com" target would silently fall back to Fill for it.
+    for style in dv.WALLPAPER_STYLES:
+        assert style in wc.POSITION_VALUES
+
+
+@pytest.mark.skipif(dv.windows_wallpaper_com is None, reason="requires comtypes on Windows")
+def test_com_backend_rejects_span_for_specific_monitor():
+    import windows_wallpaper_com as wc
+    with pytest.raises(wc.ComWallpaperError):
+        wc.ComWallpaperBackend._set_wallpaper_sta("some-device-id", "C:\\x.jpg", "Span")
 
 
 # ---------------------------------------------------------------------------

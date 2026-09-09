@@ -128,6 +128,26 @@ from two different drives and filtered into a virtual collection (✅).
 
 `IDesktopWallpaper` COM integration for true per-monitor wallpapers, panoramic/ultrawide span assist, wiring tags/collections and solar cycles into the *applied* wallpaper (not just the UI), and a go/no-go decision on desktop crossfade. The legacy `SystemParametersInfoW` path stays live behind a `wallpaper_target` feature flag until the COM path is proven (see `notes/notes_002.txt` §5 cross-cutting notes).
 
+### v1.5.1 — v2.0 groundwork landed (2026-09-09)
+
+Shipped ahead of the full milestone, gated behind `wallpaper_target: "com"` (default stays `"spi"`, zero behaviour change unless opted in):
+
+| Item | Status |
+| :--- | :--- |
+| `windows_wallpaper_com.py` — real `IDesktopWallpaper` COM backend (comtypes), one dedicated STA thread, blocking call dispatch | ✅ Done |
+| UI: per-monitor engine toggle + target-monitor picker; "Set as Wallpaper" routes through COM when enabled | ✅ Done |
+| Verify COM plumbing: object creation, monitor enumeration, `SetWallpaper`/`SetPosition` for the all-displays target and this machine's one real monitor-specific target | ✅ Done — both visibly changed the desktop, cross-checked against `SystemParametersInfoW`'s own reported path |
+| Verify true per-monitor independence (two different images, two different physical displays, neither affecting the other) | ❌ **Not verified** — this development machine has one display attached; do not treat this as confirmed until checked on real multi-monitor hardware |
+
+**Still ahead for the full v2.0 milestone** (none of this is done):
+
+- Independent per-monitor playback state — right now there is one shared image index/navigation/slideshow; a real per-monitor experience needs separate assignment and (per the wireframes) possibly separate slideshows per display.
+- Span crop assistant and mixed-DPI/portrait-display validation (notes_004 Track B).
+- Wiring `tags`/`collections` (v1.5) and the `solar` data model (v1.5) into what's actually *applied*, not just selectable in the UI.
+- Device-path persistence/reconciliation across docking or driver changes (`GetMonitorDevicePathAt` identity is not guaranteed stable — notes_004 Track B).
+- Desktop crossfade go/no-go (research gate — no committed direction).
+- Lock Screen WinRT setter (carried over from v1.5, still just a research spike).
+
 ---
 
 ## Notes

@@ -54,5 +54,6 @@
     "latitude": null,
     "longitude": null,
     "fallback_times": ["06:00", "08:00", "18:00", "21:00"]
-  }
+  },
+  "wallpaper_target": "spi"
 }

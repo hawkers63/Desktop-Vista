@@ -61,6 +61,7 @@ The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to previ
 - **Daily-times schedule** — an alternative to a fixed interval: pick times of day ("08:00, 18:00") instead
 - **Tags & collections** — tag any image and filter playback to a saved "match any of these tags" collection spanning every drive (v1.5)
 - **Monitor topology strip** — a read-only view of your actual display arrangement (groundwork for multi-monitor wallpapers in v2.0)
+- **Experimental per-monitor engine (v1.5.1)** — an opt-in `IDesktopWallpaper` COM backend lets "Set as Wallpaper" target one specific display instead of all of them; see the caveat below before relying on it with more than one monitor
 
 ---
 
@@ -160,6 +161,27 @@ Settings are stored in `config.json` beside `desktop_vista.py`. Use [`config.exa
 | `tags` | `{path: string[]}` | Freeform tags per image path (non-destructive) |
 | `collections` | `[{id, name, tags_any}]` | Saved filters — a collection plays every known image tagged with any of `tags_any` |
 | `solar` | `{enabled, latitude, longitude, fallback_times}` | Dawn/day/dusk/night data model (v1.5 groundwork) — stored and validated, not yet wired into playback |
+| `wallpaper_target` | `string` | `"spi"` (default, global) or `"com"` (experimental per-monitor engine, v1.5.1) |
+
+---
+
+## Experimental: per-monitor wallpapers (v1.5.1)
+
+Switching "Per-monitor engine (COM)" on routes **Set as Wallpaper** through
+`windows_wallpaper_com.py` (an `IDesktopWallpaper` COM backend) instead of the
+default global `SystemParametersInfoW` call, and lets you pick a specific
+display from the dropdown next to it instead of "All Displays". This has been
+verified — on the machine this was built on — to genuinely create the COM
+object, enumerate monitors, and apply to both the all-displays target and that
+machine's one real monitor without error.
+
+**What it is not yet:** that machine has a single display attached, so
+**true per-monitor independence — two different images actually showing on
+two different physical screens at once — has not been visually confirmed.**
+There is also still only one shared navigation/slideshow state; this toggle
+changes *where* the current image is applied, not a path to independent
+per-monitor slideshows. Turn it off (back to `"spi"`) if anything looks wrong
+on your setup — the default path is unaffected either way.
 
 Example (placeholders only):
 

@@ -3,3 +3,4 @@ pillow
 pystray
 pytest
 pyinstaller  # only needed to build DesktopVista.exe (see build_exe.spec)
+comtypes  # optional: enables the experimental per-monitor COM engine (v1.5.1)
