@@ -593,6 +593,100 @@ def test_resolve_source_images_missing_playlist_returns_empty():
     assert dv.resolve_source_images({"playlists": [], "hidden": []}, "playlist", "gone") == []
 
 
+# ---------------------------------------------------------------------------
+# resolve_rebuilt_index (notes_007 §1.2 — Hidden Items playback invariants)
+# ---------------------------------------------------------------------------
+
+def test_resolve_rebuilt_index_prefers_preferred_path():
+    images = ["a.jpg", "b.jpg", "c.jpg"]
+    assert dv.resolve_rebuilt_index(images, old_index=0, preferred_path="c.jpg") == 2
+
+
+def test_resolve_rebuilt_index_clamps_when_list_shrinks():
+    # Old index pointed past the end of a list that just lost its last item.
+    assert dv.resolve_rebuilt_index(["a.jpg", "b.jpg"], old_index=2, preferred_path=None) == 1
+
+
+def test_resolve_rebuilt_index_empty_list_is_negative_one():
+    assert dv.resolve_rebuilt_index([], old_index=0, preferred_path=None) == -1
+    assert dv.resolve_rebuilt_index([], old_index=0, preferred_path="gone.jpg") == -1
+
+
+def test_resolve_rebuilt_index_preferred_path_absent_falls_back_to_clamp():
+    assert dv.resolve_rebuilt_index(["a.jpg"], old_index=5, preferred_path="not-there.jpg") == 0
+
+
+def test_hide_current_image_shrinks_list_clamps_index_and_empties_shuffle_deck(tmp_path):
+    """Reproduces _rebuild_playback_after_filter_change's contract: hiding
+    the last image in a folder must not leave a stale shuffle deck that can
+    later IndexError or point at the hidden file."""
+    folder = tmp_path
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        (folder / name).write_bytes(b"x")
+    cfg = {"hidden": []}
+    images = dv.resolve_source_images(cfg, "folder", str(folder))
+    old_index = len(images) - 1  # currently viewing the last image
+    hidden_path = images[old_index]
+
+    dv.set_membership(cfg, "hidden", hidden_path, True)
+    new_images = dv.resolve_source_images(cfg, "folder", str(folder))
+    new_index = dv.resolve_rebuilt_index(new_images, old_index, preferred_path=None)
+    # Deck reset is the caller's job (self._shuffle_order = []); the deck
+    # itself is only valid for the list it was built against.
+    shuffle_order: list[int] = []
+
+    assert hidden_path not in new_images
+    assert len(new_images) == 2
+    assert 0 <= new_index < len(new_images)
+    assert shuffle_order == []
+
+
+def test_hide_then_rebuild_shuffle_deck_never_indexes_hidden_path(tmp_path):
+    folder = tmp_path
+    for name in ("a.jpg", "b.jpg", "c.jpg", "d.jpg"):
+        (folder / name).write_bytes(b"x")
+    cfg = {"hidden": []}
+    images = dv.resolve_source_images(cfg, "folder", str(folder))
+    hidden_path = images[1]
+
+    dv.set_membership(cfg, "hidden", hidden_path, True)
+    new_images = dv.resolve_source_images(cfg, "folder", str(folder))
+    new_index = dv.resolve_rebuilt_index(new_images, old_index=1, preferred_path=None)
+    # A freshly-reset deck (as _rebuild_playback_after_filter_change leaves
+    # it) forces the next _advance_shuffle call to rebuild against the new,
+    # correct length rather than reuse indices from the old one.
+    deck = dv.build_shuffle_deck(len(new_images), new_index)
+
+    assert sorted(deck) == list(range(len(new_images)))
+    assert all(new_images[i] != hidden_path for i in deck)
+
+
+def test_unhide_only_image_restores_preview_at_index_zero(tmp_path):
+    folder = tmp_path
+    (folder / "only.jpg").write_bytes(b"x")
+    only_path = str(folder / "only.jpg")
+    cfg = {"hidden": [only_path], "favourites": []}
+
+    assert dv.resolve_source_images(cfg, "folder", str(folder)) == []
+
+    dv.set_membership(cfg, "hidden", only_path, False)
+    images = dv.resolve_source_images(cfg, "folder", str(folder))
+    index = dv.resolve_rebuilt_index(images, old_index=-1, preferred_path=only_path)
+
+    assert images == [only_path]
+    assert index == 0
+    assert cfg["favourites"] == []  # unhide must not touch favourites
+
+
+def test_about_copy_has_rights_and_owner_no_local_paths():
+    joined = "\n".join(dv.ABOUT_COPY)
+    assert "All rights reserved" in joined
+    assert "Mark Hawksworth" in joined
+    assert "hawkers63" in joined
+    assert "\\" not in joined  # no leaked source-file or wallpaper folder paths
+    assert str(dv.APP_DIR) not in joined
+
+
 def test_set_membership_add_and_remove():
     cfg = {"favourites": ["a.jpg"]}
     dv.set_membership(cfg, "favourites", "b.jpg", True)

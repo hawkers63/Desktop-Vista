@@ -188,6 +188,73 @@ notes_006's phases B–D, implemented in the same session as v1.6.1, per Mark's 
 
 ---
 
+## Next five releases (scoped from notes_007 / notes_008, 2026-09-09)
+
+An architecture pack (`notes/notes_007.txt`, Principal Systems Architect role) and Mark's own
+condensed priority note (`notes/notes_008.txt`) agree on scope for the next five releases. Read
+together they replace this document's old open-ended "Beyond this window" musings with concrete,
+gated plans:
+
+| Release | Theme | Readiness |
+| :--- | :--- | :--- |
+| **v1.8** | Leftover closure (single pipeline) | ✅ Ready — no hardware/human gate, buildable now |
+| **v1.8.1** | Accessibility verification gate | ⏳ Blocked — needs Mark + real Narrator on Windows 11 |
+| **v2.0** | "One Perfect View" display rewrite | ⏳ Blocked — needs 2+ physical displays + a dock/undock cycle |
+| **v2.1** | Intelligence & scale | ⏳ Blocked — depends on v2.0's assignment model existing |
+| **Future / research gate** | dhash/ONNX saliency, extra cloud feeds, per-monitor fullscreen, desktop crossfade | ⏳ Blocked — sequenced after v2.1, some items may never ship (see notes_007 §2 "Deliberate non-features") |
+
+Only v1.8 is unblocked by anything other than engineering time, so it's the release under
+active development this session.
+
+## v1.8 — Leftover closure (single pipeline)
+
+Closes the five items Mark named plus two prep items, all correctness/UI work that does **not**
+require a second physical display. Explicitly excludes ApplyQueue, SQLite, a clickable topology
+map, and anything else that belongs to v2.0+ (notes_007 §6.5).
+
+| Priority | Item | Status |
+| :---: | :--- | :--- |
+| P0/P1 | Hidden Items playback-invariant rebuild (`_rebuild_playback_after_filter_change`) — hide/unhide no longer desyncs `self.images`/index/shuffle deck | ⏳ In progress |
+| P1 | Hide-of-applied advances the desktop through the existing silent apply path (or honestly leaves the last image if the source is now empty) | ⏳ In progress |
+| P2 | Hidden manager hygiene: `_folder_online_cache` instead of a Tk-thread probe, Reveal in Explorer per row, explicit off-thread "Remove missing" | ⏳ In progress |
+| P1/P2 | Playlist/collection `EditorSheet` + `TagSelector` reuse + playlist "Browse…" + live match-count + inline validation | ⏳ Planned |
+| Low | About/copyright block on Settings + tray "About Desktop Vista…" entry | ⏳ Planned |
+| Med | Read-only topology: session RECT join for display labels, unresolved (ambiguous) displays flagged — still no click handler | ⏳ Planned |
+| Med | Keyboard tab-order audit + `SPI_GETHIGHCONTRAST` honour + `--selftest` DPI dump + Narrator test script written into `VERIFICATION.md` | ⏳ Planned |
+
+**Exit criteria:** 152 existing tests stay green plus new Hidden/editor/About coverage;
+`APP_VERSION` → `"1.8"`.
+
+## v1.8.1 — Accessibility verification gate
+
+No feature work if v1.8's tab-order/contrast/DPI groundwork lands cleanly. Mark (or a designated
+tester) runs the `VERIFICATION.md` Narrator script on real Windows 11 — Light/Dark, 100%/150%
+scaling. Outcomes recorded as pass / fail / toolkit-limitation; a fake pass is never recorded.
+
+## v2.0 — "One Perfect View" (display rewrite)
+
+See "Beyond this window — v2.0" below for the full item list and exit criteria. Non-negotiable
+prerequisites: a machine with 2+ physical displays attached, at least one dock/undock or Win+P
+cycle during verification, and `ApplyQueue` landed before any UI claims "Applying…". Extracts
+`playback.py` (PlaybackController) and `displays.py` (topology join, fingerprinting, span slicer).
+
+## v2.1 — Intelligence and scale
+
+SQLite catalogue (`desktop_vista.db`) with dual-write of tags/favourites/hidden back to
+`config.json`, weather-reactive bias (Open-Meteo, opt-in, no API key), opt-in Windows accent-colour
+sync (Pillow quantize, never NumPy), lock-screen WinRT research spike against the frozen exe,
+perceptual-duplicate review UI, resolution down-rank, EXIF inspector, entropy focal-point crop,
+Bing Daily/NASA APOD feeds. Only starts once v2.0's per-display assignment model exists — a
+catalogue's `display_assignments` table would otherwise encode a fiction.
+
+## Future / research gate
+
+Lightweight ONNX saliency (exe-size risk), Unsplash/Wallhaven feeds (ToS/API-key risk),
+per-monitor fullscreen detection (`HWND ∩ RECT`), desktop crossfade (research gate, no committed
+direction). Mica/Acrylic on Tk stays **dropped** (notes_005/v1.4 call, reaffirmed in notes_007).
+
+---
+
 ## Beyond this window — UI evolution (notes_006, phases E–F)
 
 Phases A–D above are done. What's left from notes_006's seven-track proposal:

@@ -308,6 +308,32 @@ else:
 CONFIG_PATH = APP_DIR / "config.json"
 PLAYBACK_STATE_PATH = APP_DIR / "playback_state.json"
 BRAND_ICON_PATH = RESOURCE_DIR / "icon" / "desktop_vista.ico"
+LICENSE_PATH = RESOURCE_DIR / "LICENSE"
+
+# Baked at import time rather than read from LICENSE at paint time — a
+# frozen build's RESOURCE_DIR lookup is exactly what --selftest exists to
+# verify, not something the Settings page should depend on just to show a
+# copyright line (notes_007 §1.5). The "Licence notice" button tries the
+# real LICENSE file first and falls back to this short paragraph.
+ABOUT_COPY: tuple[str, ...] = (
+    f"{APP_NAME} {APP_VERSION}" + ("  (frozen)" if FROZEN else ""),
+    "Copyright (c) 2026-present Mark Hawksworth",
+    "All rights reserved.",
+    "https://github.com/hawkers63/",
+)
+LICENCE_NOTICE_FALLBACK = (
+    "Copyright (c) 2026-present Mark Hawksworth (https://github.com/hawkers63/). "
+    "All Rights Reserved.\n\n"
+    "This software and all associated source code, documentation, configuration "
+    "templates, notes, and other materials in this repository (the \"Software\") "
+    "are the exclusive proprietary property of Mark Hawksworth "
+    "(https://github.com/hawkers63/).\n\n"
+    "PERMISSION IS NOT GRANTED for any person or entity to copy, reproduce, "
+    "redistribute, publish, modify, reverse-engineer, decompile, disassemble, "
+    "create derivative works from, sublicense, sell, or commercially exploit "
+    "the Software, in whole or in part, without prior written consent from "
+    "the copyright holder."
+)
 
 HISTORY_MAX = 100  # ring of successfully-applied wallpapers, for tray Previous/Undo
 
@@ -605,6 +631,25 @@ def resolve_source_images(cfg: dict, kind: str, source_id: str) -> list[str]:
         images = list_images(source_id)
     hidden = set(cfg.get("hidden", []))
     return [img for img in images if img not in hidden]
+
+
+def resolve_rebuilt_index(
+    images: list[str], old_index: int, preferred_path: Optional[str] = None
+) -> int:
+    """Resolve the index to use in a freshly-rebuilt *images* list after a
+    filter-affecting change (hide/unhide, playlist/collection Save).
+
+    *preferred_path* wins if it is still present (Unhide re-selecting the
+    image it just restored). Otherwise *old_index* is clamped into range —
+    this is positional, not identity-based, matching the rest of the app's
+    index model (notes_007 §1.2). -1 means "nothing to show"; callers must
+    not index into *images* without checking for it first.
+    """
+    if preferred_path is not None and preferred_path in images:
+        return images.index(preferred_path)
+    if images:
+        return min(max(old_index, 0), len(images) - 1)
+    return -1
 
 
 def set_membership(cfg: dict, list_key: str, path: str, member: bool) -> None:
@@ -1876,9 +1921,13 @@ class DesktopVista(ctk.CTk):
 
         self._section_label(page, "ABOUT")
         ctk.CTkLabel(
-            page, text=f"{APP_NAME} {APP_VERSION}" + ("  (frozen)" if FROZEN else ""),
-            text_color="gray60", font=ctk.CTkFont(size=11),
-        ).grid(row=row(), column=0, padx=16, pady=(4, 14), sticky="w")
+            page, text="\n".join(ABOUT_COPY),
+            text_color="gray60", font=ctk.CTkFont(size=11), justify="left", anchor="w",
+        ).grid(row=row(), column=0, padx=16, pady=(4, 6), sticky="w")
+        ctk.CTkButton(
+            page, text="Licence notice", fg_color="gray30", hover_color="gray25",
+            command=self._open_licence_notice,
+        ).grid(row=row(), column=0, padx=16, pady=(0, 14), sticky="ew")
 
     # ---------------- Main stage: header / preview / HUD / footer ----------------
 
@@ -2746,31 +2795,93 @@ class DesktopVista(ctk.CTk):
         if 0 <= self.index < len(self.images) and self.images[self.index] == self._tag_drawer_path:
             self._update_tags_field()
 
-    def _hide_current(self) -> None:
-        if not (0 <= self.index < len(self.images)):
-            return
-        path = self.images[self.index]
-        set_membership(self.cfg, "hidden", path, True)
-        name = Path(path).name
+    def _rebuild_playback_after_filter_change(self, preferred_path: Optional[str] = None) -> None:
+        """Recompute images/index/shuffle-deck after Hide, Unhide, or an
+        editor Save that touched the active source (notes_007 §1.2). The
+        old code let the shuffle deck outlive a list-length change, which
+        could IndexError or silently land on the wrong file mid-slideshow —
+        every mutation of `self.images` on this path must go through here
+        so the deck is never stale."""
+        self._load_token += 1
+        old_index = self.index
         self.images = (
             resolve_source_images(self.cfg, self._active_kind, self._active_id)
             if self._active_id else []
         )
-        self._load_token += 1
-        if self.images:
-            self.index = min(self.index, len(self.images) - 1)
+        self._shuffle_order = []
+        self._shuffle_cursor = 0
+        self.index = resolve_rebuilt_index(self.images, old_index, preferred_path)
+        self._update_hidden_count_label()
+        self._update_header_context()
+        if self.index >= 0:
             self._show_current()
         else:
-            self.index = -1
             self.preview.configure(image=None, text="No images left in this source")
             self.meta.configure(text="")
             self._update_favourite_button()
             self._update_tags_field()
-        self._set_status(f"Hidden {name}. Use \"Hidden Items\" to restore it.")
+
+    def _hide_current(self) -> None:
+        if not (0 <= self.index < len(self.images)):
+            return
+        path = self.images[self.index]
+        name = Path(path).name
+        # Hiding the file currently on the desktop (or hiding anything while
+        # the slideshow runs) must advance the desktop, not just the
+        # in-window preview — otherwise "Hidden" is a lie about what's
+        # actually showing (notes_007 §1.2 P1).
+        replace_desktop = (
+            self._slideshow_running
+            or self.cfg.get("current_image") == path
+            or bool(self._history and self._history[-1] == path)
+        )
+        set_membership(self.cfg, "hidden", path, True)
+        self._rebuild_playback_after_filter_change()
+        if replace_desktop:
+            if 0 <= self.index < len(self.images):
+                new_path = self.images[self.index]
+                if self._apply_path(new_path, silent=True):
+                    self._record_history(new_path)
+                    self._set_status(f"Hidden {name}. Desktop updated to {Path(new_path).name}.")
+                else:
+                    self._set_status(f"Hidden {name}. Could not update the desktop.")
+            else:
+                self._set_status(f"Hidden {name}. No images left — desktop wallpaper unchanged.")
+        else:
+            self._set_status(f"Hidden {name}. Use \"Hidden Items\" to restore it.")
         self._toast(f"Hidden: {name}")
-        self._update_hidden_count_label()
-        self._update_header_context()
         self._flush_save()
+
+    def _reveal_path_in_explorer(self, path: str) -> None:
+        try:
+            # Windows paths cannot contain '"', so this cannot break out of
+            # the /select argument; no shell is involved (shell=False).
+            subprocess.Popen(f'explorer /select,"{path}"')
+        except OSError as exc:
+            log.warning("Reveal in Explorer failed: %s", exc)
+            self._set_status("Could not open Explorer.")
+
+    def _open_licence_notice(self) -> None:
+        """Small read-only view of the licence lead-in — not the full
+        LICENSE dumped into a 260px sidebar (notes_007 §1.5). Reads the
+        real file when available (dev checkout or a frozen build that
+        happens to bundle it) and falls back to the baked short notice
+        so this never depends on RESOURCE_DIR at paint time."""
+        try:
+            text = LICENSE_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            text = LICENCE_NOTICE_FALLBACK
+        win = ctk.CTkToplevel(self)
+        win.title("Licence Notice")
+        win.geometry("420x320")
+        win.minsize(320, 240)
+        win.transient(self)
+        win.grab_set()
+        box = ctk.CTkTextbox(win, wrap="word")
+        box.pack(padx=16, pady=16, fill="both", expand=True)
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+        ctk.CTkButton(win, text="Close", command=win.destroy).pack(padx=16, pady=(0, 16), fill="x")
 
     def _open_hidden_manager(self) -> None:
         # notes_006 §2.4 P2: showing only the basename meant two files
@@ -2779,8 +2890,8 @@ class DesktopVista(ctk.CTk):
         # plus a search filter for a long hidden list.
         win = ctk.CTkToplevel(self)
         win.title("Hidden Items")
-        win.geometry("460x460")
-        win.minsize(360, 300)
+        win.geometry("460x480")
+        win.minsize(360, 320)
         win.transient(self)
         win.grab_set()
 
@@ -2790,7 +2901,7 @@ class DesktopVista(ctk.CTk):
         count_label = ctk.CTkLabel(win, text="", text_color="gray60", font=ctk.CTkFont(size=11), anchor="w")
         count_label.pack(padx=16, pady=(4, 0), fill="x")
         scroll = ctk.CTkScrollableFrame(win)
-        scroll.pack(padx=16, pady=12, fill="both", expand=True)
+        scroll.pack(padx=16, pady=(8, 4), fill="both", expand=True)
 
         def rebuild(*_args) -> None:
             for w in scroll.winfo_children():
@@ -2810,7 +2921,11 @@ class DesktopVista(ctk.CTk):
                 text_col.pack(side="left", fill="x", expand=True)
                 ctk.CTkLabel(text_col, text=Path(path).name, anchor="w").pack(fill="x")
                 folder = str(Path(path).parent)
-                online = is_folder_online(folder)
+                # Read from the cache the reconnect watcher already keeps
+                # off-thread — probing is_folder_online() here would freeze
+                # this dialog on a slow/offline NAS list (notes_007 §1.2 P2),
+                # the same class of hitch v1.6 already fixed for the sidebar.
+                online = self._folder_online_cache.get(folder, True)
                 folder_text = folder if online else f"{folder}  (offline)"
                 ctk.CTkLabel(
                     text_col, text=folder_text, anchor="w", font=ctk.CTkFont(size=10),
@@ -2820,15 +2935,59 @@ class DesktopVista(ctk.CTk):
                 def unhide(p=path) -> None:
                     set_membership(self.cfg, "hidden", p, False)
                     if self._active_id is not None:
-                        self.images = resolve_source_images(
-                            self.cfg, self._active_kind, self._active_id
-                        )
+                        self._rebuild_playback_after_filter_change(preferred_path=p)
                     self._flush_save()
-                    self._update_hidden_count_label()
-                    self._update_header_context()
                     rebuild()
 
-                ctk.CTkButton(item, text="Unhide", width=70, command=unhide).pack(side="right")
+                btn_col = ctk.CTkFrame(item, fg_color="transparent")
+                btn_col.pack(side="right")
+                ctk.CTkButton(
+                    btn_col, text="Reveal", width=60, fg_color="gray30", hover_color="gray25",
+                    command=lambda p=path: self._reveal_path_in_explorer(p),
+                ).pack(side="left", padx=(0, 6))
+                ctk.CTkButton(btn_col, text="Unhide", width=70, command=unhide).pack(side="left")
+
+        def remove_missing() -> None:
+            hidden_snapshot = list(self.cfg.get("hidden", []))
+
+            def probe() -> list[str]:
+                # Path.exists() is a filesystem call — for a hidden list of
+                # NAS/offline paths this must stay off the Tk thread, same
+                # rule as every other folder probe in this app.
+                return [p for p in hidden_snapshot if not Path(p).exists()]
+
+            future = self._executor.submit(probe)
+            future.add_done_callback(lambda fut: self.after(0, on_probe_done, fut))
+
+        def on_probe_done(future) -> None:
+            if not win.winfo_exists():
+                return
+            try:
+                missing = future.result()
+            except Exception as exc:
+                log.warning("Remove missing probe failed: %s", exc)
+                return
+            if not missing:
+                messagebox.showinfo(APP_NAME, "No missing files found among hidden items.", parent=win)
+                return
+            if not messagebox.askyesno(
+                APP_NAME,
+                f"Remove {len(missing)} hidden item(s) whose files are gone?\n\n"
+                "(This only removes them from the Hidden list — nothing else is touched.)",
+                parent=win,
+            ):
+                return
+            for p in missing:
+                set_membership(self.cfg, "hidden", p, False)
+            if self._active_id is not None:
+                self._rebuild_playback_after_filter_change()
+            self._flush_save()
+            rebuild()
+
+        ctk.CTkButton(
+            win, text="Remove missing…", fg_color="gray30", hover_color="gray25",
+            command=remove_missing,
+        ).pack(padx=16, pady=(0, 12), fill="x")
 
         search_var.trace_add("write", rebuild)
         rebuild()
@@ -3469,6 +3628,7 @@ class DesktopVista(ctk.CTk):
                 self._on_tray_toggle_slideshow,
             ),
             pystray.MenuItem("Reveal in Explorer", self._on_tray_reveal),
+            pystray.MenuItem("About Desktop Vista…", self._on_tray_about),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", self._on_tray_exit),
         )
@@ -3556,14 +3716,17 @@ class DesktopVista(ctk.CTk):
         if not (0 <= self.index < len(self.images)):
             self._set_status("Nothing to reveal.")
             return
-        path = self.images[self.index]
-        try:
-            # Windows paths cannot contain '"', so this cannot break out of
-            # the /select argument; no shell is involved (shell=False).
-            subprocess.Popen(f'explorer /select,"{path}"')
-        except OSError as exc:
-            log.warning("Reveal in Explorer failed: %s", exc)
-            self._set_status("Could not open Explorer.")
+        self._reveal_path_in_explorer(self.images[self.index])
+
+    def _on_tray_about(self, _icon=None, _item=None) -> None:
+        self.after(0, self._show_about)
+
+    def _show_about(self) -> None:
+        """Tray and in-window About share one entry point and one copy
+        source (ABOUT_COPY) — the Settings page already has the block,
+        so this just surfaces it rather than opening a second window."""
+        self._tray_restore()
+        self._show_page("settings")
 
     def _on_tray_exit(self, _icon=None, _item=None) -> None:
         self.after(0, self._on_close)
