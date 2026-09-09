@@ -30,3 +30,4 @@ desktop.ini
 build/
 dist/
 *.spec
+!build_exe.spec
