@@ -1,0 +1,1158 @@
+DESKTOP VISTA — POST-v1.7 SYSTEMS ARCHITECTURE & LEFTOVER CLOSURE PACK
+All my drives. One perfect view.
+9 September 2026 | Baseline: v1.7 (APP_VERSION = "1.7", desktop_vista.py ~3847 lines)
+Deliverable: notes/notes_007.txt | Successor to notes_005 (functional architecture vs v1.5.1)
+             and notes_006 (UI audit vs v1.6 / ce8b849). Does not replace either.
+
+Author role: Principal Systems Architect, Automation Engineer & Feature Strategist
+Status: Design and architecture deliverable. No application code, config, assets
+        or ROADMAP.md were edited by this pack. Code fragments below are proposed
+        integration patterns, not a shipped upgrade.
+
+-------------------------------------------------------------------------------
+DOCUMENT PURPOSE
+-------------------------------------------------------------------------------
+
+v1.7 is operational. The four-page shell, HUD, tag drawer, toasts, appearance
+switch, inspection mode, 1 Hz scheduler, solar tick, history/undo, mutex, named
+pipe IPC and dedicated-thread RegisterHotKey listener are in the tree. What is
+not done is a short, honest list — and the v2.0 display rewrite those leftovers
+collide with.
+
+Mark's 2026-09-09 brief named five items that still require attention, plus the
+six original investigation tracks. This pack does both:
+
+  A. Close-out architecture for the five v1.7 leftovers (editors, Hidden Items,
+     per-display map, Narrator verification, About/copyright).
+  B. An updated viability matrix and refreshed blueprints for the six tracks,
+     written against the *as-built* v1.7 process model rather than the v1.5.1
+     snapshot notes_005 described.
+
+Non-goals: implementing the features; silently resurrecting Mica/Acrylic or a
+committed desktop crossfade; claiming COM per-monitor independence (still
+unverified — this development machine has one display); faking Narrator output.
+
+House rules that still bind (carried from notes_003–006, now also encoded in
+module docstrings of hotkeys.py / ipc.py / windows_wallpaper_com.py):
+
+  * Tk owns the main thread. Workers publish data; self.after is the only
+    legal UI marshal. app.update() loops are not a substitute for mainloop()
+    when testing background after(0, ...) callbacks (MEMORY.md, v1.7 session).
+  * One wallpaper authority. Never declare IDesktopWallpaper slideshow APIs.
+  * SetPosition is global. Per-monitor crop must be pre-rendered.
+  * COM device paths are session-ephemeral. Do not persist them as PKs.
+  * SPI remains the default until COM independence is verified on real
+    multi-display hardware.
+  * On COM failure, never silently fall back to SPI (would stamp every screen).
+  * No NumPy, no pywin32. Frozen exe size contract (~19.5 MB) still holds.
+  * Never silently geolocate. Never store network passwords.
+  * Do not whole-screen-capture this machine for "visual verification"
+    (MEMORY.md safety incident, v1.7 session).
+
+-------------------------------------------------------------------------------
+0. AS-BUILT BASELINE (v1.7) — WHAT THE NEXT CHANGE MUST ACTUALLY TOUCH
+-------------------------------------------------------------------------------
+
+Process model now, not the v1.5.1 sketch:
+
+    CustomTkinter main thread (DesktopVista)
+      ├── Four pages built once: library / playback / displays / settings
+      │     shown via grid() / grid_remove()  (state survives a switch)
+      ├── Stage: context header / preview / HoverHUD / ToastManager / tag drawer
+      ├── self.images / self.index / self._shuffle_order / self._shuffle_cursor
+      │     ← STILL ONE shared deck. COM target only aims the apply.
+      ├── 1 Hz heartbeat (_compute_next_due): interval | daily | solar
+      ├── playback_state.json history ring (100 applied) + Undo
+      ├── cfg JSON: folders, playlists, collections, tags, favourites, hidden,
+      │             playback_source (folder|playlist|collection), solar, hotkeys,
+      │             wallpaper_target, ui.*  — still no schema_version
+      ├── ThreadPoolExecutor: preview decode (cancellable via _load_token)
+      │                     + 15 s reconnect probe (off Tk thread since v1.6)
+      ├── pystray daemon thread          → after(0, …)
+      ├── ipc.IpcServer  (named pipe, owner-only SDDL) → after(0, …)
+      ├── hotkeys.HotkeyListener (own GetMessage thread, NOT a Tk WndProc subclass)
+      ├── SPI path: set_windows_wallpaper()
+      └── COM path (opt-in): one STA thread, CreateObject per call, 5 s timeout
+            _apply_path still WAITS on that call on the Tk thread
+
+Facts that notes_005 listed as defects and that v1.6 actually fixed:
+
+  * collection playback_source now survives restart.
+  * solar is live, not dead config (schedule.py, NOAA-style, unit-tested
+    London + Svalbard fixtures).
+  * mutex + pipe + hotkeys exist and were live-verified on this machine.
+  * preview decode cancels on rapid navigation; reconnect probe is off-thread.
+
+Facts that are still true and still design inputs:
+
+  1. Single playback pipeline. Enabling COM and picking "Display 2" plays the
+     same deck; it only aims SetWallpaper at one device path.
+  2. Two identity spaces. enumerate_monitors() yields GDI names (\\.\DISPLAY1)
+     + RECTs. ComWallpaperBackend.enumerate_monitors() yields
+     GetMonitorDevicePathAt strings (\\?\DISPLAY#…) + RECTs. The topology
+     canvas and the COM picker do not share a join key. Labels are ordinal
+     ("Display 1") — the identity notes_004 forbade persisting.
+  3. Pause policy is session-wide, and that is correct for the APIs in use
+     (GetSystemPowerStatus, SHQueryUserNotificationState). Independent
+     per-monitor pause cannot be built on those two calls alone.
+  4. Apply is not transactional. Span slicing will issue N SetWallpaper calls;
+     a mid-loop failure cannot roll back displays that already changed.
+  5. JSON catalogue will not scale to tens of thousands of images.
+  6. _apply_path can block the Tk thread for up to 5 s. That is the v2.0
+     ApplyQueue, not a v1.7.1-sized fix.
+  7. Hidden Items was given parent-folder + offline badge + search in v1.7.
+     That closed the *label* gap. It did not close the *playback-state* gap
+     documented in §1.2 below. That is the significant functional gap Mark
+     is right to keep on the table.
+
+Settings page already has an "ABOUT" section. It currently renders only:
+
+    f"{APP_NAME} {APP_VERSION}" + optional " (frozen)"
+
+No copyright line, no rights-reserved notice, no owner, no licence pointer.
+That is the About gap — a missing disclosure, not a missing page.
+
+-------------------------------------------------------------------------------
+1. V1.7 LEFTOVERS — ANALYSIS, STRATEGY, LIMITATIONS
+-------------------------------------------------------------------------------
+
+1.1 Playlist and collection editor dialogues
+--------------------------------------------
+
+Current state (desktop_vista.py)
+
+  _open_playlist_editor   geometry 420x480, grab_set modal
+    name entry + checkbox list of cfg["folders"] only
+    Save writes through to the live playlist dict (or appends a new one)
+    then optionally _load_source if that playlist is active
+    validation = messagebox.showerror for empty name / no folders
+
+  _open_collection_editor geometry 360x240, grab_set modal
+    name entry + comma-separated tags_any string
+    hint: "Tag images from the main window's Tags field first."
+    does not reuse ui_components.TagSelector
+    no live match-count preview
+
+What notes_006 §2.5 asked for and v1.7 deferred: draft-copy-on-open, inline
+field errors, two-line friendly/path display. That work is still the right
+shape. It is polish-plus-correctness, not a v2.0 blocker.
+
+The data-safety part of "draft copy" is weaker than notes_006 implied. Both
+editors already mutate only inside do_save(); Cancel just destroys the
+Toplevel. There is no live-binding of checkboxes back into cfg. The real
+defects are interaction and completeness:
+
+  P1  Collection editor is a raw comma string. The main window now has a
+      TagSelector that preserves canonical exact-string tag semantics. Two
+      editors for the same vocabulary will drift (whitespace, case, empty
+      tokens) the first time someone types "Nature," in one and clicks the
+      "nature" chip in the other. Reuse TagSelector. Do not invent ALL/NOT
+      filters in the same change — that is a collection *semantics* change
+      and belongs with the v2.1 boolean catalogue, not this dialog pass.
+
+  P1  Playlist editor can only include folders already in cfg["folders"].
+      A user whose wallpaper lives on F:\ only inside a playlist they built
+      last month, then removed the folder from the library list, cannot
+      re-add it from this dialog. Offer "Browse…" that calls the existing
+      add-folder picker and appends to both the draft and cfg["folders"].
+
+  P2  Fixed geometry + raw paths. folder_display_label() already exists and
+      is what the checkbox text uses; the gap is the lack of a second line
+      (full path + offline badge), identical to the Hidden Items row v1.7
+      already ships. minsize + resizable is enough; do not build a custom
+      layout engine.
+
+  P2  messagebox validation steals focus and covers the field being
+      corrected. Replace with a persistent error label under the offending
+      widget. Disable Save while invalid. That is the "inline validation"
+      notes_006 wanted.
+
+  P2  No match-count on the collection editor. resolve_collection_candidate_images
+      already exists. Run it against the draft tags (debounced, off-thread
+      if the library is large) and show "N images match". Empty match is a
+      warning, not a hard error — a user may be building the collection
+      before tagging.
+
+  P3  grab_set blocks the rest of the UI, including tray-driven navigation
+      that still marshals onto Tk. Keep modal for v1.8 — a sheet/drawer is
+      a larger IA change and fights the four-page model. Just make sure
+      Cancel / Esc / WM_DELETE_WINDOW all take the same path (destroy,
+      no write). Wire the existing Esc-closes-panel chain so a modal
+      editor is treated as an "active panel".
+
+Recommended implementation (v1.8, one sitting, no schema change)
+
+  * Extract EditorSheet helper in ui_components.py: title, body, footer
+    Save/Cancel, error_label, draft dict, on_save(draft) -> None | str error.
+  * Playlist draft = {"name", "folders": list[str]}. Collection draft =
+    {"name", "tags_any": list[str]} fed through TagSelector.
+  * On open: copy.deepcopy the record (or empty draft). On Save: validate,
+    write back, _flush_save, reload source if active. On Cancel: drop draft.
+  * Tests: empty name rejected and dialog stays open; Cancel leaves cfg
+    identical; collection tags round-trip as exact strings; playlist
+    Browse adds a new folder to cfg["folders"]; active-playlist save
+    rebuilds self.images and resets the shuffle deck (see §1.2 — the same
+    reset helper).
+
+Limitation: do not try to make the editor a live preview of the slideshow.
+Reloading the source on Save is enough. A live preview would couple a
+modal's draft to the single shared pipeline and surprise the user if they
+Cancel after the deck already changed.
+
+1.2 Hidden Items — the remaining functional gap
+-----------------------------------------------
+
+v1.7 closed the *disambiguation* gap (basename-only rows). The manager now
+shows Path.name + parent folder + offline badge + substring search + Unhide.
+That is necessary and not sufficient.
+
+The significant functional gap is that Hide/Unhide do not maintain playback
+invariants. The manager is a list editor sitting beside an engine that
+still thinks in positional indices.
+
+Evidence, _hide_current (desktop_vista.py ~2749):
+
+  * set_membership(..., "hidden", path, True)
+  * self.images = resolve_source_images(...)          # list shortens
+  * self.index = min(self.index, len(self.images)-1)  # positional, not identity
+  * does NOT clear self._shuffle_order / _shuffle_cursor
+  * does NOT apply a replacement wallpaper if the hidden file is what is
+    currently on the desktop
+  * does NOT rebuild the shuffle deck
+
+Evidence, Unhide inside _open_hidden_manager:
+
+  * set_membership(..., False)
+  * rebuilds self.images if an active source exists
+  * does NOT _show_current()
+  * does NOT clamp / re-find self.index by path
+  * does NOT reset the shuffle deck
+  * does NOT restore a source that had been emptied by hiding the last image
+    back into a visible preview (the "No images left" label can remain
+    stale until the next navigation)
+
+Consequence when shuffle is on and the slideshow is running: _advance_shuffle
+indexes into a deck built against the *previous* length. After one hide, a
+stored index can be >= len(self.images) (IndexError) or silently land on a
+different file than the deck intended. That is a correctness bug, not polish.
+It is reachable from the HUD Hide button, the H shortcut, the tray equivalent
+if wired, and Win+Alt+H.
+
+Secondary gaps, in priority order:
+
+  P1  Shuffle / index invalidation on hide and unhide. One helper,
+      _rebuild_playback_after_filter_change(preferred_path=None), must:
+        - resolve_source_images for the active source
+        - if preferred_path is still in the list, index = that position
+        - else index = min(old_index, len-1) or -1 if empty
+        - always self._shuffle_order, self._shuffle_cursor = [], 0
+        - _load_token += 1; _show_current() or the empty-state paint
+        - _update_header_context / hidden count / favourite / tags
+      Call it from _hide_current, from every Unhide, and from playlist /
+      collection Save when the active source is the one just edited.
+
+  P1  Hiding the image that is currently applied must advance the desktop,
+      not only the preview. If slideshow is running OR the hidden path
+      equals cfg["current_image"] (or the last history entry), call the
+      existing silent apply path on the new current index. If the source
+      is now empty, do not invent a wallpaper; leave the last applied
+      image on the desktop and say so in the status line. Never SPI-stamp
+      all monitors to "clear" a hidden image.
+
+  P2  Orphan hidden paths. Hidden is a list of absolute paths. Rename,
+      move, or delete the file and the row becomes a ghost; the new path
+      is treated as a different image and will play. v1.8: "Remove missing"
+      action in the manager, using Path.exists() off the Tk thread, with
+      an explicit count ("Remove 4 items whose files are gone"). Do not
+      auto-purge on startup — a temporarily offline NAS would wipe the
+      user's curation. Same rule as the reconnect watcher.
+
+  P2  Unhide does not offer Reveal in Explorer or a preview thumbnail.
+      Thumbnails are the notes_006 drawer design; they need the same
+      cancellable decode path as the stage, paged, or they will hitch a
+      400-item hidden list. Ship Reveal + "Show in library" (sets index
+      to that path after unhide) in v1.8; thumbnails in v1.8.1 or with
+      the catalogue, not in the same change as the shuffle fix.
+
+  P2  is_folder_online(parent) runs on the Tk thread once per visible row
+      during rebuild(). For a hidden list of NAS paths that is the same
+      class of freeze v1.6 moved the reconnect probe off-thread to avoid.
+      Cache against self._folder_online_cache; never probe inside rebuild.
+
+  P3  No bulk unhide / no "unhide everything in this folder". Useful,
+      cheap once the rebuild helper exists. Not the reason this item is
+      still open.
+
+  P3  Hidden paths are not stable IDs. Content-hash identity is a v2.1
+      catalogue concern (notes_005: path + mtime_ns + size is identity;
+      hashes are lazy). Do not add dhash to the hide path in v1.8.
+
+Limitation: Hidden is a global filter across every source kind. That is
+intentional (a hidden file stays hidden in Folders, Playlists and
+Collections). Do not introduce per-source hide lists in this pass — it
+would fork the config key and break resolve_source_images. If a user wants
+"hidden from this playlist only", that is a playlist-exclusion list, a
+new field, and a different conversation.
+
+Tests that must go in test_desktop_vista.py with this fix:
+
+  * hide current image shrinks images, clamps index, shuffle deck is empty
+  * hide then _advance_shuffle does not IndexError and does not select
+    the hidden path
+  * unhide of the only image in a source restores preview (index == 0)
+  * unhide does not change cfg["favourites"]
+  * hide of applied image records a new history entry only if a
+    replacement was actually applied
+
+1.3 Interactive per-display map — correctly blocked
+---------------------------------------------------
+
+Do not build a clickable topology in v1.8. The canvas today is a correct
+read-only picture of EnumDisplayMonitors RECTs. The COM picker is a
+correct read-only list of GetMonitorDevicePathAt identities. Joining them
+by ordinal ("the second rectangle is Display 2") is the bug notes_004,
+notes_005 §2.1.4 and notes_006 P1 all forbade.
+
+What "blocked on display identity" actually means, operationally:
+
+  Session join (cheap, required before any click does anything)
+    Intersect each GDI MONITORINFOEX.rcMonitor with each COM monitor RECT
+    in physical pixels. A unique maximum-area intersection is a join.
+    Ambiguous joins (cloned displays sharing a RECT, or a zero-area
+    overlap after a driver glitch) must be reported as unresolved, never
+    guessed. The map may highlight an unresolved display; it may not
+    assign a wallpaper to it.
+
+  Persistent identity (required before any assignment is saved)
+    Do not store GetMonitorDevicePathAt. Store a fingerprint:
+
+        fingerprint = {
+          "edid_hash": ...,          # SetupAPI / WMI if available, else null
+          "adapter":   ...,          # GDI device name prefix, informational
+          "width": int, "height": int,
+          "origin_x": int, "origin_y": int,
+          "is_primary": bool,
+          "orientation": "landscape"|"portrait",
+        }
+
+    Reconciliation on WM_DISPLAYCHANGE / session resume / dock:
+      1. exact edid_hash match
+      2. else same size + is_primary + orientation, origin within a
+         tolerance (users rearrange)
+      3. else same size + orientation (the remaining unique display)
+      4. else unresolved — keep the last successful wallpaper on that
+         output if COM still accepts the ephemeral path this session,
+         otherwise leave Windows alone and surface "Display changed —
+         reassign" on the Displays page
+
+  Until step 1 is implemented and verified on a dockable multi-monitor
+  machine, a clickable map would write the wrong target with high
+  confidence. That is worse than a read-only strip.
+
+v1.8 may still improve the *read-only* strip without claiming interactivity:
+label each rectangle with the joined name when the session join succeeds,
+mark unresolved displays, and stop numbering COM targets as "Display N"
+when the GDI name is available. That is Displays-page copy, not phase E.
+
+Phase E (interactive map, per-display applied thumbnails, span crop
+assistant, drag-to-assign) stays a v2.0 item on the fingerprinting scheme.
+See §2.1.
+
+Limitation: this development machine has one display. Session-join code
+can be unit-tested with synthetic RECT fixtures (two-monitor, negative
+origin, clone). Persistent reconciliation cannot be declared done without
+a real dock/undock session. Same honesty gate as v1.5.1's COM backend.
+
+1.4 Accessibility / Narrator — do not simulate
+----------------------------------------------
+
+v1.7 explicitly skipped Narrator, high-contrast and multi-DPI verification.
+That was the right call. CustomTkinter is a drawing toolkit on top of Tk.
+It does not automatically expose a complete UIA tree. A "Narrator mode"
+that announces via toasts, or a mocked IAccessible, would certify a fiction.
+
+What we can do in v1.8 without claiming AT support
+  * Every icon-only control already has a text-equivalent route (Library
+    Hidden Items button, Playback Start/Stop, footer Apply, ? overlay).
+    Audit that list; add accessible names via tk widget configure(text=)
+    or a tooltip that is also the name, not a hover-only string.
+  * Tab order: nav rail → active sidebar page → stage header → HUD
+    (focus pins it) → footer Apply → status. Hidden widgets
+    (grid_remove'd pages, unmapped tag drawer, unmapped help overlay)
+    must not be focus stops. This is testable without Narrator.
+  * High-contrast: honour System appearance, and when
+    SystemParametersInfo SPI_GETHIGHCONTRAST is on, force the "system"
+    tokens plus a 3:1 minimum for text-on-fill. Do not invent a fourth
+    appearance mode.
+  * Multi-DPI: log tk scaling, Windows scaling per monitor, and the
+    preview box at startup into --selftest. Do not "fix" mixed-DPI
+    preview until we have measured it on real hardware.
+
+What only real AT can verify (v1.8.1 gate, Mark or a designated tester)
+  * Narrator scan mode can reach Apply, Start/Stop, source menu, Hide,
+    Favourite, Tags, Hidden Items Unhide, editor Save/Cancel.
+  * Name/role/value for CTkOptionMenu, CTkSwitch, CTkSlider-equivalents
+    and the raw Tk Canvas topology are sensible, or we accept they are
+    not and keep a text fallback (the Displays page already has a
+    monitor list next to the canvas — that list is the AT surface).
+  * Contrast in Light and Dark against Win11 default themes.
+  * 125% / 150% / 200% scaling at 980×560 minimum: nothing clipped that
+    is required for the exit criteria of the release under test.
+
+Limitation: we will not reach "Narrator certified" on CustomTkinter this
+year. The honest product stance is: keyboard-complete, contrast-aware,
+screen-reader-best-effort, with a written test script Mark runs once on
+his hardware. Publish the script in VERIFICATION.md; do not add a fake
+pass to ROADMAP.md.
+
+1.5 About / copyright disclosure
+--------------------------------
+
+Mark asked for a button or description that presents an About section
+showing copyright information only. The Settings page already has an
+ABOUT heading and a version label. Extend that heading; do not add a
+second About window unless Settings is an unacceptable home.
+
+Required content (and only this — Settings is not a EULA surface):
+
+    Desktop Vista  <APP_VERSION>           [frozen]
+    Copyright (c) 2026–present Mark Hawksworth
+    All rights reserved.
+    https://github.com/hawkers63/
+
+Optional, behind an "Licence notice" text button that opens a small
+read-only Toplevel wrapping LICENSE's first paragraph + the
+"PERMISSION IS NOT GRANTED…" sentence. Do not paste the full LICENSE
+into the Settings sidebar (wraplength 260 px will mangle it). Do not
+add credits for CustomTkinter/Pillow/pystray beyond a one-line
+"Third-party notices" pointer — that is a different document.
+
+Tray menu: add "About Desktop Vista…" that switches to the Settings page
+and sees the same block. One source of copy, two entry points.
+
+Implementation: a module-level ABOUT_LINES tuple next to APP_VERSION so
+--selftest and the window share the same strings. Tests: the Settings
+page contains "All rights reserved" and "Mark Hawksworth"; the string
+does not include source-file paths or the user's wallpaper folders.
+
+Limitation: this is disclosure, not a licence-change. LICENSE stays
+proprietary / all-rights-reserved. About must not imply an open-source
+grant.
+
+-------------------------------------------------------------------------------
+2. EXECUTIVE FUNCTIONAL MATRIX & VIABILITY ASSESSMENT
+-------------------------------------------------------------------------------
+
+Impact / complexity are qualitative against this codebase. "Technical risk"
+is the chance of a wrong Windows behaviour that unit tests cannot catch.
+Items already shipped in v1.6 / v1.6.1 / v1.7 are listed once, as Done,
+so this matrix is a forward plan rather than a restatement of notes_005.
+
+Feature                                      Subsystem     Impact   Risk/Complexity   Target
+-------------------------------------------  ------------  ------   ----------------  ----------
+Hidden Items playback-invariant rebuild      Curation      High     Low               v1.8
+Hidden: apply-replacement when current       Curation      High     Low               v1.8
+Hidden: orphan "remove missing" (manual)     Curation      Med      Low               v1.8
+Playlist/collection EditorSheet + TagSelector Library     Med      Low               v1.8
+Collection editor live match-count           Library       Med      Low               v1.8
+About / copyright block on Settings + tray   UX            Low      Low               v1.8
+Esc closes editor modals consistently        UX            Low      Low               v1.8
+Read-only topology: joined labels, no click  Displays      Med      Med               v1.8
+Keyboard tab-order + high-contrast honour    A11y          Med      Med               v1.8
+Narrator pass on real AT                     A11y          Med      High (toolkit)    v1.8.1 gate
+ApplyQueue (COM off the Tk thread)           Displays      High     Med               v2.0
+Independent per-monitor PlaybackController   Displays      High     High              v2.0
+Per-monitor source / interval / shuffle      Displays      High     High              v2.0
+Display fingerprint + dock reconciliation    Displays      High     High              v2.0
+WM_DISPLAYCHANGE / resume topology refresh   Displays      High     Med               v2.0
+Interactive per-display map + thumbnails     UX            High     High (blocked)    v2.0
+Ultrawide / span slicer + bezel compensation Displays     Med-High High              v2.0
+COM default once independence verified       Displays      High     High (hw gate)    v2.0
+Per-monitor crop preview (actual ratio)      UX            High     Med               v2.0
+Weather-reactive bias (Open-Meteo, no key)   Schedule      Med      Med               v2.1
+Windows accent-colour sync (opt-in)          Integration   Med      High              v2.1
+Lock-screen setter (WinRT)                   Integration   Med      High (research)   v2.1
+SQLite catalogue desktop_vista.db            Library       High     High              v2.1
+Boolean tag expressions                      Library       Med      Med               v2.1
+Play-count / last-played                     Library       Med      Low (needs db)    v2.1
+Perceptual duplicate dhash/phash             Curation      Med      Med               v2.1
+Resolution down-rank vs native display       Curation      Med      Low               v2.1
+EXIF inspector + Show on Map                 Curation      Med      Low (GPS privacy) v2.1
+Entropy / contrast focal-point crop          Curation      High     Med               v2.1
+Lightweight ONNX saliency                    Curation      Med      High (exe size)   Future
+Bing Daily + NASA APOD feeds                 Feeds         Med      Low               v2.1 opt-in
+Unsplash / Wallhaven (user API key)          Feeds         Low-Med  Med (ToS, keys)   Future
+Download sandbox + quota / purge             Feeds         Med      Med               v2.1 w/ feed
+Per-monitor fullscreen (HWND ∩ RECT)         Power         Med      High              Future
+Battery throttle (slower, not only pause)    Power         Low      Low               v2.1
+Desktop crossfade                            Displays      Low      High              Research gate
+Mica / Acrylic on Tk                         UX            Low      High              Dropped
+Ambient glow / drag-to-assign polish         UX            Low-Med  Med               v2.1 (phase F)
+
+Why these version numbers now (updated from notes_005)
+
+  v1.8    Last single-pipeline *UI/correctness* release. Closes the five
+          leftovers that do not need a second physical display to be
+          right: Hidden playback invariants, editor drafts, About,
+          read-only joined labels, keyboard/contrast prep.
+  v1.8.1  Accessibility verification gate. No feature work required if
+          v1.8's tab-order/contrast work lands. Needs Mark + Narrator.
+  v2.0    Display rewrite. Exit criteria are visual and hardware-bound.
+          Shipping it without a two-or-more-monitor *and* a dock/undock
+          session would repeat the v1.5.1 honesty problem as a lie.
+  v2.1    Intelligence and scale. Catalogue display_assignments would
+          encode a fiction before v2.0's assignment model exists.
+  Future / Dropped / Research — unchanged from notes_005.
+
+Deliberate non-features (still)
+
+  Native Windows slideshow COM methods         two schedulers will fight
+  Silent SPI fallback on COM error             would stamp every monitor
+  k-means via NumPy for accent colour          exe-size contract
+  pywin32                                      ctypes only
+  Auto-enable solar from timezone alone        wrong at TZ edges
+  Hash every file at scan time                 path+mtime_ns+size is identity
+  Cloud feeds on by default                    offline-first
+  Simulated Narrator / fake UIA provider       would certify a fiction
+  Clickable display map before fingerprinting  would assign the wrong output
+
+-------------------------------------------------------------------------------
+3. DEEP-DIVE ARCHITECTURAL BLUEPRINTS
+-------------------------------------------------------------------------------
+
+3.0 Target module map (updated for code that already exists)
+
+    desktop_vista.py          UI shell, config I/O, tray, Tk lifecycle
+    ui_components.py          ActionButton, HoverHUD, ToastManager, TagSelector
+                              + (v1.8) EditorSheet
+    windows_wallpaper_com.py  STA COM backend (already extracted)
+    schedule.py               interval / daily / solar due-time (exists)
+    ipc.py                    mutex, named pipe, CLI (exists)
+    hotkeys.py                RegisterHotKey + dedicated GetMessage thread
+                              (exists; do NOT replace with a Tk WndProc subclass —
+                               that was notes_005's sketch and v1.6 correctly
+                               rejected it)
+    playback.py               v2.0 extract: PlaybackController, ShuffleDeck,
+                              HistoryStack, ApplyRequest
+    displays.py               v2.0 extract: topology join, fingerprint,
+                              span slicer, assignment store
+    catalogue.py              v2.1 SQLite
+    curation.py               v2.1 dhash/phash, entropy crop, EXIF
+    feeds.py                  v2.1 opt-in fetchers + quota
+
+Do not split desktop_vista.py on the v1.8 pass. Hidden rebuild + EditorSheet
+are small enough to live where the call sites are. Extract playback.py the
+moment a second controller instance exists — that is v2.0 day one.
+
+3.1 Multi-monitor independent playback (v2.0 core)
+--------------------------------------------------
+
+Invariant to preserve until COM independence is visually confirmed on two
+physical displays: wallpaper_target default remains "spi". A second
+PlaybackController must be instantiable in tests without applying anything.
+
+State per assignment (not per GDI name, not per COM path):
+
+    Assignment
+      id: str                         # stable, we mint it
+      fingerprint: DisplayFingerprint # §1.3
+      role: "single" | "span-member" | "span-group"
+      source: {kind, id}              # folder | playlist | collection
+      interval_s / schedule mode      # may share the app default
+      shuffle: bool
+      images: list[str]               # resolved, hidden-filtered
+      index: int
+      shuffle_order / shuffle_cursor
+      history: HistoryStack           # last 100 applied *to this assignment*
+      pause_reasons: set[str]         # union with session-wide power/fs
+      last_applied_path: str | None
+      last_ephemeral_monitor_id       # COM path, session only
+
+One shared session-wide layer remains correct:
+
+    power (Battery Saver) and fullscreen (SHQueryUserNotificationState)
+    pause every controller. Per-monitor fullscreen is Future work
+    (foreground HWND ∩ monitor RECT) and is not required to ship v2.0.
+
+Controller loop (one heartbeat, N controllers — do not start N timers):
+
+    every 1 s, already true of v1.6:
+      refresh session pause reasons
+      for each controller:
+        if session paused or controller user-paused: skip
+        if due(controller): controller.advance() -> ApplyRequest
+
+ApplyQueue (replaces the blocking _apply_path wait):
+
+    Tk thread                          Apply worker (existing COM STA)
+      enqueue(ApplyRequest)
+      paint "Applying…" on that
+        assignment's card
+      never wait                       SetPosition once if style changed
+                                       SetWallpaper per target
+                                       result = ok | partial | fail
+      after(0, on_apply_done)  <------ report partial success honestly
+
+Partial success: record which fingerprints changed, keep last-good path
+on the ones that failed, toast the failure, do not roll back the ones
+that succeeded (Windows will not do it for us; a rollback is just another
+SetWallpaper that can also fail).
+
+Span slicer (same release, behind the assignment role):
+
+    Input: one source image, a span-group of assignments with origins in
+    a shared virtual desktop coordinate space, optional bezel_px per gap.
+    Output: N pre-rendered crops on disk under %LOCALAPPDATA%\DesktopVista\span\
+    named by (source_hash, fingerprint_id, bezel, style). SetWallpaper each
+    member with its crop. Fit style for a span-group is forced to Fill on
+    the crop; SetPosition(Span) is only legal on the all-displays target
+    and is rejected for a specific monitor today — keep that rejection.
+
+    Mixed-DPI: crop in physical pixels (RECT from the topology join), not
+    logical Tk units. A 200% laptop + 100% external is the test fixture
+    that has to pass before we call span done.
+
+    Portrait member of a landscape span: allowed, but the crop will look
+    wrong; surface a warning on that assignment card rather than rotating
+    the source (rotation is a different feature).
+
+Hot-plug:
+
+    Listen WM_DISPLAYCHANGE and power-resume. Re-enumerate both identity
+    spaces, re-run session join, re-run fingerprint reconciliation, then
+    either re-bind last_ephemeral_monitor_id and re-apply last_applied_path
+    or mark the assignment unresolved. Do not reshuffle. Do not advance.
+
+Pattern (illustrative):
+
+    class PlaybackController:
+        def __init__(self, assignment: Assignment, resolve, apply_queue): ...
+        def set_source(self, kind: str, source_id: str) -> None: ...
+        def hide_current(self) -> None:
+            # MUST call the same rebuild helper as v1.8's single-pipeline
+            # hide path, scoped to this controller's images/index/deck.
+            ...
+        def advance(self) -> ApplyRequest: ...
+        def undo(self) -> ApplyRequest | None: ...
+
+    class ApplyQueue:
+        def submit(self, req: ApplyRequest) -> None: ...
+        # results marshalled to Tk via after(0, ...)
+
+3.2 Global hotkeys — as built, not as originally sketched
+---------------------------------------------------------
+
+hotkeys.py already runs a dedicated thread that registers bindings and
+pumps GetMessage. Firing never touches Tk; desktop_vista.py wraps the
+callback in after(0, ...). That is the correct pattern. notes_005's
+WndProc-subclass-of-Tk sketch is obsolete and must not be reintroduced.
+
+v1.8 / v2.0 work on this surface is small:
+
+  * Keep conflict detection as "log + status, never steal". The Win+Alt+F
+    collision on this machine is why the shipped favourite default is
+    Win+Alt+L. Do not silently fall back to another chord.
+  * Per-controller targeting in v2.0: a hotkey acts on the *focused
+    assignment* (last clicked card on the Displays page, falling back to
+    the primary display). Do not apply Next to every controller at once.
+  * UIPI: an elevated window will swallow our hotkeys. Disclose that in
+    the Settings hotkey status line when we can detect it; do not try to
+    register from an elevated helper just to beat UIPI.
+  * Configurability already exists (cfg["hotkeys"]). A recorder UI is
+    polish; a text field that parses the existing "Win+Alt+N" grammar is
+    enough.
+
+3.3 Solar calculation and time-of-day scheduler — as built
+----------------------------------------------------------
+
+schedule.py is pure, stdlib, unit-tested. The 1 Hz heartbeat already
+polls a wall-clock due-time for solar/daily and a monotonic due-time for
+interval, which is why sleep/hibernate does not burst. Do not replace
+this.
+
+v2.0 change: each PlaybackController gets its own next-due, but they all
+ask the same schedule.py functions. Solar coordinates stay app-global
+(one user, one location). Phase-tag bias stays "if the controller's
+resolved list has any phase tag, prefer those; else play unfiltered and
+say so in status" — already the v1.6 policy.
+
+v2.1 weather bias is an extra predicate on the same pick function, not a
+fourth schedule.mode. Empty-filter trap: if weather tags match nothing,
+fall back to the solar-biased list, then to unfiltered, and disclose.
+Open-Meteo, no API key, cache 15 minutes, offline = last cache then
+local-only. Never block the heartbeat on the network; a worker writes
+the current condition into a slot the pick function reads.
+
+3.4 Single-instance Named Pipe IPC — as built
+---------------------------------------------
+
+ipc.py already provides CreateMutexW + owner-only named pipe + JSON
+request/reply. Second launch forwards to the running instance. Shutdown
+ordering that MEMORY.md recorded must be preserved:
+
+    _stop_event.set()  BEFORE  the wake-up send_command
+    so the server thread skips dispatch instead of marshalling onto a
+    Tk thread that is mid-shutdown.
+
+v2.0 additions to the command set, not a rewrite:
+
+    --status                 include per-assignment summaries
+    --next [--display ID]    default = focused / primary
+    --set PATH [--display ID]
+    --pause / --resume
+    --undo [--display ID]
+
+ACL stays owner-only. Do not widen to Everyone because a Stream Deck
+plugin "needs it" — the plugin runs as the same user.
+
+3.5 v1.8 code patterns (the leftovers, concretely)
+--------------------------------------------------
+
+Hidden rebuild helper (single pipeline, lives in DesktopVista until
+playback.py exists):
+
+    def _rebuild_playback_after_filter_change(self, preferred_path=None):
+        kind, sid = self._active_kind, self._active_id
+        self._load_token += 1
+        self.images = (
+            resolve_source_images(self.cfg, kind, sid) if sid else []
+        )
+        self._shuffle_order = []
+        self._shuffle_cursor = 0
+        if preferred_path in self.images:
+            self.index = self.images.index(preferred_path)
+        elif self.images:
+            self.index = min(max(self.index, 0), len(self.images) - 1)
+        else:
+            self.index = -1
+        self._update_hidden_count_label()
+        self._update_header_context()
+        if self.index >= 0:
+            self._show_current()
+        else:
+            self.preview.configure(image=None, text="No images left in this source")
+            self.meta.configure(text="")
+            self._update_favourite_button()
+            self._update_tags_field()
+
+About block (Settings page, replace the version-only label):
+
+    ABOUT_COPY = (
+        f"{APP_NAME} {APP_VERSION}" + ("  (frozen)" if FROZEN else ""),
+        "Copyright (c) 2026–present Mark Hawksworth",
+        "All rights reserved.",
+        "https://github.com/hawkers63/",
+    )
+
+Do not load LICENSE from disk at paint time if the frozen build's
+resource path is what you would be testing — bake the four lines next
+to APP_VERSION. A "Licence notice" button may read LICENSE from
+RESOURCE_DIR when present and fall back to the baked short notice.
+
+EditorSheet sketch:
+
+    class EditorSheet(ctk.CTkToplevel):
+        def __init__(self, master, title, on_save, on_cancel=None):
+            ...
+            self.draft = {}
+            self.error = ctk.CTkLabel(...)
+        def set_error(self, text: str) -> None: ...
+        def set_valid(self, ok: bool) -> None:  # enables/disables Save
+
+Collection body uses TagSelector(on_change=lambda tags: draft.__setitem__
+("tags_any", list(tags))). Match-count label refreshed from a debounced
+after() that calls resolve_collection_candidate_images on a snapshot.
+
+-------------------------------------------------------------------------------
+4. DATABASE SCHEMA & MIGRATION SPECIFICATION
+-------------------------------------------------------------------------------
+
+Still v2.1. Do not introduce desktop_vista.db in v1.8 — Hidden and editors
+are JSON-list problems. The schema below is unchanged in intent from
+notes_005, tightened against v1.7 keys that now exist (hotkeys, ui,
+playback_state.json).
+
+4.1 DDL
+
+    PRAGMA journal_mode = WAL;
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE meta (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    -- schema_version = 1
+    -- migrated_from  = config.json
+    -- migrated_at    = ISO-8601
+
+    CREATE TABLE sources (
+      id          TEXT PRIMARY KEY,          -- folder path or playlist/collection id
+      kind        TEXT NOT NULL CHECK (kind IN ('folder','playlist','collection','feed')),
+      name        TEXT NOT NULL,
+      root_path   TEXT,                      -- folder / feed cache root
+      offline     INTEGER NOT NULL DEFAULT 0,
+      created_at  INTEGER NOT NULL,
+      updated_at  INTEGER NOT NULL
+    );
+
+    CREATE TABLE source_folders (
+      source_id   TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+      folder      TEXT NOT NULL,
+      PRIMARY KEY (source_id, folder)
+    );
+
+    CREATE TABLE images (
+      path        TEXT PRIMARY KEY,
+      source_id   TEXT REFERENCES sources(id) ON DELETE SET NULL,
+      mtime_ns    INTEGER,
+      size_bytes  INTEGER,
+      width       INTEGER,
+      height      INTEGER,
+      dhash       TEXT,
+      favourite   INTEGER NOT NULL DEFAULT 0,
+      hidden      INTEGER NOT NULL DEFAULT 0,
+      play_count  INTEGER NOT NULL DEFAULT 0,
+      last_played INTEGER,
+      exif_json   TEXT,
+      updated_at  INTEGER NOT NULL
+    );
+    CREATE INDEX idx_images_hidden     ON images(hidden);
+    CREATE INDEX idx_images_favourite  ON images(favourite);
+    CREATE INDEX idx_images_dhash      ON images(dhash);
+
+    CREATE TABLE tags (
+      path     TEXT NOT NULL REFERENCES images(path) ON DELETE CASCADE,
+      tag      TEXT NOT NULL,
+      PRIMARY KEY (path, tag)
+    );
+    CREATE INDEX idx_tags_tag ON tags(tag);
+
+    CREATE TABLE playlists (
+      id    TEXT PRIMARY KEY,
+      name  TEXT NOT NULL
+    );
+
+    CREATE TABLE collections (
+      id        TEXT PRIMARY KEY,
+      name      TEXT NOT NULL,
+      tags_any  TEXT NOT NULL          -- JSON array, exact-string semantics
+    );
+
+    CREATE TABLE display_fingerprints (
+      id           TEXT PRIMARY KEY,   -- we mint
+      edid_hash    TEXT,
+      width        INTEGER NOT NULL,
+      height       INTEGER NOT NULL,
+      origin_x     INTEGER NOT NULL,
+      origin_y     INTEGER NOT NULL,
+      is_primary   INTEGER NOT NULL,
+      orientation  TEXT NOT NULL,
+      last_seen    INTEGER NOT NULL
+    );
+
+    CREATE TABLE display_assignments (
+      id               TEXT PRIMARY KEY,
+      fingerprint_id   TEXT NOT NULL REFERENCES display_fingerprints(id),
+      source_kind      TEXT NOT NULL,
+      source_id        TEXT NOT NULL,
+      role             TEXT NOT NULL DEFAULT 'single',
+      shuffle          INTEGER NOT NULL DEFAULT 0,
+      interval_s       INTEGER,
+      last_path        TEXT,
+      updated_at       INTEGER NOT NULL
+    );
+
+    CREATE TABLE history (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      applied_at  INTEGER NOT NULL,
+      path        TEXT NOT NULL,
+      assignment  TEXT,                 -- null = pre-v2.0 single pipeline
+      via         TEXT                  -- ui | slideshow | ipc | hotkey | undo
+    );
+    CREATE INDEX idx_history_applied ON history(applied_at DESC);
+
+    CREATE TABLE ui_prefs (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
+Preferences that stay in config.json even after the catalogue exists
+(small, edited by humans, not 50k-row data):
+
+    wallpaper_target, hotkeys, power, schedule, solar, tray, style,
+    interval, ui.appearance, ui.hud_always_visible, ui.reduced_motion
+
+playback_state.json is absorbed into history + display_assignments.last_path
+and then deleted, once the migration has verified row counts.
+
+4.2 Zero-data-loss migration from v1.7 config.json
+
+    1. Open config.json, validate with the existing _validate_config.
+    2. Write desktop_vista.db-tmp (same directory as config.json).
+    3. Insert sources from folders, playlists, collections.
+    4. For each known folder that is online, list_images and insert images
+       rows (path, mtime_ns, size_bytes). Offline folders: insert paths we
+       already know from tags/favourites/hidden/current_image, mark
+       source.offline = 1. Do not block startup on a NAS timeout — this
+       step is resumable.
+    5. Apply favourites, hidden, tags onto those rows. Paths that appear
+       only in hidden/favourites/tags and nowhere on disk stay as image
+       rows with hidden/favourite/tag set; they are the orphans §1.2
+       already has a manual purge for.
+    6. Copy playback_state.json's ring into history (via = 'migrated').
+    7. Write meta.schema_version = 1, meta.migrated_from checksum.
+    8. fsync, rename db-tmp -> desktop_vista.db (atomic on NTFS).
+    9. Leave config.json in place as the preference file. Do not delete
+       it. Do not rewrite it into a new schema in the same sitting.
+    10. On failure: delete db-tmp, keep running on JSON, surface a toast.
+        Never leave a half-written desktop_vista.db as the authority.
+
+Idempotency: if desktop_vista.db exists and meta.schema_version == 1,
+do not migrate again. A "Rebuild catalogue" Settings action is allowed
+and must be explicit.
+
+Rollback: keep JSON as source of truth for prefs; the catalogue is a
+derived index plus curator flags. A user who deletes the db loses play
+counts and dhashes, not folders or tags, provided we have not yet
+stopped writing tags/favourites/hidden back to config.json. Dual-write
+those three lists until a v2.2 "JSON curator keys retired" milestone.
+That dual-write is the actual zero-data-loss guarantee.
+
+-------------------------------------------------------------------------------
+5. HARDWARE & OPERATING SYSTEM EDGE-CASE ANALYSIS
+-------------------------------------------------------------------------------
+
+5.1 Multi-GPU
+
+  Two adapters (laptop Intel + discrete NVIDIA, or a dock GPU) produce
+  two sets of GDI device names and two sets of COM device paths. The
+  session join is RECT-based and survives that. EDID is attached to the
+  *monitor*, not the adapter, so a dock that routes the same panel
+  through a different GPU should still match on edid_hash. When EDID is
+  missing (some HDMI dongles), fall through to size+origin+primary and
+  expect an unresolved assignment more often. Never key on adapter name.
+
+5.2 Mixed-DPI scaling
+
+  Physical RECTs from GetMonitorInfoW / GetMonitorRECT are the only
+  coordinate space span cropping may use. Tk's scaling is per-process
+  and follows the *primary* display on older Windows; Win10/11
+  per-monitor-DPI-aware is a manifest flag the frozen exe must set
+  before we promise mixed-DPI preview. v1.8 --selftest should print
+  GetDpiForMonitor for every GDI monitor and tk's current scaling so
+  the v2.0 work starts from a measurement, not an assumption.
+
+  Preview box today is a logical 16:9 rectangle inside the stage. On a
+  200% display the same JPEG is decoded to fewer physical pixels than
+  the user thinks. That is acceptable for the stage; it is not
+  acceptable for a span crop written to disk.
+
+5.3 HDR
+
+  IDesktopWallpaper SetWallpaper does not take an HDR flag. Windows
+  Advanced Colour will tone-map a JPEG; a JXR/HDR file is outside this
+  product's format list and should stay outside. Do not attempt to
+  "preserve HDR" by writing a different registry key. If a user sets an
+  HDR image through Explorer, our next apply of a JPEG will replace it
+  — disclose that in the Displays page footnote, do not try to detect
+  the Advanced Colour state every tick.
+
+5.4 Sleep / hibernate / Fast Startup
+
+  v1.6's 1 Hz due-time already prevents catch-up bursts. What it does
+  not do is refresh topology. After resume:
+
+    * COM object may be stale. The STA thread should drop and
+      recreate the IDesktopWallpaper instance on the first failed call,
+      not on every resume (avoid a resume storm).
+    * Device paths may have changed. Reconciliation (§1.3) runs once
+      per resume.
+    * NAS folders may take tens of seconds to reappear. The existing
+      15 s off-thread probe is the right mechanism; do not add a
+      resume-time full rescan on the Tk thread.
+    * Fast Startup (hybrid shutdown) looks like a fresh process with
+      warm hardware. Treat it as a normal launch, not as a resume.
+
+5.5 Dock / undock / clone / Win+P
+
+  Clone mode: two physical panels share one RECT and one logical
+  display. Session join will see one GDI monitor and possibly two COM
+  paths with identical RECTs — that is the ambiguous-join case and
+  must stay unresolved. Do not slice a span across a clone.
+
+  Win+P "Second screen only" removes the laptop panel from the
+  topology. The laptop's assignment becomes unresolved and must not
+  fight to apply. When the panel returns, reconcile and re-apply
+  last_applied_path.
+
+  Device-path volatility across a dock cycle is the entire reason
+  fingerprints exist. If a driver update changes EDID bytes, the user
+  will reassign once; that is acceptable. Silent remapping by ordinal
+  is not.
+
+5.6 Fullscreen, UIPI, Secure Desktop
+
+  SHQueryUserNotificationState remains the session-wide pause signal.
+  It will not see a borderless windowed game; that is a known miss and
+  stays Future (HWND ∩ RECT). Lock screen (Secure Desktop) is a
+  different session — our hotkeys and pipe do not reach it, which is
+  correct. The WinRT lock-screen setter (v2.1 research gate) writes
+  the image that will appear *next* time the machine locks; it does
+  not paint the current Secure Desktop.
+
+5.7 Packaged vs unpackaged vs frozen
+
+  The running shape is a PyInstaller frozen exe or a python[w].exe
+  script. It is not an MSIX packaged app. WinRT lock-screen APIs and
+  some accent APIs behave differently when unpackaged. The v2.1
+  research spike must run against the frozen exe Mark actually uses,
+  not against a loose `python desktop_vista.py`, and must be willing
+  to return "not viable unpackaged" rather than invent a broker.
+
+-------------------------------------------------------------------------------
+6. IMPLEMENTATION ROADMAP & PHASED EXECUTION PLAN
+-------------------------------------------------------------------------------
+
+6.1 v1.8 — Leftover closure (single pipeline)
+
+    Order of work, each with an exit criterion. Do not start item N+1
+    if item N's tests are red. Do not bundle ApplyQueue or a clickable
+    map into this release.
+
+    1. Hidden rebuild helper + shuffle reset
+       Exit: unit tests in §1.2 pass; hide during a running shuffled
+       slideshow never IndexErrors and never reselects the hidden path;
+       unhide of a last-remaining image restores the preview.
+    2. Hide-of-applied advances the desktop through the existing silent
+       apply path, or honestly leaves the last image if the source is
+       empty.
+       Exit: live-verified once on this machine; wallpaper restored
+       afterwards (MEMORY.md testing hazard still applies).
+    3. Hidden manager: use _folder_online_cache; add Reveal; add
+       "Remove missing" (explicit, off-thread exists() probe).
+       Exit: a NAS-hidden list does not freeze the dialog on open;
+       Remove missing only drops paths whose exists() is False.
+    4. EditorSheet + playlist Browse + collection TagSelector +
+       match-count + inline errors.
+       Exit: Cancel is a no-op on cfg; Save of the active playlist
+       goes through the same rebuild helper; collection tags remain
+       case-sensitive exact strings (existing canonical tests stay green).
+    5. About / copyright block + tray entry.
+       Exit: Settings page and tray About show the four ABOUT_COPY
+       lines; no full LICENSE dump in the sidebar.
+    6. Read-only topology joined labels (session RECT join only).
+       Exit: unit tests for two-monitor, negative origin, clone
+       (ambiguous = unresolved). No click handler.
+    7. Tab-order audit + SPI_GETHIGHCONTRAST honour + --selftest DPI
+       dump. Write the Narrator script into VERIFICATION.md.
+       Exit: script exists; we do not tick "Narrator verified".
+
+    Regression bar: 152 existing tests remain green, plus the new
+    Hidden/editor/About cases. APP_VERSION -> "1.8".
+
+6.2 v1.8.1 — Accessibility gate
+
+    Mark (or a designated tester) runs VERIFICATION.md's Narrator
+    script on real Windows 11 with Narrator, Light and Dark, at 100%
+    and 150%. Outcomes are recorded as pass / fail / toolkit-limitation.
+    Failures that are ours (missing names, focus traps, contrast) come
+    back as a patch. Failures that are CustomTkinter drawing onto a
+    blank UIA tree are documented as limitations, not fixed with a
+    fake provider.
+
+    Exit: a written record in VERIFICATION.md, not a ROADMAP green
+    tick that says "accessible".
+
+6.3 v2.0 — One Perfect View
+
+    Prerequisites that are not negotiable:
+      * a machine with two or more physical displays attached
+      * at least one dock/undock or Win+P cycle during verification
+      * ApplyQueue in place before any UI claims "Applying…"
+
+    Sequence:
+      1. Extract playback.py. One controller wrapping the current
+         single pipeline. Behaviour-identical; tests ported.
+      2. ApplyQueue: COM/SPI calls leave the Tk thread. Partial
+         success is a first-class result.
+      3. displays.py: session join + fingerprint persist +
+         WM_DISPLAYCHANGE / resume hook. Still one controller.
+      4. N controllers, one heartbeat. Per-assignment source /
+         interval / shuffle / history. Hotkeys and IPC gain
+         --display. Displays page cards become the focused-assignment
+         surface. Interactive map is allowed only after step 3 is
+         live-verified.
+      5. Span slicer behind role=span-group. Mixed-DPI physical-pixel
+         crops. Clone topologies rejected.
+      6. Go/no-go on COM-as-default: only if step 4 is visually
+         confirmed (two different images, two different physical
+         displays, neither affecting the other) AND a dock cycle
+         restored the same assignments. Otherwise wallpaper_target
+         stays "spi" and COM remains opt-in. Same honesty as v1.5.1.
+
+    Exit criteria:
+      * two physical displays show independent images from independent
+        sources on independent timers
+      * dock/undock restores assignments without reshuffling
+      * Tk thread stays responsive during a 5 s COM call
+      * SPI path still works with wallpaper_target = "spi"
+      * 152 + v1.8 tests plus new controller/join/span unit tests green
+      * --selftest reports join results for every attached display
+
+6.4 v2.1 — Intelligence and scale
+
+    Only after v2.0's assignment model exists.
+      * SQLite catalogue + dual-write of tags/favourites/hidden
+      * weather bias on the existing pick function
+      * opt-in accent sync (Pillow quantize, never NumPy); disclose
+        that Win11 may ignore the write
+      * lock-screen WinRT research spike against the frozen exe;
+        implement only if the spike says unpackaged is viable
+      * dhash/phash duplicate review UI (manual merge, no silent delete)
+      * resolution down-rank
+      * EXIF inspector; Show on Map is opt-in and does not store GPS
+        beyond the session
+      * entropy focal crop for mismatched aspect ratios
+      * Bing Daily + NASA APOD + quota sandbox; Unsplash/Wallhaven stay
+        Future
+      * battery throttle (slower interval)
+      * phase F polish (ambient glow, drag-to-assign) only if the
+        interactive map from v2.0 is actually in use
+
+    Exit: catalogue migration dry-run on Mark's real config.json
+    (copy, not the live file) reports equal folder/tag/hidden counts;
+    dual-write keeps JSON curator keys current; feeds off by default
+    and the app is fully usable with the network unplugged.
+
+6.5 Explicitly not in the next sitting
+
+    Clickable per-display map
+    ApplyQueue
+    SQLite
+    Narrator "support" implemented as toasts
+    Any whole-screen capture for visual proof
+    Constructing DesktopVista() in throwaway scripts against the live
+      config.json without restoring Mark's folders / style / hidden /
+      ui prefs afterwards
+
+-------------------------------------------------------------------------------
+7. RECOMMENDED NEXT SITTING
+-------------------------------------------------------------------------------
+
+If the next session is "continue development" rather than another design
+pack, do v1.8 items 1–5 in that order (Hidden rebuild, hide-of-applied,
+manager hygiene, editors, About). They are single-pipeline, testable on
+this one-display machine, and they close every leftover Mark named that
+is not hardware-blocked.
+
+Leave item 6 (joined topology labels) for the start of the v2.0 branch
+if time is short — it is the only v1.8 item that touches identity, and
+identity work has a habit of becoming the display rewrite by accident.
+
+Leave item 7 (a11y prep + VERIFICATION.md script) as the last commit of
+the sitting so the Narrator gate has a script waiting for Mark, not a
+promise that we already ran one.
+
+-------------------------------------------------------------------------------
+END OF notes_007.txt
+-------------------------------------------------------------------------------

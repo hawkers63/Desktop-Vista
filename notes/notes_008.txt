@@ -1,0 +1,37 @@
+**Author: Mark**
+**Date: 2026-09-09**
+
+**Addressing Leftovers**  
+Enhance playlist editors to reduce potential correctness issues. Both dialogues allow for draft saving, thus emphasising tag management: the main window employs TagSelector, while the collection dialogue depends on a comma box. For version 1.8, design a streamlined EditorSheet, reuse TagSelector, incorporate a “Browse…” option for playlists, and substitute message boxes with inline error labels and live match counts. Ensure that these elements remain modal and refrain from including ALL/NOT filters at this stage, as they pertain to catalog semantics.
+
+**Hidden Items**  
+The primary functional deficiency lies in this area, rather than the labels.
+
+Version 1.7 addressed disambiguation; however, the Hide/Unhide functions fail to preserve playback. The _hide_current method reduces self.images without clearing _shuffle_order, which may lead to IndexErrors. The Unhide function reconstructs the list without invoking _show_current(), resulting in empty sources displaying “No images left.” Additionally, hiding the desktop image does not trigger a replacement.
+
+Implement the _rebuild_playback_after_filter_change function to reset images and the shuffle deck, activated by Hide, Unhide, and editor Save actions. If the hidden path pertains to the wallpaper, apply the new image silently or retain the previous one if no new image is available. Orphan purges should be executed explicitly and off-thread; automatic purging during startup may lead to curation loss in instances of NAS downtime. Verify if the folder is online from the cache, rather than during dialogue reconstruction.
+
+**Interactive Per-Display Map**  
+Maintain the current block.
+
+The topology canvas and COM picker represent separate identity spaces. Merging them by ordinal presents challenges. A clickable map prior to fingerprinting may produce inaccurate outputs. Joining sessions based on maximum RECT intersection is optimal. Persistent identity should be based on EDID hash, size, origin, primary, and orientation, reconciled during WM_DISPLAYCHANGE/resume/dock events—never persist the COM path. Version 1.8 should enhance read-only labels and identify unresolved displays; Phase E is designated for version 2.0.
+
+**Narrator**  
+Refrain from simulation.
+
+CustomTkinter is built on Tk and does not feature a complete UIA tree. A toast-based “Narrator mode” would misrepresent the functionality. Version 1.8 can enhance non-AT capabilities: adjust tab order, ensure no focus interruptions on grid_removed pages, provide text equivalents for icon-only controls, respect SPI_GETHIGHCONTRAST, and output per-monitor DPI from --selftest. Include a genuine Narrator script in VERIFICATION.md for hardware testing. Document the limitations of the toolkit as failures, rather than as misleading providers.
+
+**About**  
+The settings already feature the heading.
+
+Currently, it displays only Desktop Vista 1.7. Expand this without necessitating a second window. Include four lines: name + version, Copyright (c) 2026–present Mark Hawksworth, All rights reserved., GitHub URL. An optional “Licence notice” should open a small read-only view of the LICENSE lead-in—avoid pasting the full text in a 260 px sidebar. The tray option “About Desktop Vista…” should link to the same settings section. Integrate the four lines alongside APP_VERSION so that the frozen executable does not need to locate LICENSE at paint time.
+
+**What Not to Include in the Next Session**  
+Omit ApplyQueue (as COM can block Tk for up to 5 seconds), SQLite, weather features, accent synchronisation, lock screen functionalities, span slicing, and clickable maps as previously noted. Version 1.8 will serve as the final correctness/UI pass for this single-display machine. Version 2.0 necessitates a hardware gate: two physical displays and a dock/undock process prior to COM defaults.
+
+**Recommended Implementation Order**  
+If the upcoming session is focused on building: Hidden rebuild → hide-of-applied → manager hygiene → editors → About. This approach will address all remaining issues not obstructed by hardware constraints.
+
+-------------------------------------------------------------------------------
+END OF notes_008.txt
+-------------------------------------------------------------------------------
