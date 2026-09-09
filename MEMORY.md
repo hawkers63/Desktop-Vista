@@ -442,3 +442,63 @@ next real launch, not a version already "consumed" by test runs).
 
 APP_VERSION bumped to "1.7". 152/152 tests passing (up from 148).
 `DesktopVista.exe` rebuilt and re-sent to Mark reflecting all of it.
+
+---
+
+## 2026-09-10 — v1.8 "Leftover closure" shipped; five-release scope set
+
+**Context:** Mark dropped `notes/notes_007.txt` (Principal Systems Architect design pack) and
+`notes/notes_008.txt` (his own condensed priority note) and asked for a structured scope across
+the next five releases, then to start on whatever was actually ready. Both notes agreed: v1.8
+closes the single-pipeline leftovers named in the v1.7 pass; v1.8.1 (Narrator/AT), v2.0 (display
+rewrite), and v2.1 (catalogue/intelligence) are all gated on hardware or a human running a script
+that doesn't exist on this one-display dev machine. Wrote the five-release structure into
+`ROADMAP.md` and built v1.8 — the only release not blocked by anything but engineering time — in
+full, across four commits (`d6f8f87`..`df2328c`).
+
+**What shipped:**
+- **Hidden Items playback invariants** — the real functional gap, not the v1.7 label fix.
+  `_rebuild_playback_after_filter_change` (backed by a pure `resolve_rebuilt_index`) is now the
+  one path every Hide/Unhide/editor-Save-of-the-active-source mutation of
+  `self.images`/index/shuffle-deck goes through, closing an `IndexError`/wrong-file risk that was
+  reachable from the HUD Hide button, `H`, and Win+Alt+H mid-slideshow. Hiding the applied
+  wallpaper (or hiding anything while the slideshow runs) now silently advances the desktop
+  through the existing apply path instead of only updating the preview.
+- **Hidden manager hygiene** — reads `_folder_online_cache` instead of probing
+  `is_folder_online()` on the Tk thread during rebuild (same freeze class v1.6 already fixed for
+  the sidebar); added a per-row Reveal button and an explicit, off-thread "Remove missing" action.
+- **`ui_components.EditorSheet`** — a reusable modal draft shell (persistent inline error label,
+  Save disabled while invalid, Cancel/Esc/window-close all genuinely no-op on cfg). Playlist
+  editor gained "Browse…"; collection editor now uses the same `TagSelector` as the main tag
+  drawer instead of a raw comma box (was a real semantics-drift risk) plus a live, off-thread
+  match count (`collection_match_count`).
+- **About/copyright disclosure** — Settings block + "Licence notice" viewer + tray entry, one
+  `ABOUT_COPY` source for both.
+- **Read-only topology joined labels** — `join_monitor_topology`, a pure max-area-RECT-
+  intersection join between the Win32 GDI topology and the COM device-path list. Ties (clone
+  displays) or no overlap report unresolved, never guessed. Only attempted if a COM backend
+  already exists (never spins one up just to label the strip) — still no click handler, that
+  stays blocked on v2.0's fingerprint/reconciliation scheme.
+- **a11y prep** — `is_high_contrast_active` (SPI_GETHIGHCONTRAST) wired through a new
+  `_apply_appearance_mode`, which also fixed a real latent bug it exposed: appearance mode was
+  hardcoded to `"dark"` at startup regardless of the saved preference, only ever corrected after
+  an explicit dropdown change. `--selftest` now dumps per-monitor DPI (`GetDpiForMonitor`) and
+  Tk's scaling factor. **Tab-order finding:** a standalone Tk probe (not this app, a throwaway
+  script) confirmed `tk_focusNext` already excludes `grid_remove()`'d and `place_forget()`'d
+  widgets via `winfo_ismapped()` — hidden pages/overlays cannot become focus stops, and no code
+  change was needed for the thing notes_007 flagged. Full Narrator/contrast/multi-DPI script
+  written into `VERIFICATION.md` for the v1.8.1 hardware gate — not run this session (needs real
+  AT and a human).
+
+**Not done live this session, by design:** did not construct a real `DesktopVista()` against a
+config this time (unlike the v1.7 session's throwaway smoke tests, which twice needed manual
+restoration of `config.json`/registry state afterward — see the incident above). All v1.8 logic
+that could be pulled into pure functions (`resolve_rebuilt_index`, `collection_match_count`,
+`join_monitor_topology`, `is_high_contrast_active`) has unit coverage instead; the new dialogs
+(EditorSheet-based playlist/collection editors, hidden manager changes, About page) were reviewed
+carefully and lint-checked (`pyflakes` clean) but **not interactively clicked through in a running
+window** — flagged explicitly to Mark rather than claimed as verified. `--selftest` was run for
+real on this machine and confirmed clean (no lingering process afterward).
+
+APP_VERSION bumped to "1.8". 171/171 tests passing (up from 152). Commits not yet pushed to
+`origin/main` — local `main` is 4 commits ahead, pending Mark's go-ahead.
