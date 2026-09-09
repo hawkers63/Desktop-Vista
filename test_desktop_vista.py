@@ -594,6 +594,58 @@ def test_resolve_source_images_missing_playlist_returns_empty():
 
 
 # ---------------------------------------------------------------------------
+# join_monitor_topology (notes_007 §1.3 — read-only session join)
+# ---------------------------------------------------------------------------
+
+def test_join_monitor_topology_two_monitor_exact_match():
+    gdi = [
+        {"rect": (0, 0, 1920, 1080), "primary": True},
+        {"rect": (1920, 0, 3840, 1080), "primary": False},
+    ]
+    com = [
+        ("com-a", (0, 0, 1920, 1080)),
+        ("com-b", (1920, 0, 3840, 1080)),
+    ]
+    assert dv.join_monitor_topology(gdi, com) == [0, 1]
+
+
+def test_join_monitor_topology_negative_origin():
+    # A monitor placed to the left of the primary has negative coordinates.
+    gdi = [
+        {"rect": (-1920, 0, 0, 1080), "primary": False},
+        {"rect": (0, 0, 1920, 1080), "primary": True},
+    ]
+    com = [
+        ("com-a", (0, 0, 1920, 1080)),
+        ("com-b", (-1920, 0, 0, 1080)),
+    ]
+    assert dv.join_monitor_topology(gdi, com) == [1, 0]
+
+
+def test_join_monitor_topology_clone_is_unresolved():
+    # Two COM entries reporting the identical RECT (clone mode) must tie,
+    # never be guessed — a wrong guess here would assign wallpaper to the
+    # wrong physical output once v2.0 wires an apply target off this join.
+    gdi = [{"rect": (0, 0, 1920, 1080), "primary": True}]
+    com = [
+        ("com-a", (0, 0, 1920, 1080)),
+        ("com-b", (0, 0, 1920, 1080)),
+    ]
+    assert dv.join_monitor_topology(gdi, com) == [None]
+
+
+def test_join_monitor_topology_no_overlap_is_unresolved():
+    gdi = [{"rect": (0, 0, 1920, 1080), "primary": True}]
+    com = [("com-a", (5000, 5000, 6000, 6000))]
+    assert dv.join_monitor_topology(gdi, com) == [None]
+
+
+def test_join_monitor_topology_empty_com_list():
+    gdi = [{"rect": (0, 0, 1920, 1080), "primary": True}]
+    assert dv.join_monitor_topology(gdi, []) == [None]
+
+
+# ---------------------------------------------------------------------------
 # resolve_rebuilt_index (notes_007 §1.2 — Hidden Items playback invariants)
 # ---------------------------------------------------------------------------
 

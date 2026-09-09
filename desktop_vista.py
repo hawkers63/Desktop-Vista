@@ -864,6 +864,51 @@ def compute_topology_layout(monitors: list[dict], box_w: int, box_h: int) -> lis
     return out
 
 
+def _rect_intersection_area(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3])
+    return max(0, right - left) * max(0, bottom - top)
+
+
+def join_monitor_topology(
+    gdi_monitors: list[dict], com_monitors: list[tuple[str, tuple[int, int, int, int]]]
+) -> list[Optional[int]]:
+    """Session-scoped join between the read-only Win32 topology
+    (enumerate_monitors) and the COM device-path list
+    (ComWallpaperBackend.enumerate_monitors), by maximum-area RECT
+    intersection in physical pixels (notes_007 §1.3).
+
+    Returns, for each *gdi_monitors* entry in order, the index into
+    *com_monitors* it joins to, or None if the join is ambiguous (a tie —
+    including two COM entries sharing one clone-mode RECT) or there is no
+    overlap at all. A tie is reported unresolved rather than guessed: once
+    v2.0 wires an apply target off this join, a wrong guess here means
+    silently assigning wallpaper to the wrong physical display. Never
+    persist the result across a session — device paths are ephemeral
+    (notes_004/notes_007 house rules); re-run this every time both sides
+    are freshly re-enumerated.
+    """
+    joins: list[Optional[int]] = []
+    for gdi in gdi_monitors:
+        best_area = 0
+        best_index: Optional[int] = None
+        tied = False
+        for com_index, (_device_id, com_rect) in enumerate(com_monitors):
+            area = _rect_intersection_area(gdi["rect"], com_rect)
+            if area <= 0:
+                continue
+            if area > best_area:
+                best_area = area
+                best_index = com_index
+                tied = False
+            elif area == best_area:
+                tied = True
+        joins.append(None if tied else best_index)
+    return joins
+
+
 def is_fullscreen_active(state: Optional[int] = None) -> bool:
     """Pure predicate over a notification-state value — pass one explicitly
     in tests; real callers omit it to query the live Win32 API."""
@@ -2092,13 +2137,33 @@ class DesktopVista(ctk.CTk):
             return
         margin = 4
         layout = compute_topology_layout(monitors, box_w - 2 * margin, box_h - 2 * margin)
-        for i, monitor in enumerate(layout, start=1):
+
+        # Only join against COM if its backend already exists — this
+        # read-only label must never be the reason a COM STA thread gets
+        # started for someone who has not opted into the experimental
+        # per-monitor engine (notes_007 §1.3). Still no click handler:
+        # a resolved join only improves the label, never becomes a target.
+        com_monitors: list[tuple[str, tuple[int, int, int, int]]] = []
+        if self._com_backend is not None:
+            try:
+                com_monitors = self._com_backend.enumerate_monitors()
+            except Exception as exc:
+                log.warning("Could not enumerate COM monitors for topology join: %s", exc)
+        joins = join_monitor_topology(monitors, com_monitors) if com_monitors else [None] * len(monitors)
+
+        for i, (monitor, com_index) in enumerate(zip(layout, joins), start=1):
             box = monitor["layout"]
             x0, y0 = margin + box["x"], margin + box["y"]
             x1, y1 = x0 + box["w"], y0 + box["h"]
             color = "#3a8dde" if monitor["primary"] else "#5a5a5a"
             canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="#1c1c1c")
-            label = f"{i}" + (" ★" if monitor["primary"] else "")
+            if com_index is not None:
+                label = f"Display {com_index + 1}"
+            elif com_monitors:
+                label = f"{i} (unresolved)"
+            else:
+                label = f"{i}"
+            label += " ★" if monitor["primary"] else ""
             canvas.create_text(
                 (x0 + x1) // 2, (y0 + y1) // 2, text=label, fill="white",
                 font=("Segoe UI", 9, "bold"),
