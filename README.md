@@ -59,6 +59,8 @@ The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to previ
 - **Drive reconnect watcher** — offline badges and empty sources refresh automatically on a 15-second poll
 - **Battery Saver & fullscreen auto-pause** — the slideshow pauses itself on Battery Saver or while a fullscreen app/game is active, and resumes automatically once the reason clears (v1.4)
 - **Daily-times schedule** — an alternative to a fixed interval: pick times of day ("08:00, 18:00") instead
+- **Tags & collections** — tag any image and filter playback to a saved "match any of these tags" collection spanning every drive (v1.5)
+- **Monitor topology strip** — a read-only view of your actual display arrangement (groundwork for multi-monitor wallpapers in v2.0)
 
 ---
 
@@ -155,6 +157,9 @@ Settings are stored in `config.json` beside `desktop_vista.py`. Use [`config.exa
 | `power.pause_on_fullscreen` | `boolean` | Auto-pause while a fullscreen app/game or presentation is active (default `true`) |
 | `schedule.mode` | `string` | `"interval"` (fixed interval, default) or `"daily"` (`daily_times`) |
 | `schedule.daily_times` | `string[]` | 24-hour `"HH:MM"` times used when `schedule.mode` is `"daily"` |
+| `tags` | `{path: string[]}` | Freeform tags per image path (non-destructive) |
+| `collections` | `[{id, name, tags_any}]` | Saved filters — a collection plays every known image tagged with any of `tags_any` |
+| `solar` | `{enabled, latitude, longitude, fallback_times}` | Dawn/day/dusk/night data model (v1.5 groundwork) — stored and validated, not yet wired into playback |
 
 Example (placeholders only):
 

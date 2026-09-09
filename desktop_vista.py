@@ -8,7 +8,7 @@
 # See the LICENSE file in the project root for the full proprietary notice.
 """
 Desktop Vista  —  All my drives. One perfect view.
-Version 1.4.0  (September 2026)
+Version 1.5.0  (September 2026)
 
 A lightweight Windows wallpaper manager.
 
@@ -85,9 +85,20 @@ New in v1.4 "Power & Context Awareness":
     - Mica/Acrylic backdrop experiment dropped from scope — disproportionate
       implementation risk for a CustomTkinter app relative to its value
 
-Planned for v1.5+: monitor-topology groundwork, tags/collections, solar
-data model, and finally multi-monitor (IDesktopWallpaper COM) in v2.0 —
-see ROADMAP.md.
+New in v1.5 "Foundations for v2.0":
+    - Read-only monitor topology strip (Win32 EnumDisplayMonitors /
+      GetMonitorInfoW — no COM needed for read-only enumeration); shows
+      the real arrangement, does not change what's applied anywhere
+    - Tags (freeform, per image) and collections (saved "match any of
+      these tags" filters) — a third playback-source kind alongside
+      folders and playlists, spanning every tagged image across drives
+    - Solar dawn/day/dusk/night data model (coordinates + 4 fallback
+      times) — validated and stored, not yet wired into the live
+      schedule; that wiring, like per-monitor apply, is v2.0's job
+
+Planned for v2.0: multi-monitor (IDesktopWallpaper COM), built behind an
+opt-in experimental flag — see ROADMAP.md for what's been verified versus
+what still needs multi-monitor hardware to confirm.
 """
 
 from __future__ import annotations
@@ -128,7 +139,7 @@ except ImportError:
 
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageOps
-from tkinter import filedialog, messagebox, simpledialog
+from tkinter import Canvas, filedialog, messagebox, simpledialog
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -145,7 +156,7 @@ log = logging.getLogger("desktop_vista")
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Desktop Vista"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 TAGLINE = "All my drives. One perfect view."
 
 # Frozen (PyInstaller) builds extract bundled files under a temporary
@@ -214,6 +225,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # v1.4 Power & Context Awareness — additive.
     "power": {"pause_on_battery_saver": True, "pause_on_fullscreen": True},
     "schedule": {"mode": "interval", "daily_times": []},  # mode: "interval"|"daily"
+    # v1.5 Foundations for v2.0 — additive.
+    "tags": {},           # {image path: [tag, ...]}
+    "collections": [],    # [{"id", "name", "tags_any": [tag, ...]}]
+    "solar": {             # data model only — not wired into playback yet (v2.0)
+        "enabled": False,
+        "latitude": None,
+        "longitude": None,
+        "fallback_times": ["06:00", "08:00", "18:00", "21:00"],  # dawn/day/dusk/night
+    },
 }
 
 STARTUP_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -294,7 +314,7 @@ def playlist_folder_status(playlist: dict) -> tuple[int, int]:
 
 
 def source_display_label(cfg: dict, kind: str, source_id: str) -> str:
-    """Human-readable label for a folder or playlist source, offline-badged."""
+    """Human-readable label for a folder, playlist, or collection source."""
     if kind == "playlist":
         playlist = find_playlist(cfg, source_id)
         if playlist is None:
@@ -304,12 +324,62 @@ def source_display_label(cfg: dict, kind: str, source_id: str) -> str:
         if total and online < total:
             return f"{name}  ({online}/{total} drives online)"
         return name
+    if kind == "collection":
+        collection = find_collection(cfg, source_id)
+        if collection is None:
+            return f"(missing collection {source_id})"
+        return f"# {collection.get('name', '(unnamed)')}"
     return folder_display_label(source_id)
+
+
+def find_collection(cfg: dict, collection_id: str) -> dict | None:
+    return next((c for c in cfg.get("collections", []) if c.get("id") == collection_id), None)
+
+
+def get_tags(cfg: dict, path: str) -> list[str]:
+    return list(cfg.get("tags", {}).get(path, []))
+
+
+def set_tags(cfg: dict, path: str, tags: list[str]) -> None:
+    """Replace *path*'s tags (empty list removes its entry entirely)."""
+    cleaned = dedupe_preserve_order([t.strip() for t in tags if t.strip()])
+    tags_map = dict(cfg.get("tags", {}))
+    if cleaned:
+        tags_map[path] = cleaned
+    else:
+        tags_map.pop(path, None)
+    cfg["tags"] = tags_map
+
+
+def resolve_collection_candidate_images(cfg: dict, collection_id: str) -> list[str]:
+    """
+    Images from any known folder (standalone or inside a playlist) whose
+    tags intersect the collection's tags_any. Hidden-filtering happens in
+    resolve_source_images, uniformly across all source kinds.
+    """
+    collection = find_collection(cfg, collection_id)
+    wanted = set(collection.get("tags_any", [])) if collection else set()
+    if not wanted:
+        return []
+    tags_map = cfg.get("tags", {})
+    all_folders = dedupe_preserve_order(
+        list(cfg.get("folders", []))
+        + [f for p in cfg.get("playlists", []) for f in p.get("folders", [])]
+    )
+    seen: set[str] = set()
+    images: list[str] = []
+    for folder in all_folders:
+        for img in list_images(folder):
+            if img not in seen and wanted & set(tags_map.get(img, [])):
+                seen.add(img)
+                images.append(img)
+    return images
 
 
 def resolve_source_images(cfg: dict, kind: str, source_id: str) -> list[str]:
     """
-    Return the hidden-filtered image list for a folder or playlist source.
+    Return the hidden-filtered image list for a folder, playlist, or
+    tag-based collection source.
 
     Playlist images are the union of their member folders' images, folder
     order preserved, deduplicated (a folder listed twice contributes once).
@@ -321,6 +391,8 @@ def resolve_source_images(cfg: dict, kind: str, source_id: str) -> list[str]:
         for folder in dedupe_preserve_order(folders):
             images.extend(list_images(folder))
         images = dedupe_preserve_order(images)
+    elif kind == "collection":
+        images = resolve_collection_candidate_images(cfg, source_id)
     else:
         images = list_images(source_id)
     hidden = set(cfg.get("hidden", []))
@@ -423,6 +495,107 @@ def query_user_notification_state() -> Optional[int]:
     except OSError:
         return None
     return state.value if hresult == 0 else None  # 0 == S_OK
+
+
+class _RECT(ctypes.Structure if ctypes is not None else object):
+    _fields_ = (
+        [
+            ("left", ctypes.c_long), ("top", ctypes.c_long),
+            ("right", ctypes.c_long), ("bottom", ctypes.c_long),
+        ]
+        if ctypes is not None
+        else []
+    )
+
+
+class _MONITORINFOEXW(ctypes.Structure if ctypes is not None else object):
+    _fields_ = (
+        [
+            ("cbSize", ctypes.c_ulong),
+            ("rcMonitor", _RECT),
+            ("rcWork", _RECT),
+            ("dwFlags", ctypes.c_ulong),
+            ("szDevice", ctypes.c_wchar * 32),
+        ]
+        if ctypes is not None
+        else []
+    )
+
+
+MONITORINFOF_PRIMARY = 0x1
+
+
+def enumerate_monitors() -> list[dict]:
+    """
+    Read-only monitor topology via EnumDisplayMonitors/GetMonitorInfoW.
+
+    Returns [{"device": str, "rect": (l, t, r, b), "primary": bool}, ...] in
+    enumeration order, or [] on any non-Windows platform or API failure.
+    This never writes anything — no wallpaper apply path reads it (yet);
+    it exists purely so the UI can show the real arrangement (v1.5 P0).
+    """
+    if ctypes is None or sys.platform != "win32":
+        return []
+    monitors: list[dict] = []
+    MonitorEnumProc = ctypes.WINFUNCTYPE(
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(_RECT), ctypes.c_void_p
+    )
+
+    def _callback(hmonitor, _hdc, _lprect, _data):
+        info = _MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(_MONITORINFOEXW)
+        if ctypes.windll.user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+            rect = info.rcMonitor
+            monitors.append({
+                "device": info.szDevice,
+                "rect": (rect.left, rect.top, rect.right, rect.bottom),
+                "primary": bool(info.dwFlags & MONITORINFOF_PRIMARY),
+            })
+        return 1  # non-zero: keep enumerating
+
+    try:
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, MonitorEnumProc(_callback), 0)
+    except OSError:
+        return []
+    return monitors
+
+
+def compute_topology_layout(monitors: list[dict], box_w: int, box_h: int) -> list[dict]:
+    """
+    Scale monitor rects to fit within box_w x box_h for display, preserving
+    relative position and aspect ratio (uniform scale, union bounding box
+    mapped to the box — same approach notes_004 Track B recommends for the
+    real topology strip, so negative-coordinate/portrait arrangements still
+    render sensibly).
+
+    Returns each input monitor dict plus a "layout": {x, y, w, h} key in
+    box-local pixel coordinates. Pure function — no live monitor query.
+    """
+    if not monitors or box_w <= 0 or box_h <= 0:
+        return []
+    lefts = [m["rect"][0] for m in monitors]
+    tops = [m["rect"][1] for m in monitors]
+    rights = [m["rect"][2] for m in monitors]
+    bottoms = [m["rect"][3] for m in monitors]
+    union_w = max(rights) - min(lefts)
+    union_h = max(bottoms) - min(tops)
+    if union_w <= 0 or union_h <= 0:
+        return []
+    scale = min(box_w / union_w, box_h / union_h)
+    min_x, min_y = min(lefts), min(tops)
+    out = []
+    for m in monitors:
+        l, t, r, b = m["rect"]
+        out.append({
+            **m,
+            "layout": {
+                "x": int((l - min_x) * scale),
+                "y": int((t - min_y) * scale),
+                "w": max(1, int((r - l) * scale)),
+                "h": max(1, int((b - t) * scale)),
+            },
+        })
+    return out
 
 
 def is_fullscreen_active(state: Optional[int] = None) -> bool:
@@ -599,6 +772,78 @@ def _validate_config(raw: dict) -> dict[str, Any]:
     else:
         log.warning("Invalid 'schedule' in config; using default.")
         cfg["schedule"] = dict(DEFAULT_CONFIG["schedule"])
+
+    # ---- v1.5 additions (all additive; absent/invalid -> safe defaults) ----
+
+    tags_raw = raw.get("tags", {})
+    valid_tags: dict[str, list[str]] = {}
+    if isinstance(tags_raw, dict):
+        for path, tag_list in tags_raw.items():
+            if (
+                isinstance(path, str)
+                and isinstance(tag_list, list)
+                and all(isinstance(t, str) for t in tag_list)
+            ):
+                cleaned = dedupe_preserve_order([t.strip() for t in tag_list if t.strip()])
+                if cleaned:
+                    valid_tags[path] = cleaned
+    else:
+        log.warning("Invalid 'tags' in config; using default.")
+    cfg["tags"] = valid_tags
+
+    collections_raw = raw.get("collections", [])
+    valid_collections: list[dict] = []
+    seen_collection_ids: set[str] = set()
+    if isinstance(collections_raw, list):
+        for entry in collections_raw:
+            if not isinstance(entry, dict):
+                continue
+            cid, name, tags_any = entry.get("id"), entry.get("name"), entry.get("tags_any")
+            if (
+                isinstance(cid, str) and cid and cid not in seen_collection_ids
+                and isinstance(name, str) and name.strip()
+                and isinstance(tags_any, list) and all(isinstance(t, str) for t in tags_any)
+                and tags_any
+            ):
+                seen_collection_ids.add(cid)
+                valid_collections.append(
+                    {"id": cid, "name": name, "tags_any": dedupe_preserve_order(tags_any)}
+                )
+            else:
+                log.warning("Dropping invalid collection entry in config: %r", entry)
+    else:
+        log.warning("Invalid 'collections' in config; using default.")
+    cfg["collections"] = valid_collections
+
+    solar_raw = raw.get("solar", DEFAULT_CONFIG["solar"])
+    if isinstance(solar_raw, dict):
+        solar_defaults = DEFAULT_CONFIG["solar"]
+        enabled = solar_raw.get("enabled")
+        fallback_raw = solar_raw.get("fallback_times")
+        valid_fallback = (
+            [t for t in fallback_raw if isinstance(t, str) and is_valid_time_string(t)]
+            if isinstance(fallback_raw, list) else []
+        )
+        if len(valid_fallback) != 4:
+            valid_fallback = list(solar_defaults["fallback_times"])
+
+        def _valid_coord(value: Any, bound: float) -> Optional[float]:
+            if (
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and -bound <= value <= bound
+            ):
+                return float(value)
+            return None
+
+        cfg["solar"] = {
+            "enabled": enabled if isinstance(enabled, bool) else solar_defaults["enabled"],
+            "latitude": _valid_coord(solar_raw.get("latitude"), 90),
+            "longitude": _valid_coord(solar_raw.get("longitude"), 180),
+            "fallback_times": valid_fallback,
+        }
+    else:
+        log.warning("Invalid 'solar' in config; using default.")
+        cfg["solar"] = copy.deepcopy(DEFAULT_CONFIG["solar"])
 
     return cfg
 
@@ -987,6 +1232,20 @@ class DesktopVista(ctk.CTk):
         ctk.CTkButton(pbtns, text="Delete", fg_color="gray30", hover_color="gray25",
                       command=self._delete_active_playlist).grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
+        # Collections: saved tag filters, spanning any tagged image cross-drive.
+        ctk.CTkLabel(side, text="COLLECTIONS", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(14, 0), sticky="w")
+        ctk.CTkButton(side, text="+ New Collection",
+                      command=lambda: self._open_collection_editor()).grid(
+            row=row(), column=0, padx=16, pady=(4, 4), sticky="ew")
+        cbtns = ctk.CTkFrame(side, fg_color="transparent")
+        cbtns.grid(row=row(), column=0, padx=16, sticky="ew")
+        cbtns.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(cbtns, text="Edit", fg_color="gray30", hover_color="gray25",
+                      command=self._edit_active_collection).grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        ctk.CTkButton(cbtns, text="Delete", fg_color="gray30", hover_color="gray25",
+                      command=self._delete_active_collection).grid(row=0, column=1, padx=(4, 0), sticky="ew")
+
         # Fit style
         ctk.CTkLabel(side, text="FIT STYLE", font=ctk.CTkFont(size=11, weight="bold"),
                      text_color="gray60").grid(row=row(), column=0, padx=16, pady=(18, 0), sticky="w")
@@ -1042,6 +1301,16 @@ class DesktopVista(ctk.CTk):
                       command=self._on_daily_times_apply).grid(
             row=row(), column=0, padx=16, pady=(4, 0), sticky="ew")
 
+        # Monitor topology (read-only; v1.5 groundwork — no per-monitor apply yet)
+        ctk.CTkLabel(side, text="MONITORS (read-only)", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
+        self.monitor_canvas = Canvas(side, width=260, height=80, highlightthickness=0, bg="#2b2b2b")
+        self.monitor_canvas.grid(row=row(), column=0, padx=16, pady=(4, 0), sticky="ew")
+        ctk.CTkButton(side, text="Refresh", fg_color="gray30", hover_color="gray25", width=80,
+                      command=self._refresh_monitor_topology).grid(
+            row=row(), column=0, padx=16, pady=(4, 0), sticky="w")
+        self._refresh_monitor_topology()
+
         # Startup
         ctk.CTkLabel(side, text="STARTUP", font=ctk.CTkFont(size=11, weight="bold"),
                      text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
@@ -1090,6 +1359,17 @@ class DesktopVista(ctk.CTk):
                                          hover_color="gray25", command=self._open_hidden_manager)
         self.hidden_btn.grid(row=0, column=2, padx=6)
 
+        # Tags — freeform per-image labels; collections filter playback by these
+        tagrow = ctk.CTkFrame(self.main, fg_color="transparent")
+        tagrow.grid(row=4, column=0, pady=(0, 16))
+        ctk.CTkLabel(tagrow, text="Tags:").grid(row=0, column=0, padx=(0, 6))
+        self.tags_var = ctk.StringVar(value="")
+        self.tags_entry = ctk.CTkEntry(tagrow, textvariable=self.tags_var, width=220,
+                                        placeholder_text="nature, minimal")
+        self.tags_entry.grid(row=0, column=1, padx=(0, 6))
+        ctk.CTkButton(tagrow, text="Apply", width=70, command=self._on_tags_apply).grid(
+            row=0, column=2)
+
         # Keyboard shortcuts
         self.bind("<Left>", lambda e: self._prev())
         self.bind("<Right>", lambda e: self._next())
@@ -1117,6 +1397,31 @@ class DesktopVista(ctk.CTk):
             self.iconbitmap(str(BRAND_ICON_PATH))
         except Exception as exc:
             log.warning("Could not set window icon: %s", exc)
+
+    # ---------------- Monitor topology (read-only) ----------------
+
+    def _refresh_monitor_topology(self) -> None:
+        monitors = enumerate_monitors()
+        canvas = self.monitor_canvas
+        canvas.delete("all")
+        box_w = int(canvas["width"])
+        box_h = int(canvas["height"])
+        if not monitors:
+            canvas.create_text(box_w // 2, box_h // 2, text="Unavailable", fill="gray60")
+            return
+        margin = 4
+        layout = compute_topology_layout(monitors, box_w - 2 * margin, box_h - 2 * margin)
+        for i, monitor in enumerate(layout, start=1):
+            box = monitor["layout"]
+            x0, y0 = margin + box["x"], margin + box["y"]
+            x1, y1 = x0 + box["w"], y0 + box["h"]
+            color = "#3a8dde" if monitor["primary"] else "#5a5a5a"
+            canvas.create_rectangle(x0, y0, x1, y1, fill=color, outline="#1c1c1c")
+            label = f"{i}" + (" ★" if monitor["primary"] else "")
+            canvas.create_text(
+                (x0 + x1) // 2, (y0 + y1) // 2, text=label, fill="white",
+                font=("Segoe UI", 9, "bold"),
+            )
 
     # ---------------- Debounced save ----------------
 
@@ -1176,6 +1481,8 @@ class DesktopVista(ctk.CTk):
             return "folder", self.cfg["folders"][0]
         if self.cfg["playlists"]:
             return "playlist", self.cfg["playlists"][0]["id"]
+        if self.cfg["collections"]:
+            return "collection", self.cfg["collections"][0]["id"]
         return None
 
     def _restore_state(self) -> None:
@@ -1211,6 +1518,10 @@ class DesktopVista(ctk.CTk):
             label = source_display_label(self.cfg, "playlist", playlist["id"])
             labels.append(label)
             mapping[label] = ("playlist", playlist["id"])
+        for collection in self.cfg["collections"]:
+            label = source_display_label(self.cfg, "collection", collection["id"])
+            labels.append(label)
+            mapping[label] = ("collection", collection["id"])
         self._source_label_to_key = mapping
 
         if not labels:
@@ -1256,6 +1567,7 @@ class DesktopVista(ctk.CTk):
                 self.preview.configure(image=None, text="No images found in this source")
                 self.meta.configure(text="")
                 self._update_favourite_button()
+                self._update_tags_field()
             if kind == "folder" and not is_folder_online(source_id):
                 self._set_status("Folder is offline (drive disconnected?).")
             elif kind == "playlist":
@@ -1265,6 +1577,8 @@ class DesktopVista(ctk.CTk):
                     self._set_status("All folders in this playlist are offline.")
                 else:
                     self._set_status("No images found in this playlist.")
+            elif kind == "collection":
+                self._set_status("No images match this collection's tags.")
             else:
                 self._set_status("No images found in this folder.")
             self._flush_save()
@@ -1273,10 +1587,13 @@ class DesktopVista(ctk.CTk):
             return
 
         self.index = 0
-        noun = "playlist" if kind == "playlist" else "folder"
-        name = find_playlist(self.cfg, source_id)["name"] if kind == "playlist" else (
-            Path(source_id).name or source_id
-        )
+        noun = {"playlist": "playlist", "collection": "collection"}.get(kind, "folder")
+        if kind == "playlist":
+            name = find_playlist(self.cfg, source_id)["name"]
+        elif kind == "collection":
+            name = find_collection(self.cfg, source_id)["name"]
+        else:
+            name = Path(source_id).name or source_id
         self._set_status(f"{len(self.images)} images in {noun} '{name}'")
         if show:
             self._show_current()
@@ -1421,6 +1738,99 @@ class DesktopVista(ctk.CTk):
             self.meta.configure(text="")
             self._flush_save()
 
+    # ---------------- Collections (saved tag filters) ----------------
+
+    def _open_collection_editor(self, collection: Optional[dict] = None) -> None:
+        win = ctk.CTkToplevel(self)
+        win.title("New Collection" if collection is None else f"Edit Collection — {collection['name']}")
+        win.geometry("360x240")
+        win.transient(self)
+        win.grab_set()
+
+        ctk.CTkLabel(win, text="Collection name").pack(padx=16, pady=(16, 4), anchor="w")
+        name_var = ctk.StringVar(value=collection["name"] if collection else "")
+        ctk.CTkEntry(win, textvariable=name_var).pack(padx=16, fill="x")
+
+        ctk.CTkLabel(win, text="Match images tagged with any of").pack(
+            padx=16, pady=(16, 4), anchor="w")
+        tags_var = ctk.StringVar(
+            value=", ".join(collection["tags_any"]) if collection else ""
+        )
+        ctk.CTkEntry(win, textvariable=tags_var, placeholder_text="nature, minimal").pack(
+            padx=16, fill="x")
+        ctk.CTkLabel(
+            win, text="Tag images from the main window's Tags field first.",
+            text_color="gray60", font=ctk.CTkFont(size=11), wraplength=320,
+        ).pack(padx=16, pady=(6, 0), anchor="w")
+
+        def do_save() -> None:
+            name = name_var.get().strip()
+            tags_any = dedupe_preserve_order([t.strip() for t in tags_var.get().split(",") if t.strip()])
+            if not name or not tags_any:
+                messagebox.showerror(
+                    APP_NAME, "Collection needs a name and at least one tag.", parent=win
+                )
+                return
+            if collection is None:
+                created = {"id": new_id(), "name": name, "tags_any": tags_any}
+                self.cfg["collections"].append(created)
+                self._load_source("collection", created["id"])
+            else:
+                collection["name"] = name
+                collection["tags_any"] = tags_any
+                if self._active_kind == "collection" and self._active_id == collection["id"]:
+                    self._load_source("collection", collection["id"])
+                else:
+                    self._refresh_source_menu()
+            self._flush_save()
+            win.destroy()
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(padx=16, pady=12, fill="x")
+        ctk.CTkButton(btns, text="Save", command=do_save).pack(
+            side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(btns, text="Cancel", fg_color="gray30", hover_color="gray25",
+                      command=win.destroy).pack(side="left", expand=True, fill="x", padx=(4, 0))
+
+    def _edit_active_collection(self) -> None:
+        if self._active_kind != "collection":
+            self._set_status("Select a collection to edit.")
+            return
+        collection = find_collection(self.cfg, self._active_id)
+        if collection is not None:
+            self._open_collection_editor(collection)
+
+    def _delete_active_collection(self) -> None:
+        if self._active_kind != "collection":
+            self._set_status("Select a collection to delete.")
+            return
+        collection = find_collection(self.cfg, self._active_id)
+        if collection is None:
+            return
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Delete collection '{collection['name']}'?\n\n(No image files or tags are deleted.)",
+        ):
+            return
+        self._stop_slideshow()
+        self.cfg["collections"] = [
+            c for c in self.cfg["collections"] if c["id"] != collection["id"]
+        ]
+        if self.cfg.get("playback_source") and self.cfg["playback_source"]["id"] == collection["id"]:
+            self.cfg["playback_source"] = None
+
+        fallback = self._resolve_initial_source()
+        if fallback:
+            self._load_source(*fallback)
+        else:
+            self._load_token += 1
+            self.images, self.index = [], -1
+            self._active_kind, self._active_id = "folder", None
+            self._refresh_source_menu()
+            self.preview.configure(image=None, text="Add a folder to begin")
+            self.meta.configure(text="")
+            self._flush_save()
+
     # ---------------- Favourites / hidden (non-destructive curation) ----------------
 
     def _toggle_favourite(self) -> None:
@@ -1445,6 +1855,22 @@ class DesktopVista(ctk.CTk):
     def _update_hidden_count_label(self) -> None:
         self.hidden_btn.configure(text=f"Hidden ({len(self.cfg.get('hidden', []))})")
 
+    def _update_tags_field(self) -> None:
+        if 0 <= self.index < len(self.images):
+            self.tags_var.set(", ".join(get_tags(self.cfg, self.images[self.index])))
+        else:
+            self.tags_var.set("")
+
+    def _on_tags_apply(self) -> None:
+        if not (0 <= self.index < len(self.images)):
+            return
+        path = self.images[self.index]
+        tags = [t.strip() for t in self.tags_var.get().split(",")]
+        set_tags(self.cfg, path, tags)
+        self.tags_var.set(", ".join(get_tags(self.cfg, path)))
+        self._flush_save()
+        self._set_status("Tags updated.")
+
     def _hide_current(self) -> None:
         if not (0 <= self.index < len(self.images)):
             return
@@ -1464,6 +1890,7 @@ class DesktopVista(ctk.CTk):
             self.preview.configure(image=None, text="No images left in this source")
             self.meta.configure(text="")
             self._update_favourite_button()
+            self._update_tags_field()
         self._set_status(f"Hidden {name}. Use \"Hidden\" to restore it.")
         self._update_hidden_count_label()
         self._flush_save()
@@ -1611,6 +2038,7 @@ class DesktopVista(ctk.CTk):
             )
             self._update_favourite_button()
             self._update_hidden_count_label()
+            self._update_tags_field()
         except Exception as exc:
             log.warning("Preview apply failed: %s", exc)
 

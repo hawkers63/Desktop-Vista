@@ -138,6 +138,14 @@ def test_load_config_valid_values_kept(tmp_path):
         "playback_source": None,
         "power": {"pause_on_battery_saver": True, "pause_on_fullscreen": True},
         "schedule": {"mode": "interval", "daily_times": []},
+        "tags": {},
+        "collections": [],
+        "solar": {
+            "enabled": False,
+            "latitude": None,
+            "longitude": None,
+            "fallback_times": ["06:00", "08:00", "18:00", "21:00"],
+        },
     }
 
 
@@ -594,6 +602,158 @@ def test_is_fullscreen_active_pure_predicate():
     assert dv.is_fullscreen_active(4) is True  # QUNS_PRESENTATION_MODE
     assert dv.is_fullscreen_active(5) is False  # QUNS_ACCEPTS_NOTIFICATIONS
     assert dv.is_fullscreen_active(None) is False
+
+
+# ---------------------------------------------------------------------------
+# v1.5 — tags/collections, solar data model, monitor topology math
+# ---------------------------------------------------------------------------
+
+def test_get_set_tags_roundtrip():
+    # Tags are case-sensitive and deduped only on exact match, with
+    # whitespace trimmed — "Nature" and "nature" are distinct tags.
+    cfg = {"tags": {}}
+    dv.set_tags(cfg, "a.jpg", ["Nature", "  minimal ", "Nature"])
+    assert dv.get_tags(cfg, "a.jpg") == ["Nature", "minimal"]
+
+
+def test_set_tags_empty_list_removes_entry():
+    cfg = {"tags": {"a.jpg": ["x"]}}
+    dv.set_tags(cfg, "a.jpg", [])
+    assert dv.get_tags(cfg, "a.jpg") == []
+    assert "a.jpg" not in cfg["tags"]
+
+
+def test_load_config_collections_valid_kept(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"collections": [{"id": "c1", "name": "Nature", "tags_any": ["nature"]}]}),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["collections"] == [{"id": "c1", "name": "Nature", "tags_any": ["nature"]}]
+
+
+def test_load_config_collections_drops_malformed(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "collections": [
+                    {"id": "c1", "name": "Good", "tags_any": ["x"]},
+                    {"id": "c2", "name": "No tags", "tags_any": []},
+                    {"id": "", "name": "Blank id", "tags_any": ["x"]},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["collections"] == [{"id": "c1", "name": "Good", "tags_any": ["x"]}]
+
+
+def test_resolve_collection_candidate_images_matches_by_tag(tmp_path):
+    folder = tmp_path
+    (folder / "a.jpg").write_bytes(b"x")
+    (folder / "b.jpg").write_bytes(b"x")
+    cfg = {
+        "folders": [str(folder)],
+        "playlists": [],
+        "tags": {str(folder / "a.jpg"): ["nature"]},
+        "collections": [{"id": "c1", "name": "Nature", "tags_any": ["nature"]}],
+    }
+    assert dv.resolve_source_images(cfg, "collection", "c1") == [str(folder / "a.jpg")]
+
+
+def test_resolve_collection_candidate_images_missing_collection_empty():
+    cfg = {"folders": [], "playlists": [], "tags": {}, "collections": []}
+    assert dv.resolve_source_images(cfg, "collection", "gone") == []
+
+
+def test_source_display_label_collection():
+    cfg = {"collections": [{"id": "c1", "name": "Nature", "tags_any": ["nature"]}]}
+    assert dv.source_display_label(cfg, "collection", "c1") == "# Nature"
+
+
+def test_load_config_solar_defaults_when_missing(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["solar"] == {
+        "enabled": False, "latitude": None, "longitude": None,
+        "fallback_times": ["06:00", "08:00", "18:00", "21:00"],
+    }
+
+
+def test_load_config_solar_valid_coordinates_kept(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"solar": {"enabled": True, "latitude": 51.5, "longitude": -0.1}}),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["solar"]["enabled"] is True
+    assert cfg["solar"]["latitude"] == 51.5
+    assert cfg["solar"]["longitude"] == -0.1
+
+
+def test_load_config_solar_out_of_range_coordinates_rejected(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"solar": {"latitude": 999, "longitude": float("nan")}}), encoding="utf-8"
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["solar"]["latitude"] is None
+    assert cfg["solar"]["longitude"] is None
+
+
+def test_load_config_solar_bad_fallback_times_falls_back_to_default(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"solar": {"fallback_times": ["08:00"]}}), encoding="utf-8"  # only 1, need 4
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["solar"]["fallback_times"] == ["06:00", "08:00", "18:00", "21:00"]
+
+
+def test_enumerate_monitors_returns_list_type():
+    # Real hardware-dependent; just assert the contract (list, never raises).
+    result = dv.enumerate_monitors()
+    assert isinstance(result, list)
+
+
+def test_compute_topology_layout_single_monitor_fills_box():
+    monitors = [{"device": "M1", "rect": (0, 0, 1920, 1080), "primary": True}]
+    layout = dv.compute_topology_layout(monitors, 200, 100)
+    assert len(layout) == 1
+    box = layout[0]["layout"]
+    assert box["x"] == 0 and box["y"] == 0
+    assert box["w"] <= 200 and box["h"] <= 100
+
+
+def test_compute_topology_layout_two_monitors_relative_position():
+    # Monitor 2 sits to the right of monitor 1 — layout must preserve that.
+    monitors = [
+        {"device": "M1", "rect": (0, 0, 1920, 1080), "primary": True},
+        {"device": "M2", "rect": (1920, 0, 3840, 1080), "primary": False},
+    ]
+    layout = dv.compute_topology_layout(monitors, 400, 100)
+    assert layout[0]["layout"]["x"] < layout[1]["layout"]["x"]
+
+
+def test_compute_topology_layout_empty_returns_empty():
+    assert dv.compute_topology_layout([], 200, 100) == []
+
+
+def test_compute_topology_layout_negative_coordinates_handled():
+    """A monitor positioned left of/above the primary (negative coords)
+    must still map into non-negative box-local pixels."""
+    monitors = [
+        {"device": "M1", "rect": (0, 0, 1920, 1080), "primary": True},
+        {"device": "M2", "rect": (-1920, 0, 0, 1080), "primary": False},
+    ]
+    layout = dv.compute_topology_layout(monitors, 400, 100)
+    assert all(m["layout"]["x"] >= 0 and m["layout"]["y"] >= 0 for m in layout)
+    assert layout[1]["layout"]["x"] < layout[0]["layout"]["x"]
 
 
 # ---------------------------------------------------------------------------

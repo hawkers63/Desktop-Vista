@@ -97,18 +97,30 @@ exact-time-boundary cases).
 
 ---
 
-## v1.5 — Foundations for v2.0
+## v1.5 — Foundations for v2.0 ✅ Done (2026-09-09)
 
 Goal: lay organisational and topology groundwork before the multi-monitor COM rewrite, without touching the wallpaper-apply path yet.
 
-| Priority | Item |
-| :---: | :--- |
-| P0 | Read-only monitor topology (`GetMonitorDevicePathAt`, `GetMonitorRECT`) surfaced in the UI — no per-monitor apply yet |
-| P1 | Smart tags + virtual collections (non-destructive metadata, cross-path, no file duplication) |
-| P1 | Solar/time-of-day cycle groundwork (Dawn/Day/Dusk/Night scheduling model, no live output changes required yet) |
-| P2 | Lock Screen WinRT setter — research spike only |
+| Priority | Item | Status |
+| :---: | :--- | :--- |
+| P0 | Read-only monitor topology surfaced in the UI — no per-monitor apply yet | ✅ Done — via `EnumDisplayMonitors`/`GetMonitorInfoW`, not `IDesktopWallpaper`'s `GetMonitorDevicePathAt`/`GetMonitorRECT` (COM isn't needed just to enumerate read-only; that pairing is deferred to v2.0 alongside the COM apply path itself, so device-path identity — stable across docking changes — arrives together with the code that actually needs it) |
+| P1 | Smart tags + virtual collections (non-destructive metadata, cross-path, no file duplication) | ✅ Done |
+| P1 | Solar/time-of-day cycle groundwork (Dawn/Day/Dusk/Night scheduling model, no live output changes required yet) | ✅ Done — data model + validation only, no UI and no scheduler wiring (out of scope for "groundwork") |
+| P2 | Lock Screen WinRT setter — research spike only | ❌ Not started |
 
-**Exit criteria:** the monitor strip in the UI accurately reflects the real arrangement; a tag can be applied across images from two different drives and filtered into a virtual collection.
+**Implementation note:** tags/collections are a third playback-source kind
+(`kind: "collection"`) alongside folders and playlists — a collection's
+candidate images are every tagged image inside any known folder or playlist
+folder, matched on tags-any, then hidden-filtered the same way every other
+source is. The monitor topology math (union-rect scaling, negative-coordinate
+handling) is a pure, unit-tested function so it's reused as-is once v2.0 needs
+the same layout for per-monitor assignment cards.
+
+**Exit criteria:** the monitor strip in the UI accurately reflects the real
+arrangement (✅ on this machine's single display; multi-monitor layout math
+unit-tested for two-monitor and negative-coordinate cases, not visually
+confirmed on real multi-monitor hardware); a tag can be applied across images
+from two different drives and filtered into a virtual collection (✅).
 
 ---
 

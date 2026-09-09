@@ -38,5 +38,21 @@
   "schedule": {
     "mode": "interval",
     "daily_times": []
+  },
+  "tags": {
+    "D:\\Wallpapers\\Landscapes\\example_widescreen.jpg": ["nature", "widescreen"]
+  },
+  "collections": [
+    {
+      "id": "f6e5d4c3b2a1",
+      "name": "Nature",
+      "tags_any": ["nature"]
+    }
+  ],
+  "solar": {
+    "enabled": false,
+    "latitude": null,
+    "longitude": null,
+    "fallback_times": ["06:00", "08:00", "18:00", "21:00"]
   }
 }
