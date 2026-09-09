@@ -54,6 +54,9 @@ The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to previ
 - **Offline-aware folders** — folders on a disconnected drive show `(offline)` in the folder dropdown, and an unattended slideshow skips missing files instead of stopping on an error dialog
 - **Branded icon** — the window and tray icon use the Desktop Vista glyph (`icon/desktop_vista.ico`), with a procedural fallback if the asset is ever missing
 - **Tray Next/Previous apply the wallpaper** — not just the in-window preview, so the tray menu does what its labels say
+- **Playlists** — group folders from any drives into one named, deduplicated slideshow source ("All My Drives", v1.3)
+- **Favourites & Hide** — non-destructive per-image curation; hidden images are filtered out of playback everywhere without touching the source file
+- **Drive reconnect watcher** — offline badges and empty sources refresh automatically on a 15-second poll
 
 ---
 
@@ -142,6 +145,10 @@ Settings are stored in `config.json` beside `desktop_vista.py`. Use [`config.exa
 | `tray.enabled` | `boolean` | Start the system tray icon (default `true`) |
 | `tray.close_to_tray` | `boolean` | Closing the window hides to tray instead of quitting (default `true`) |
 | `tray.run_at_startup` | `boolean` | Launch Desktop Vista minimised at Windows login (Run key); reflects the actual registry state, not just this file (default `false`) |
+| `playlists` | `[{id, name, folders}]` | Named playlists — each aggregates images from its listed folders (union, deduplicated) |
+| `favourites` | `string[]` | Favourited image paths (non-destructive) |
+| `hidden` | `string[]` | Hidden image paths — filtered out of playback everywhere (non-destructive) |
+| `playback_source` | `{kind, id} \| null` | The active source: `kind` is `"folder"` or `"playlist"`, `id` is a folder path or playlist id |
 
 Example (placeholders only):
 

@@ -129,7 +129,13 @@ def test_load_config_valid_values_kept(tmp_path):
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps(payload), encoding="utf-8")
     cfg = dv.load_config(cfg_path)
-    assert cfg == payload
+    assert cfg == {
+        **payload,
+        "playlists": [],
+        "favourites": [],
+        "hidden": [],
+        "playback_source": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +349,159 @@ def test_folder_display_label_online_unchanged(tmp_path):
 def test_folder_display_label_offline_badged(tmp_path):
     folder = str(tmp_path / "gone")
     assert dv.folder_display_label(folder) == folder + dv.OFFLINE_SUFFIX
+
+
+# ---------------------------------------------------------------------------
+# v1.3 — playlists, favourites/hidden, playback_source
+# ---------------------------------------------------------------------------
+
+def test_dedupe_preserve_order():
+    assert dv.dedupe_preserve_order(["b", "a", "b", "c", "a"]) == ["b", "a", "c"]
+
+
+def test_load_config_playlists_valid_kept(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {"playlists": [{"id": "p1", "name": "Workday", "folders": ["C:\\A", "D:\\B"]}]}
+        ),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["playlists"] == [{"id": "p1", "name": "Workday", "folders": ["C:\\A", "D:\\B"]}]
+
+
+def test_load_config_playlists_drops_malformed_entries(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "playlists": [
+                    {"id": "p1", "name": "Good", "folders": ["C:\\A"]},
+                    {"id": "p1", "name": "Duplicate id", "folders": []},  # dup id, dropped
+                    {"name": "Missing id", "folders": []},
+                    {"id": "p2", "name": "", "folders": []},  # blank name
+                    {"id": "p3", "name": "Bad folders", "folders": [1, 2]},
+                    "not-a-dict",
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["playlists"] == [{"id": "p1", "name": "Good", "folders": ["C:\\A"]}]
+
+
+def test_load_config_favourites_hidden_kept_and_deduped(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"favourites": ["a.jpg", "b.jpg", "a.jpg"], "hidden": ["c.jpg"]}),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["favourites"] == ["a.jpg", "b.jpg"]
+    assert cfg["hidden"] == ["c.jpg"]
+
+
+def test_load_config_favourites_invalid_type_falls_back(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"favourites": "not-a-list"}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["favourites"] == []
+
+
+def test_load_config_playback_source_valid_folder_kept(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {"folders": ["C:\\A"], "playback_source": {"kind": "folder", "id": "C:\\A"}}
+        ),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["playback_source"] == {"kind": "folder", "id": "C:\\A"}
+
+
+def test_load_config_playback_source_dangling_reference_falls_back(tmp_path):
+    """A playback_source pointing at a folder that no longer exists in
+    'folders' (e.g. removed since) must not be trusted verbatim."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"folders": [], "playback_source": {"kind": "folder", "id": "C:\\Gone"}}),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["playback_source"] is None
+
+
+def test_load_config_playback_source_playlist_reference(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "playlists": [{"id": "p1", "name": "Workday", "folders": []}],
+                "playback_source": {"kind": "playlist", "id": "p1"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["playback_source"] == {"kind": "playlist", "id": "p1"}
+
+
+def test_resolve_source_images_playlist_unions_folders(tmp_path):
+    f1, f2 = tmp_path / "f1", tmp_path / "f2"
+    f1.mkdir()
+    f2.mkdir()
+    (f1 / "a.jpg").write_bytes(b"x")
+    (f2 / "b.jpg").write_bytes(b"x")
+    cfg = {
+        "playlists": [{"id": "p1", "name": "Both", "folders": [str(f1), str(f2)]}],
+        "hidden": [],
+    }
+    images = dv.resolve_source_images(cfg, "playlist", "p1")
+    assert images == [str(f1 / "a.jpg"), str(f2 / "b.jpg")]
+
+
+def test_resolve_source_images_filters_hidden(tmp_path):
+    folder = tmp_path
+    (folder / "a.jpg").write_bytes(b"x")
+    (folder / "b.jpg").write_bytes(b"x")
+    cfg = {"hidden": [str(folder / "b.jpg")]}
+    images = dv.resolve_source_images(cfg, "folder", str(folder))
+    assert images == [str(folder / "a.jpg")]
+
+
+def test_resolve_source_images_missing_playlist_returns_empty():
+    assert dv.resolve_source_images({"playlists": [], "hidden": []}, "playlist", "gone") == []
+
+
+def test_set_membership_add_and_remove():
+    cfg = {"favourites": ["a.jpg"]}
+    dv.set_membership(cfg, "favourites", "b.jpg", True)
+    assert cfg["favourites"] == ["a.jpg", "b.jpg"]
+    dv.set_membership(cfg, "favourites", "a.jpg", False)
+    assert cfg["favourites"] == ["b.jpg"]
+    # Removing a non-member, or adding an existing member, is a no-op.
+    dv.set_membership(cfg, "favourites", "z.jpg", False)
+    assert cfg["favourites"] == ["b.jpg"]
+    dv.set_membership(cfg, "favourites", "b.jpg", True)
+    assert cfg["favourites"] == ["b.jpg"]
+
+
+def test_source_display_label_playlist_all_online(tmp_path):
+    (tmp_path / "sub").mkdir()
+    cfg = {"playlists": [{"id": "p1", "name": "Workday", "folders": [str(tmp_path / "sub")]}]}
+    assert dv.source_display_label(cfg, "playlist", "p1") == "▶ Workday"
+
+
+def test_source_display_label_playlist_partial_offline():
+    cfg = {
+        "playlists": [
+            {"id": "p1", "name": "Workday", "folders": ["C:\\gone1", "C:\\gone2"]}
+        ]
+    }
+    assert dv.source_display_label(cfg, "playlist", "p1") == "▶ Workday  (0/2 drives online)"
 
 
 # ---------------------------------------------------------------------------

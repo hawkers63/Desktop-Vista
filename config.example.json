@@ -12,5 +12,23 @@
     "enabled": true,
     "close_to_tray": true,
     "run_at_startup": false
+  },
+  "playlists": [
+    {
+      "id": "a1b2c3d4e5f6",
+      "name": "Workday",
+      "folders": [
+        "D:\\Wallpapers\\Landscapes",
+        "E:\\Media\\Desktop Backgrounds"
+      ]
+    }
+  ],
+  "favourites": [
+    "D:\\Wallpapers\\Landscapes\\example_widescreen.jpg"
+  ],
+  "hidden": [],
+  "playback_source": {
+    "kind": "folder",
+    "id": "D:\\Wallpapers\\Landscapes"
   }
 }

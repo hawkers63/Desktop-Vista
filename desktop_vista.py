@@ -8,7 +8,7 @@
 # See the LICENSE file in the project root for the full proprietary notice.
 """
 Desktop Vista  —  All my drives. One perfect view.
-Version 1.2.1  (September 2026)
+Version 1.3.0  (September 2026)
 
 A lightweight Windows wallpaper manager.
 
@@ -61,9 +61,19 @@ v1.2.1 hardening addendum (see notes/notes_004.txt review):
     - "Start with Windows" reflects whether the registry command still
       matches this install, not just whether some value exists
 
-Planned for v1.3+: cross-drive playlists, then power/context awareness,
-monitor-topology groundwork, and finally multi-monitor (IDesktopWallpaper
-COM) in v2.0 — see ROADMAP.md.
+New in v1.3 "All My Drives":
+    - Playlists: named groups of folders played as one aggregated,
+      deduplicated source, spanning any number of drives
+    - Favourites (♡) and Hide (🙈) — non-destructive; hidden images are
+      filtered out of playback everywhere without touching the source file
+    - Drive reconnect watcher: offline badges and empty sources refresh on
+      a 15s poll without needing a manual reselect
+    - Playback source generalised to folder-or-playlist (`playback_source`
+      in config); `current_folder` kept in sync for older readers
+
+Planned for v1.4+: power/context awareness, then monitor-topology
+groundwork, and finally multi-monitor (IDesktopWallpaper COM) in v2.0 —
+see ROADMAP.md.
 """
 
 from __future__ import annotations
@@ -79,6 +89,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -118,7 +129,7 @@ log = logging.getLogger("desktop_vista")
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Desktop Vista"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 TAGLINE = "All my drives. One perfect view."
 
 # Frozen (PyInstaller) builds extract bundled files under a temporary
@@ -178,10 +189,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "shuffle": False,
     "interval_custom_seconds": None,
     "tray": {"enabled": True, "close_to_tray": True, "run_at_startup": False},
+    # v1.3 "All My Drives" — additive; a config with none of these still
+    # loads and behaves exactly as it did under v1.2.
+    "playlists": [],           # [{"id", "name", "folders": [path, ...]}]
+    "favourites": [],          # [image path, ...] — non-destructive
+    "hidden": [],              # [image path, ...] — non-destructive
+    "playback_source": None,   # {"kind": "folder"|"playlist", "id": str} or None
 }
 
 STARTUP_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "DesktopVista"
+
+RECONNECT_POLL_MS = 15_000
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +240,76 @@ def is_folder_online(folder: str) -> bool:
 def folder_display_label(folder: str) -> str:
     """Decorate *folder* with an offline badge when its drive is unreachable."""
     return folder if is_folder_online(folder) else f"{folder}{OFFLINE_SUFFIX}"
+
+
+def new_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def find_playlist(cfg: dict, playlist_id: str) -> dict | None:
+    return next((p for p in cfg.get("playlists", []) if p.get("id") == playlist_id), None)
+
+
+def playlist_folder_status(playlist: dict) -> tuple[int, int]:
+    """Return (online_count, total_count) for a playlist's member folders."""
+    folders = playlist.get("folders", [])
+    online = sum(1 for f in folders if is_folder_online(f))
+    return online, len(folders)
+
+
+def source_display_label(cfg: dict, kind: str, source_id: str) -> str:
+    """Human-readable label for a folder or playlist source, offline-badged."""
+    if kind == "playlist":
+        playlist = find_playlist(cfg, source_id)
+        if playlist is None:
+            return f"(missing playlist {source_id})"
+        online, total = playlist_folder_status(playlist)
+        name = f"▶ {playlist.get('name', '(unnamed)')}"
+        if total and online < total:
+            return f"{name}  ({online}/{total} drives online)"
+        return name
+    return folder_display_label(source_id)
+
+
+def resolve_source_images(cfg: dict, kind: str, source_id: str) -> list[str]:
+    """
+    Return the hidden-filtered image list for a folder or playlist source.
+
+    Playlist images are the union of their member folders' images, folder
+    order preserved, deduplicated (a folder listed twice contributes once).
+    """
+    if kind == "playlist":
+        playlist = find_playlist(cfg, source_id)
+        folders = playlist.get("folders", []) if playlist else []
+        images: list[str] = []
+        for folder in dedupe_preserve_order(folders):
+            images.extend(list_images(folder))
+        images = dedupe_preserve_order(images)
+    else:
+        images = list_images(source_id)
+    hidden = set(cfg.get("hidden", []))
+    return [img for img in images if img not in hidden]
+
+
+def set_membership(cfg: dict, list_key: str, path: str, member: bool) -> None:
+    """Add/remove *path* from cfg[list_key] (favourites/hidden), preserving order."""
+    items = list(cfg.get(list_key, []))
+    is_member = path in items
+    if member and not is_member:
+        items.append(path)
+    elif not member and is_member:
+        items.remove(path)
+    cfg[list_key] = items
 
 
 def resolve_interval_seconds(interval_key: str, custom_seconds: Any) -> int:
@@ -310,6 +399,55 @@ def _validate_config(raw: dict) -> dict[str, Any]:
     else:
         log.warning("Invalid 'tray' in config; using default.")
         cfg["tray"] = dict(DEFAULT_CONFIG["tray"])
+
+    # ---- v1.3 additions (all additive; absent/invalid -> safe defaults) ----
+
+    playlists_raw = raw.get("playlists", [])
+    valid_playlists: list[dict] = []
+    seen_ids: set[str] = set()
+    if isinstance(playlists_raw, list):
+        for entry in playlists_raw:
+            if not isinstance(entry, dict):
+                continue
+            pid, name, folders = entry.get("id"), entry.get("name"), entry.get("folders")
+            if (
+                isinstance(pid, str) and pid and pid not in seen_ids
+                and isinstance(name, str) and name.strip()
+                and isinstance(folders, list) and all(isinstance(f, str) for f in folders)
+            ):
+                seen_ids.add(pid)
+                valid_playlists.append(
+                    {"id": pid, "name": name, "folders": dedupe_preserve_order(folders)}
+                )
+            else:
+                log.warning("Dropping invalid playlist entry in config: %r", entry)
+    else:
+        log.warning("Invalid 'playlists' in config; using default.")
+    cfg["playlists"] = valid_playlists
+
+    for list_key in ("favourites", "hidden"):
+        raw_list = raw.get(list_key, [])
+        if isinstance(raw_list, list) and all(isinstance(p, str) for p in raw_list):
+            cfg[list_key] = dedupe_preserve_order(raw_list)
+        else:
+            log.warning("Invalid '%s' in config; using default.", list_key)
+            cfg[list_key] = []
+
+    playback_source = raw.get("playback_source")
+    if (
+        isinstance(playback_source, dict)
+        and playback_source.get("kind") in ("folder", "playlist")
+        and isinstance(playback_source.get("id"), str)
+        and playback_source.get("id")
+    ):
+        kind, sid = playback_source["kind"], playback_source["id"]
+        valid_ref = (
+            (kind == "folder" and sid in cfg["folders"])
+            or (kind == "playlist" and find_playlist(cfg, sid) is not None)
+        )
+        cfg["playback_source"] = {"kind": kind, "id": sid} if valid_ref else None
+    else:
+        cfg["playback_source"] = None
 
     return cfg
 
@@ -592,7 +730,10 @@ class DesktopVista(ctk.CTk):
         self.cfg = load_config()
         self.images: list[str] = []
         self.index: int = -1
-        self._folder_label_to_path: dict[str, str] = {}
+        self._active_kind: str = "folder"
+        self._active_id: Optional[str] = None
+        self._source_label_to_key: dict[str, tuple[str, str]] = {}
+        self._reconnect_job: Any = None
         self._preview_ref = None  # keep CTkImage alive
         self._slideshow_job: Any = None
         self._save_job: Any = None
@@ -617,6 +758,7 @@ class DesktopVista(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close_request)
         self._init_tray()
         self._sync_startup_state()
+        self._start_reconnect_watcher()
         if self._start_minimized:
             if self._tray_is_ready():
                 self.withdraw()
@@ -632,80 +774,104 @@ class DesktopVista(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # ---- Left sidebar: control panel ----
-        side = ctk.CTkFrame(self, width=300, corner_radius=12)
+        # ---- Left sidebar: scrollable control panel ----
+        # A CTkScrollableFrame rather than a fixed-height CTkFrame: v1.3+
+        # keeps adding sections (playlists, and later power/schedule,
+        # monitor topology) and a fixed sidebar would either clip them or
+        # force renumbering every row index each time. `row()` hands out
+        # sequential grid rows so new sections just call it again.
+        side = ctk.CTkScrollableFrame(self, width=300, corner_radius=12)
         side.grid(row=0, column=0, sticky="nsw", padx=(12, 6), pady=12)
-        side.grid_propagate(False)
         side.grid_columnconfigure(0, weight=1)
+        self._sidebar_row = 0
+
+        def row() -> int:
+            r = self._sidebar_row
+            self._sidebar_row += 1
+            return r
 
         ctk.CTkLabel(side, text=APP_NAME, font=ctk.CTkFont(size=22, weight="bold")).grid(
-            row=0, column=0, padx=16, pady=(16, 0), sticky="w")
+            row=row(), column=0, padx=16, pady=(16, 0), sticky="w")
         ctk.CTkLabel(side, text=TAGLINE, font=ctk.CTkFont(size=12), text_color="gray70").grid(
-            row=1, column=0, padx=16, pady=(0, 14), sticky="w")
+            row=row(), column=0, padx=16, pady=(0, 14), sticky="w")
 
-        # Folders
-        ctk.CTkLabel(side, text="WALLPAPER FOLDERS", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=2, column=0, padx=16, sticky="w")
-        self.folder_var = ctk.StringVar(value="(no folders yet)")
-        self.folder_menu = ctk.CTkOptionMenu(
-            side, variable=self.folder_var, values=["(no folders yet)"],
-            command=self._on_folder_selected, dynamic_resizing=False)
-        self.folder_menu.grid(row=3, column=0, padx=16, pady=(4, 6), sticky="ew")
+        # Playback source: folders and playlists share one dropdown — the
+        # active source, whichever kind it is, drives preview/nav/slideshow.
+        ctk.CTkLabel(side, text="PLAYBACK SOURCE", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="gray60").grid(row=row(), column=0, padx=16, sticky="w")
+        self.source_var = ctk.StringVar(value="(no sources yet)")
+        self.source_menu = ctk.CTkOptionMenu(
+            side, variable=self.source_var, values=["(no sources yet)"],
+            command=self._on_source_selected, dynamic_resizing=False)
+        self.source_menu.grid(row=row(), column=0, padx=16, pady=(4, 6), sticky="ew")
 
         fbtns = ctk.CTkFrame(side, fg_color="transparent")
-        fbtns.grid(row=4, column=0, padx=16, sticky="ew")
+        fbtns.grid(row=row(), column=0, padx=16, sticky="ew")
         fbtns.grid_columnconfigure((0, 1), weight=1)
         ctk.CTkButton(fbtns, text="+ Add folder", command=self._add_folder).grid(
             row=0, column=0, padx=(0, 4), sticky="ew")
         ctk.CTkButton(fbtns, text="Remove", fg_color="gray30", hover_color="gray25",
                       command=self._remove_folder).grid(row=0, column=1, padx=(4, 0), sticky="ew")
 
+        # Playlists: named groups of folders, aggregated as one source.
+        ctk.CTkLabel(side, text="PLAYLISTS", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(14, 0), sticky="w")
+        ctk.CTkButton(side, text="+ New Playlist",
+                      command=lambda: self._open_playlist_editor()).grid(
+            row=row(), column=0, padx=16, pady=(4, 4), sticky="ew")
+        pbtns = ctk.CTkFrame(side, fg_color="transparent")
+        pbtns.grid(row=row(), column=0, padx=16, sticky="ew")
+        pbtns.grid_columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(pbtns, text="Edit", fg_color="gray30", hover_color="gray25",
+                      command=self._edit_active_playlist).grid(row=0, column=0, padx=(0, 4), sticky="ew")
+        ctk.CTkButton(pbtns, text="Delete", fg_color="gray30", hover_color="gray25",
+                      command=self._delete_active_playlist).grid(row=0, column=1, padx=(4, 0), sticky="ew")
+
         # Fit style
         ctk.CTkLabel(side, text="FIT STYLE", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=5, column=0, padx=16, pady=(18, 0), sticky="w")
+                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(18, 0), sticky="w")
         self.style_var = ctk.StringVar(value=self.cfg["style"])
         ctk.CTkOptionMenu(side, variable=self.style_var, values=list(WALLPAPER_STYLES),
                           command=self._on_style_changed).grid(
-            row=6, column=0, padx=16, pady=(4, 0), sticky="ew")
+            row=row(), column=0, padx=16, pady=(4, 0), sticky="ew")
 
         # Primary action
         self.set_btn = ctk.CTkButton(
             side, text="Set as Wallpaper", height=44,
             font=ctk.CTkFont(size=15, weight="bold"), command=self._set_wallpaper)
-        self.set_btn.grid(row=7, column=0, padx=16, pady=(22, 0), sticky="ew")
+        self.set_btn.grid(row=row(), column=0, padx=16, pady=(22, 0), sticky="ew")
 
         # Slideshow
         ctk.CTkLabel(side, text="SLIDESHOW", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=8, column=0, padx=16, pady=(24, 0), sticky="w")
+                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
         self.interval_var = ctk.StringVar(value=self.cfg["interval"])
         ctk.CTkOptionMenu(side, variable=self.interval_var,
                           values=list(SLIDESHOW_INTERVALS) + [CUSTOM_INTERVAL_LABEL],
                           command=self._on_interval_changed).grid(
-            row=9, column=0, padx=16, pady=(4, 6), sticky="ew")
+            row=row(), column=0, padx=16, pady=(4, 6), sticky="ew")
         self.shuffle_var = ctk.BooleanVar(value=self.cfg["shuffle"])
         ctk.CTkSwitch(side, text="Shuffle", variable=self.shuffle_var,
-                      command=self._on_shuffle_changed).grid(row=10, column=0, padx=16, sticky="w")
+                      command=self._on_shuffle_changed).grid(row=row(), column=0, padx=16, sticky="w")
         self.slide_btn = ctk.CTkButton(
             side, text="Start Slideshow", height=40, fg_color="#2e7d32", hover_color="#27682a",
             command=self._toggle_slideshow)
-        self.slide_btn.grid(row=11, column=0, padx=16, pady=(12, 0), sticky="ew")
+        self.slide_btn.grid(row=row(), column=0, padx=16, pady=(12, 0), sticky="ew")
 
         # Startup
         ctk.CTkLabel(side, text="STARTUP", font=ctk.CTkFont(size=11, weight="bold"),
-                     text_color="gray60").grid(row=12, column=0, padx=16, pady=(24, 0), sticky="w")
+                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
         self.startup_var = ctk.BooleanVar(value=False)
         self.startup_switch = ctk.CTkSwitch(
             side, text="Start with Windows (minimised)", variable=self.startup_var,
             command=self._on_startup_toggle)
-        self.startup_switch.grid(row=13, column=0, padx=16, pady=(4, 0), sticky="w")
+        self.startup_switch.grid(row=row(), column=0, padx=16, pady=(4, 0), sticky="w")
         if winreg is None or sys.platform != "win32":
             self.startup_switch.configure(state="disabled")
 
         # Status
-        side.grid_rowconfigure(14, weight=1)
         self.status = ctk.CTkLabel(side, text="Ready.", text_color="gray60",
                                    font=ctk.CTkFont(size=11), wraplength=260, justify="left")
-        self.status.grid(row=15, column=0, padx=16, pady=(0, 14), sticky="sw")
+        self.status.grid(row=row(), column=0, padx=16, pady=(20, 14), sticky="w")
 
         # ---- Right main area: the canvas ----
         self.main = ctk.CTkFrame(self, corner_radius=12)
@@ -721,11 +887,23 @@ class DesktopVista(ctk.CTk):
         self.meta.grid(row=1, column=0, padx=16, sticky="ew")
 
         nav = ctk.CTkFrame(self.main, fg_color="transparent")
-        nav.grid(row=2, column=0, pady=(8, 16))
+        nav.grid(row=2, column=0, pady=(8, 4))
         ctk.CTkButton(nav, text="◀  Previous", width=130, command=self._prev).grid(row=0, column=0, padx=6)
         ctk.CTkButton(nav, text="Random", width=110, fg_color="gray30", hover_color="gray25",
                       command=self._random).grid(row=0, column=1, padx=6)
         ctk.CTkButton(nav, text="Next  ▶", width=130, command=self._next).grid(row=0, column=2, padx=6)
+
+        # Favourite / hide — non-destructive curation of the active source
+        curate = ctk.CTkFrame(self.main, fg_color="transparent")
+        curate.grid(row=3, column=0, pady=(0, 16))
+        self.fav_btn = ctk.CTkButton(curate, text="♡ Favourite", width=130, fg_color="gray30",
+                                      hover_color="gray25", command=self._toggle_favourite)
+        self.fav_btn.grid(row=0, column=0, padx=6)
+        ctk.CTkButton(curate, text="🙈 Hide", width=110, fg_color="gray30", hover_color="gray25",
+                      command=self._hide_current).grid(row=0, column=1, padx=6)
+        self.hidden_btn = ctk.CTkButton(curate, text="Hidden (0)", width=130, fg_color="gray30",
+                                         hover_color="gray25", command=self._open_hidden_manager)
+        self.hidden_btn.grid(row=0, column=2, padx=6)
 
         # Keyboard shortcuts
         self.bind("<Left>", lambda e: self._prev())
@@ -737,6 +915,9 @@ class DesktopVista(ctk.CTk):
         self.bind("<Escape>", lambda e: self._stop_slideshow())
         self.bind("r", lambda e: self._random())
         self.bind("R", lambda e: self._random())
+        self.bind("f", lambda e: self._toggle_favourite())
+        self.bind("F", lambda e: self._toggle_favourite())
+        self.bind("h", lambda e: self._hide_current())
 
         # Dynamic 16:9 preview sizing
         self.preview.bind("<Configure>", self._on_preview_configure)
@@ -792,102 +973,113 @@ class DesktopVista(ctk.CTk):
 
     # ---------------- State ----------------
 
-    def _restore_state(self) -> None:
-        """Load folder without showing, then restore last image and show once."""
-        self._refresh_folder_menu()
-        folder = self.cfg.get("current_folder")
-        if folder and folder in self.cfg["folders"]:
-            self._load_folder(folder, show=False)
-            last = self.cfg.get("current_image")
-            if last in self.images:
-                self.index = self.images.index(last)
-            elif self.images:
-                self.index = 0
-            if self.images:
-                self._show_current()
-            else:
-                self._flush_save()
-        elif self.cfg["folders"]:
-            self._load_folder(self.cfg["folders"][0], show=True)
-
-    # ---------------- Folders ----------------
-
-    def _refresh_folder_menu(self) -> None:
-        """Rebuild the folder dropdown, badging any currently-offline folders."""
-        folders = self.cfg["folders"]
-        if folders:
-            labels = [folder_display_label(f) for f in folders]
-            self._folder_label_to_path = dict(zip(labels, folders))
-            self.folder_menu.configure(values=labels)
-            current = self.cfg.get("current_folder")
-            if current not in folders:
-                current = folders[0]
-            self.folder_var.set(folder_display_label(current))
-        else:
-            self._folder_label_to_path = {}
-            self.folder_menu.configure(values=["(no folders yet)"])
-            self.folder_var.set("(no folders yet)")
-
-    def _add_folder(self) -> None:
-        chosen = filedialog.askdirectory(title="Choose a wallpaper folder")
-        if not chosen:
-            return
-        chosen = os.path.normpath(chosen)
-        if chosen not in self.cfg["folders"]:
-            self.cfg["folders"].append(chosen)
-        self._load_folder(chosen)
-
-    def _remove_folder(self) -> None:
-        label = self.folder_var.get()
-        folder = self._folder_label_to_path.get(label, label)
-        if folder not in self.cfg["folders"]:
-            return
-        if not messagebox.askyesno(
-            APP_NAME,
-            f"Remove this folder from Desktop Vista?\n\n{folder}\n\n(No files are deleted.)",
-        ):
-            return
-        self._stop_slideshow()
-        self.cfg["folders"].remove(folder)
+    def _resolve_initial_source(self) -> Optional[tuple[str, str]]:
+        """Pick which source to load on startup: the saved playback_source,
+        falling back to legacy current_folder, then the first known folder
+        or playlist, in that order of preference."""
+        ps = self.cfg.get("playback_source")
+        if ps:
+            kind, sid = ps["kind"], ps["id"]
+            if kind == "folder" and sid in self.cfg["folders"]:
+                return kind, sid
+            if kind == "playlist" and find_playlist(self.cfg, sid) is not None:
+                return kind, sid
+        current_folder = self.cfg.get("current_folder")
+        if current_folder and current_folder in self.cfg["folders"]:
+            return "folder", current_folder
         if self.cfg["folders"]:
-            self._load_folder(self.cfg["folders"][0])
+            return "folder", self.cfg["folders"][0]
+        if self.cfg["playlists"]:
+            return "playlist", self.cfg["playlists"][0]["id"]
+        return None
+
+    def _restore_state(self) -> None:
+        """Load the saved source without showing, then restore last image and show once."""
+        initial = self._resolve_initial_source()
+        if initial is None:
+            self._refresh_source_menu()
+            return
+        kind, source_id = initial
+        self._load_source(kind, source_id, show=False)
+        last = self.cfg.get("current_image")
+        if last in self.images:
+            self.index = self.images.index(last)
+        elif self.images:
+            self.index = 0
+        if self.images:
+            self._show_current()
         else:
-            self._load_token += 1
-            self.images, self.index = [], -1
-            self._shuffle_order = []
-            self._shuffle_cursor = 0
-            self.cfg["current_folder"] = None
-            self.cfg["current_image"] = None
-            self._refresh_folder_menu()
-            self.preview.configure(image=None, text="Add a folder to begin")
-            self.meta.configure(text="")
             self._flush_save()
 
-    def _on_folder_selected(self, label: str) -> None:
-        folder = self._folder_label_to_path.get(label)
-        if folder and folder in self.cfg["folders"]:
-            self._load_folder(folder)
+    # ---------------- Playback source: folders + playlists ----------------
 
-    def _load_folder(self, folder: str, show: bool = True) -> None:
-        self._flush_save()  # persist previous folder/image before switching
-        # Invalidate any in-flight preview load from the previous folder
-        # immediately, even if this folder turns out to have no images —
-        # otherwise a late callback for the old folder could still land and
+    def _refresh_source_menu(self) -> None:
+        """Rebuild the source dropdown (folders + playlists), badging
+        offline folders/playlists without user action."""
+        labels: list[str] = []
+        mapping: dict[str, tuple[str, str]] = {}
+        for folder in self.cfg["folders"]:
+            label = folder_display_label(folder)
+            labels.append(label)
+            mapping[label] = ("folder", folder)
+        for playlist in self.cfg["playlists"]:
+            label = source_display_label(self.cfg, "playlist", playlist["id"])
+            labels.append(label)
+            mapping[label] = ("playlist", playlist["id"])
+        self._source_label_to_key = mapping
+
+        if not labels:
+            self.source_menu.configure(values=["(no sources yet)"])
+            self.source_var.set("(no sources yet)")
+            return
+
+        self.source_menu.configure(values=labels)
+        current_label = next(
+            (
+                label for label, (kind, sid) in mapping.items()
+                if kind == self._active_kind and sid == self._active_id
+            ),
+            None,
+        )
+        # Active source no longer exists (deleted/renamed elsewhere) — the
+        # dropdown must still show something valid.
+        self.source_var.set(current_label if current_label is not None else labels[0])
+
+    def _on_source_selected(self, label: str) -> None:
+        key = self._source_label_to_key.get(label)
+        if key is not None:
+            self._load_source(*key)
+
+    def _load_source(self, kind: str, source_id: str, show: bool = True) -> None:
+        self._flush_save()  # persist the previous source/image before switching
+        # Invalidate any in-flight preview load from the previous source
+        # immediately, even if this one turns out to have no images —
+        # otherwise a late callback for the old source could still land and
         # repaint over the "No images found" / offline status text.
         self._load_token += 1
-        self.cfg["current_folder"] = folder
-        self._refresh_folder_menu()
-        self.images = list_images(folder)
+        self._active_kind, self._active_id = kind, source_id
+        self.cfg["playback_source"] = {"kind": kind, "id": source_id}
+        if kind == "folder":
+            self.cfg["current_folder"] = source_id  # kept in sync for v1.2 readers
+        self._refresh_source_menu()
+        self.images = resolve_source_images(self.cfg, kind, source_id)
         self._shuffle_order = []
         self._shuffle_cursor = 0
         if not self.images:
             self.index = -1
             if show:
-                self.preview.configure(image=None, text="No images found in this folder")
+                self.preview.configure(image=None, text="No images found in this source")
                 self.meta.configure(text="")
-            # Distinguish empty vs offline (drive gone) for a clearer status.
-            if not is_folder_online(folder):
+                self._update_favourite_button()
+            if kind == "folder" and not is_folder_online(source_id):
                 self._set_status("Folder is offline (drive disconnected?).")
+            elif kind == "playlist":
+                playlist = find_playlist(self.cfg, source_id)
+                online, total = playlist_folder_status(playlist) if playlist else (0, 0)
+                if total and online == 0:
+                    self._set_status("All folders in this playlist are offline.")
+                else:
+                    self._set_status("No images found in this playlist.")
             else:
                 self._set_status("No images found in this folder.")
             self._flush_save()
@@ -896,11 +1088,256 @@ class DesktopVista(ctk.CTk):
             return
 
         self.index = 0
-        self._set_status(f"{len(self.images)} images in {Path(folder).name or folder}")
+        noun = "playlist" if kind == "playlist" else "folder"
+        name = find_playlist(self.cfg, source_id)["name"] if kind == "playlist" else (
+            Path(source_id).name or source_id
+        )
+        self._set_status(f"{len(self.images)} images in {noun} '{name}'")
         if show:
             self._show_current()
         else:
             self._flush_save()
+
+    def _add_folder(self) -> None:
+        chosen = filedialog.askdirectory(title="Choose a wallpaper folder")
+        if not chosen:
+            return
+        chosen = os.path.normpath(chosen)
+        if chosen not in self.cfg["folders"]:
+            self.cfg["folders"].append(chosen)
+        self._load_source("folder", chosen)
+
+    def _remove_folder(self) -> None:
+        if self._active_kind != "folder" or self._active_id not in self.cfg["folders"]:
+            self._set_status("Select a folder (not a playlist) to remove it.")
+            return
+        folder = self._active_id
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Remove this folder from Desktop Vista?\n\n{folder}\n\n(No files are deleted.)",
+        ):
+            return
+        self._stop_slideshow()
+        self.cfg["folders"].remove(folder)
+        # A playlist referencing this folder can no longer resolve it —
+        # drop the reference rather than leave a dangling path behind.
+        for playlist in self.cfg["playlists"]:
+            if folder in playlist["folders"]:
+                playlist["folders"] = [f for f in playlist["folders"] if f != folder]
+
+        fallback = self._resolve_initial_source()
+        if fallback:
+            self._load_source(*fallback)
+        else:
+            self._load_token += 1
+            self.images, self.index = [], -1
+            self._active_kind, self._active_id = "folder", None
+            self.cfg["current_folder"] = None
+            self.cfg["current_image"] = None
+            self.cfg["playback_source"] = None
+            self._refresh_source_menu()
+            self.preview.configure(image=None, text="Add a folder to begin")
+            self.meta.configure(text="")
+            self._flush_save()
+
+    # ---------------- Playlists ----------------
+
+    def _open_playlist_editor(self, playlist: Optional[dict] = None) -> None:
+        """Modal editor for creating or renaming/re-scoping a playlist."""
+        win = ctk.CTkToplevel(self)
+        win.title("New Playlist" if playlist is None else f"Edit Playlist — {playlist['name']}")
+        win.geometry("420x480")
+        win.transient(self)
+        win.grab_set()
+
+        ctk.CTkLabel(win, text="Playlist name").pack(padx=16, pady=(16, 4), anchor="w")
+        name_var = ctk.StringVar(value=playlist["name"] if playlist else "")
+        ctk.CTkEntry(win, textvariable=name_var).pack(padx=16, fill="x")
+
+        ctk.CTkLabel(win, text="Folders to include").pack(padx=16, pady=(16, 4), anchor="w")
+        scroll = ctk.CTkScrollableFrame(win, height=260)
+        scroll.pack(padx=16, pady=(0, 8), fill="both", expand=True)
+        existing = set(playlist["folders"]) if playlist else set()
+        check_vars: dict[str, ctk.BooleanVar] = {}
+        for folder in self.cfg["folders"]:
+            var = ctk.BooleanVar(value=folder in existing)
+            ctk.CTkCheckBox(scroll, text=folder_display_label(folder), variable=var).pack(
+                anchor="w", pady=2, padx=4
+            )
+            check_vars[folder] = var
+        if not self.cfg["folders"]:
+            ctk.CTkLabel(scroll, text="Add a wallpaper folder first.",
+                         text_color="gray60").pack(pady=8)
+
+        def do_save() -> None:
+            name = name_var.get().strip()
+            chosen = [f for f, v in check_vars.items() if v.get()]
+            if not name:
+                messagebox.showerror(APP_NAME, "Playlist needs a name.", parent=win)
+                return
+            if not chosen:
+                messagebox.showerror(APP_NAME, "Select at least one folder.", parent=win)
+                return
+            if playlist is None:
+                created = {"id": new_id(), "name": name, "folders": chosen}
+                self.cfg["playlists"].append(created)
+                self._load_source("playlist", created["id"])
+            else:
+                playlist["name"] = name
+                playlist["folders"] = chosen
+                if self._active_kind == "playlist" and self._active_id == playlist["id"]:
+                    self._load_source("playlist", playlist["id"])
+                else:
+                    self._refresh_source_menu()
+            self._flush_save()
+            win.destroy()
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(padx=16, pady=12, fill="x")
+        ctk.CTkButton(btns, text="Save", command=do_save).pack(
+            side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(btns, text="Cancel", fg_color="gray30", hover_color="gray25",
+                      command=win.destroy).pack(side="left", expand=True, fill="x", padx=(4, 0))
+
+    def _edit_active_playlist(self) -> None:
+        if self._active_kind != "playlist":
+            self._set_status("Select a playlist to edit.")
+            return
+        playlist = find_playlist(self.cfg, self._active_id)
+        if playlist is not None:
+            self._open_playlist_editor(playlist)
+
+    def _delete_active_playlist(self) -> None:
+        if self._active_kind != "playlist":
+            self._set_status("Select a playlist to delete.")
+            return
+        playlist = find_playlist(self.cfg, self._active_id)
+        if playlist is None:
+            return
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Delete playlist '{playlist['name']}'?\n\n(No image files are deleted.)",
+        ):
+            return
+        self._stop_slideshow()
+        self.cfg["playlists"] = [p for p in self.cfg["playlists"] if p["id"] != playlist["id"]]
+        if self.cfg.get("playback_source") and self.cfg["playback_source"]["id"] == playlist["id"]:
+            self.cfg["playback_source"] = None
+
+        fallback = self._resolve_initial_source()
+        if fallback:
+            self._load_source(*fallback)
+        else:
+            self._load_token += 1
+            self.images, self.index = [], -1
+            self._active_kind, self._active_id = "folder", None
+            self._refresh_source_menu()
+            self.preview.configure(image=None, text="Add a folder to begin")
+            self.meta.configure(text="")
+            self._flush_save()
+
+    # ---------------- Favourites / hidden (non-destructive curation) ----------------
+
+    def _toggle_favourite(self) -> None:
+        if not (0 <= self.index < len(self.images)):
+            return
+        path = self.images[self.index]
+        is_fav = path in self.cfg.get("favourites", [])
+        set_membership(self.cfg, "favourites", path, not is_fav)
+        self._update_favourite_button()
+        self._schedule_save()
+
+    def _update_favourite_button(self) -> None:
+        favourited = (
+            0 <= self.index < len(self.images)
+            and self.images[self.index] in self.cfg.get("favourites", [])
+        )
+        if favourited:
+            self.fav_btn.configure(text="♥ Favourited", fg_color="#b71c1c", hover_color="#951616")
+        else:
+            self.fav_btn.configure(text="♡ Favourite", fg_color="gray30", hover_color="gray25")
+
+    def _update_hidden_count_label(self) -> None:
+        self.hidden_btn.configure(text=f"Hidden ({len(self.cfg.get('hidden', []))})")
+
+    def _hide_current(self) -> None:
+        if not (0 <= self.index < len(self.images)):
+            return
+        path = self.images[self.index]
+        set_membership(self.cfg, "hidden", path, True)
+        name = Path(path).name
+        self.images = (
+            resolve_source_images(self.cfg, self._active_kind, self._active_id)
+            if self._active_id else []
+        )
+        self._load_token += 1
+        if self.images:
+            self.index = min(self.index, len(self.images) - 1)
+            self._show_current()
+        else:
+            self.index = -1
+            self.preview.configure(image=None, text="No images left in this source")
+            self.meta.configure(text="")
+            self._update_favourite_button()
+        self._set_status(f"Hidden {name}. Use \"Hidden\" to restore it.")
+        self._update_hidden_count_label()
+        self._flush_save()
+
+    def _open_hidden_manager(self) -> None:
+        win = ctk.CTkToplevel(self)
+        win.title("Hidden Images")
+        win.geometry("420x420")
+        win.transient(self)
+        win.grab_set()
+        scroll = ctk.CTkScrollableFrame(win)
+        scroll.pack(padx=16, pady=16, fill="both", expand=True)
+
+        def rebuild() -> None:
+            for w in scroll.winfo_children():
+                w.destroy()
+            hidden = self.cfg.get("hidden", [])
+            if not hidden:
+                ctk.CTkLabel(scroll, text="No hidden images.", text_color="gray60").pack(pady=8)
+                return
+            for path in hidden:
+                item = ctk.CTkFrame(scroll, fg_color="transparent")
+                item.pack(fill="x", pady=2)
+                ctk.CTkLabel(item, text=Path(path).name, anchor="w").pack(
+                    side="left", fill="x", expand=True)
+
+                def unhide(p=path) -> None:
+                    set_membership(self.cfg, "hidden", p, False)
+                    if self._active_id is not None:
+                        self.images = resolve_source_images(
+                            self.cfg, self._active_kind, self._active_id
+                        )
+                    self._flush_save()
+                    self._update_hidden_count_label()
+                    rebuild()
+
+                ctk.CTkButton(item, text="Unhide", width=70, command=unhide).pack(side="right")
+
+        rebuild()
+
+    # ---------------- Drive reconnect watcher ----------------
+
+    def _start_reconnect_watcher(self) -> None:
+        self._reconnect_job = self.after(RECONNECT_POLL_MS, self._reconnect_tick)
+
+    def _reconnect_tick(self) -> None:
+        if self._closing:
+            return
+        had_no_images = not self.images
+        self._refresh_source_menu()  # refreshes offline badges without user action
+        if had_no_images and self._active_id is not None:
+            images = resolve_source_images(self.cfg, self._active_kind, self._active_id)
+            if images:
+                self.images = images
+                self.index = 0
+                self._load_token += 1
+                self._set_status("Source reconnected — resuming.")
+                self._show_current()
+        self._reconnect_job = self.after(RECONNECT_POLL_MS, self._reconnect_tick)
 
     # ---------------- Preview sizing ----------------
 
@@ -931,7 +1368,7 @@ class DesktopVista(ctk.CTk):
     # ---------------- Preview & navigation ----------------
 
     def _show_current(self) -> None:
-        if not (0 <= self.index < len(self.images)):
+        if self._closing or not (0 <= self.index < len(self.images)):
             return
         path = self.images[self.index]
         self._load_token += 1
@@ -964,7 +1401,7 @@ class DesktopVista(ctk.CTk):
             return
         self.preview.configure(image=None, text=f"Cannot open image\n{Path(path).name}")
         self.meta.configure(text=str(exc))
-        self._refresh_folder_menu()  # a missing file often means a drive went offline
+        self._refresh_source_menu()  # a missing file often means a drive went offline
 
     def _on_preview_ready(
         self,
@@ -987,6 +1424,8 @@ class DesktopVista(ctk.CTk):
                 text=f"{Path(path).name}    •    {width} × {height}    •    {size}    "
                      f"•    {self.index + 1} of {len(self.images)}"
             )
+            self._update_favourite_button()
+            self._update_hidden_count_label()
         except Exception as exc:
             log.warning("Preview apply failed: %s", exc)
 
@@ -1067,7 +1506,7 @@ class DesktopVista(ctk.CTk):
                 # often this just means a drive went offline mid-run.
                 log.warning("Slideshow could not set wallpaper for %s: %s", path, exc)
                 self._set_status(f"Skipped (unavailable): {Path(path).name}")
-                self._refresh_folder_menu()
+                self._refresh_source_menu()
             else:
                 messagebox.showerror(APP_NAME, f"Could not set wallpaper:\n{exc}")
 
@@ -1313,7 +1752,7 @@ class DesktopVista(ctk.CTk):
     # ---------------- Close ----------------
 
     def _cancel_after_jobs(self) -> None:
-        for attr in ("_slideshow_job", "_save_job"):
+        for attr in ("_slideshow_job", "_save_job", "_reconnect_job"):
             job = getattr(self, attr, None)
             if job is not None:
                 try:

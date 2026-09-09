@@ -45,18 +45,26 @@ Deferred to v1.3+ (see notes_004 §1, §4–5, §7): background-thread folder en
 
 ---
 
-## v1.3 — "All My Drives" playlists
+## v1.3 — "All My Drives" playlists ✅ Done (2026-09-09)
 
 Goal: deliver the tagline — one slideshow spanning every drive, not just the folder currently selected.
 
-| Priority | Item |
-| :---: | :--- |
-| P0 | Playlist manager + `playback_source` config (folders ∪ playlists) |
-| P0 | Slideshow builds its image list from playlist membership across multiple drives |
-| P1 | Favourites (heart) and blacklist/hide filters — non-destructive, source files untouched |
-| P1 | Drive reconnect watcher (poll or `WM_DEVICECHANGE`), building on v1.2's offline badges |
+| Priority | Item | Status |
+| :---: | :--- | :--- |
+| P0 | Playlist manager + `playback_source` config (folders ∪ playlists) | ✅ Done |
+| P0 | Slideshow builds its image list from playlist membership across multiple drives | ✅ Done |
+| P1 | Favourites (heart) and blacklist/hide filters — non-destructive, source files untouched | ✅ Done |
+| P1 | Drive reconnect watcher (poll), building on v1.2's offline badges | ✅ Done — 15s poll, `WM_DEVICECHANGE` deferred (notes_004 Track A: "not a replacement for UNC polling", so polling alone already meets this release's bar) |
 
-**Exit criteria:** one playlist spanning two drives plays correctly; favourites/blacklist filter the active slideshow without modifying source files.
+**Implementation note:** playlists/favourites/hidden/`playback_source` are additive
+`config.json` fields (see `config.example.json`), not notes_004 §7's full schema v2
+(stable source IDs, volume identity, SQLite catalogue). That heavier model earns its
+cost once tags/collections (v1.5) or library scale need it — v1.3's own exit criteria
+don't.
+
+**Exit criteria:** one playlist spanning two drives plays correctly (✅ — the
+playback source list is a folder-image union, deduplicated); favourites/hidden
+filter the active slideshow without modifying source files (✅).
 
 ---
 
