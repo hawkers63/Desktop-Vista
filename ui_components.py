@@ -7,15 +7,17 @@
 #
 # See the LICENSE file in the project root for the full proprietary notice.
 """
-Desktop Vista — shared UI components (v1.7), from notes/notes_006.txt §4.
+Desktop Vista — shared UI components (v1.7-v1.8), from notes/notes_006.txt
+§4 and notes/notes_007.txt §3.5.
 
-Four self-contained CustomTkinter building blocks: a focusable action
-button, a floating hover HUD, a bounded toast notification manager, and a
-tag chip selector. They import no Desktop Vista engine code and cannot set
-a wallpaper or write config — desktop_vista.py wires their callbacks to
-the real handlers and owns all persistence. All widget methods run on
-Tk's owning thread; ToastManager.post() alone is safe to call from a
-worker thread (it only pushes onto a bounded queue).
+Five self-contained CustomTkinter building blocks: a focusable action
+button, a floating hover HUD, a bounded toast notification manager, a tag
+chip selector, and a modal draft-editor shell. They import no Desktop
+Vista engine code and cannot set a wallpaper or write config —
+desktop_vista.py wires their callbacks to the real handlers and owns all
+persistence. All widget methods run on Tk's owning thread; ToastManager.
+post() alone is safe to call from a worker thread (it only pushes onto a
+bounded queue).
 
 Blueprint limits that remain true here: no complete screen-reader
 provider or multi-select bulk editor for tags; the toast manager doesn't
@@ -487,3 +489,71 @@ class TagSelector(ctk.CTkFrame):
             self._remove_buttons[-1].focus_set()
             return "break"
         return None
+
+
+class EditorSheet(ctk.CTkToplevel):
+    """Modal draft-editor shell (notes_006 §2.5 / notes_007 §1.1): a
+    caller-populated body, a persistent inline error label (replacing
+    messagebox popups that stole focus and covered the field being
+    corrected), and a Save/Cancel footer with Save disabled while the
+    draft is invalid. Cancel, Esc, and the window's own close button all
+    take the same path — destroy with no write — so there is exactly one
+    way for this dialog to change anything: a successful on_save().
+    Desktop Vista owns cfg and validation; this widget owns none of it."""
+
+    def __init__(
+        self, master, *, title: str, on_save: Callable[[], Optional[str]],
+        geometry: str = "420x480", min_size: tuple[int, int] = (360, 320),
+    ):
+        super().__init__(master)
+        self.title(title)
+        self.geometry(geometry)
+        self.minsize(*min_size)
+        self.transient(master)
+        self.grab_set()
+        self._on_save = on_save
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        self.body = ctk.CTkFrame(self, fg_color="transparent")
+        self.body.grid(row=0, column=0, sticky="nsew", padx=16, pady=(16, 0))
+        self.body.grid_columnconfigure(0, weight=1)
+
+        self.error_label = ctk.CTkLabel(
+            self, text="", text_color=ERROR_TEXT, anchor="w", justify="left", wraplength=380,
+        )
+        self.error_label.grid(row=1, column=0, sticky="ew", padx=16, pady=(8, 0))
+
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.grid(row=2, column=0, sticky="ew", padx=16, pady=12)
+        footer.grid_columnconfigure((0, 1), weight=1)
+        self.save_button = ctk.CTkButton(footer, text="Save", command=self._save)
+        self.save_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkButton(
+            footer, text="Cancel", fg_color="gray30", hover_color="gray25", command=self._cancel,
+        ).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda event: self._cancel())
+
+    def set_error(self, text: str) -> None:
+        self.error_label.configure(text=text)
+
+    def set_valid(self, ok: bool) -> None:
+        self.save_button.configure(state="normal" if ok else "disabled")
+
+    def cancel(self) -> None:
+        """Discard the draft — the one path Cancel, Esc, the window close
+        button, and a caller's own Esc-chain (e.g. TagSelector's
+        on_close_requested) all funnel through."""
+        self.destroy()
+
+    def _save(self) -> None:
+        error = self._on_save()
+        if error:
+            self.set_error(error)
+            return
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.cancel()

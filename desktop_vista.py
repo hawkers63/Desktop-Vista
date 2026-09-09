@@ -633,6 +633,19 @@ def resolve_source_images(cfg: dict, kind: str, source_id: str) -> list[str]:
     return [img for img in images if img not in hidden]
 
 
+def collection_match_count(cfg: dict, tags_any: list[str]) -> int:
+    """How many images would currently match a collection with *tags_any*
+    (hidden-filtered), without requiring the collection to be saved to cfg
+    first — backs the collection editor's live match-count (notes_007
+    §1.1 P2). Reuses resolve_source_images against a throwaway id so the
+    matching semantics can never drift from the real playback path."""
+    if not tags_any:
+        return 0
+    snapshot = dict(cfg)
+    snapshot["collections"] = [{"id": "__draft__", "name": "", "tags_any": tags_any}]
+    return len(resolve_source_images(snapshot, "collection", "__draft__"))
+
+
 def resolve_rebuilt_index(
     images: list[str], old_index: int, preferred_path: Optional[str] = None
 ) -> int:
@@ -2533,41 +2546,89 @@ class DesktopVista(ctk.CTk):
     # ---------------- Playlists ----------------
 
     def _open_playlist_editor(self, playlist: Optional[dict] = None) -> None:
-        """Modal editor for creating or renaming/re-scoping a playlist."""
-        win = ctk.CTkToplevel(self)
-        win.title("New Playlist" if playlist is None else f"Edit Playlist — {playlist['name']}")
-        win.geometry("420x480")
-        win.transient(self)
-        win.grab_set()
+        """Modal editor for creating or renaming/re-scoping a playlist. The
+        draft dict is mutated only by this dialog's own widgets and
+        committed to cfg solely inside do_save — Cancel (or Esc, or the
+        window's close button) is always a true no-op on the playlist
+        itself (notes_007 §1.1). "Browse…" is the one exception: adding a
+        library folder from here is the same action as the Library page's
+        Add Folder, so it commits to cfg["folders"] immediately, same as
+        that existing picker (notes_007 §1.1 P1)."""
+        draft = {
+            "name": playlist["name"] if playlist else "",
+            "folders": list(playlist["folders"]) if playlist else [],
+        }
+        sheet = ui_components.EditorSheet(
+            self,
+            title="New Playlist" if playlist is None else f"Edit Playlist — {playlist['name']}",
+            on_save=lambda: do_save(),
+            geometry="420x520",
+        )
+        body = sheet.body
+        body.grid_rowconfigure(3, weight=1)
 
-        ctk.CTkLabel(win, text="Playlist name").pack(padx=16, pady=(16, 4), anchor="w")
-        name_var = ctk.StringVar(value=playlist["name"] if playlist else "")
-        ctk.CTkEntry(win, textvariable=name_var).pack(padx=16, fill="x")
+        ctk.CTkLabel(body, text="Playlist name").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        name_var = ctk.StringVar(value=draft["name"])
+        ctk.CTkEntry(body, textvariable=name_var).grid(row=1, column=0, sticky="ew")
 
-        ctk.CTkLabel(win, text="Folders to include").pack(padx=16, pady=(16, 4), anchor="w")
-        scroll = ctk.CTkScrollableFrame(win, height=260)
-        scroll.pack(padx=16, pady=(0, 8), fill="both", expand=True)
-        existing = set(playlist["folders"]) if playlist else set()
+        folders_row = ctk.CTkFrame(body, fg_color="transparent")
+        folders_row.grid(row=2, column=0, sticky="ew", pady=(16, 4))
+        folders_row.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(folders_row, text="Folders to include").grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(folders_row, text="Browse…", width=90, command=lambda: do_browse()).grid(
+            row=0, column=1, sticky="e")
+
+        scroll = ctk.CTkScrollableFrame(body, height=260)
+        scroll.grid(row=3, column=0, sticky="nsew")
         check_vars: dict[str, ctk.BooleanVar] = {}
-        for folder in self.cfg["folders"]:
-            var = ctk.BooleanVar(value=folder in existing)
-            ctk.CTkCheckBox(scroll, text=folder_display_label(folder), variable=var).pack(
-                anchor="w", pady=2, padx=4
-            )
-            check_vars[folder] = var
-        if not self.cfg["folders"]:
-            ctk.CTkLabel(scroll, text="Add a wallpaper folder first.",
-                         text_color="gray60").pack(pady=8)
 
-        def do_save() -> None:
-            name = name_var.get().strip()
-            chosen = [f for f, v in check_vars.items() if v.get()]
-            if not name:
-                messagebox.showerror(APP_NAME, "Playlist needs a name.", parent=win)
-                return
+        def rebuild_folder_list() -> None:
+            for w in scroll.winfo_children():
+                w.destroy()
+            check_vars.clear()
+            for folder in self.cfg["folders"]:
+                var = ctk.BooleanVar(value=folder in draft["folders"])
+                var.trace_add("write", lambda *_a: validate())
+                ctk.CTkCheckBox(scroll, text=folder_display_label(folder), variable=var).pack(
+                    anchor="w", pady=2, padx=4
+                )
+                check_vars[folder] = var
+            if not self.cfg["folders"]:
+                ctk.CTkLabel(scroll, text="Add a wallpaper folder first.",
+                             text_color="gray60").pack(pady=8)
+
+        def do_browse() -> None:
+            chosen = filedialog.askdirectory(title="Choose a wallpaper folder", parent=sheet)
             if not chosen:
-                messagebox.showerror(APP_NAME, "Select at least one folder.", parent=win)
                 return
+            chosen = os.path.normpath(chosen)
+            if chosen not in self.cfg["folders"]:
+                self.cfg["folders"].append(chosen)
+            if chosen not in draft["folders"]:
+                draft["folders"].append(chosen)
+            rebuild_folder_list()
+            validate()
+
+        def validate(*_args) -> None:
+            draft["folders"] = [f for f, v in check_vars.items() if v.get()]
+            name = name_var.get().strip()
+            if not name:
+                sheet.set_error("Playlist needs a name.")
+                sheet.set_valid(False)
+            elif not draft["folders"]:
+                sheet.set_error("Select at least one folder.")
+                sheet.set_valid(False)
+            else:
+                sheet.set_error("")
+                sheet.set_valid(True)
+
+        def do_save() -> Optional[str]:
+            name = name_var.get().strip()
+            chosen = draft["folders"]
+            if not name:
+                return "Playlist needs a name."
+            if not chosen:
+                return "Select at least one folder."
             if playlist is None:
                 created = {"id": new_id(), "name": name, "folders": chosen}
                 self.cfg["playlists"].append(created)
@@ -2576,18 +2637,14 @@ class DesktopVista(ctk.CTk):
                 playlist["name"] = name
                 playlist["folders"] = chosen
                 if self._active_kind == "playlist" and self._active_id == playlist["id"]:
-                    self._load_source("playlist", playlist["id"])
-                else:
-                    self._refresh_source_menu()
+                    self._rebuild_playback_after_filter_change()
+                self._refresh_source_menu()
             self._flush_save()
-            win.destroy()
+            return None
 
-        btns = ctk.CTkFrame(win, fg_color="transparent")
-        btns.pack(padx=16, pady=12, fill="x")
-        ctk.CTkButton(btns, text="Save", command=do_save).pack(
-            side="left", expand=True, fill="x", padx=(0, 4))
-        ctk.CTkButton(btns, text="Cancel", fg_color="gray30", hover_color="gray25",
-                      command=win.destroy).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        rebuild_folder_list()
+        name_var.trace_add("write", validate)
+        validate()
 
     def _edit_active_playlist(self) -> None:
         if self._active_kind != "playlist":
@@ -2629,36 +2686,90 @@ class DesktopVista(ctk.CTk):
     # ---------------- Collections (saved tag filters) ----------------
 
     def _open_collection_editor(self, collection: Optional[dict] = None) -> None:
-        win = ctk.CTkToplevel(self)
-        win.title("New Collection" if collection is None else f"Edit Collection — {collection['name']}")
-        win.geometry("360x240")
-        win.transient(self)
-        win.grab_set()
-
-        ctk.CTkLabel(win, text="Collection name").pack(padx=16, pady=(16, 4), anchor="w")
-        name_var = ctk.StringVar(value=collection["name"] if collection else "")
-        ctk.CTkEntry(win, textvariable=name_var).pack(padx=16, fill="x")
-
-        ctk.CTkLabel(win, text="Match images tagged with any of").pack(
-            padx=16, pady=(16, 4), anchor="w")
-        tags_var = ctk.StringVar(
-            value=", ".join(collection["tags_any"]) if collection else ""
+        """Modal editor for a saved tag filter. Reuses TagSelector — the
+        same exact-string canonical tag semantics as the main window's tag
+        drawer — instead of a raw comma-separated box, which previously
+        let whitespace/case drift between the two entry points (notes_007
+        §1.1 P1). Match count runs off the Tk thread since it can touch
+        list_images() I/O; a stale result (tags changed again before it
+        returns) is dropped rather than repainted."""
+        draft = {
+            "name": collection["name"] if collection else "",
+            "tags_any": list(collection["tags_any"]) if collection else [],
+        }
+        sheet = ui_components.EditorSheet(
+            self,
+            title="New Collection" if collection is None else f"Edit Collection — {collection['name']}",
+            on_save=lambda: do_save(),
+            geometry="380x480",
         )
-        ctk.CTkEntry(win, textvariable=tags_var, placeholder_text="nature, minimal").pack(
-            padx=16, fill="x")
-        ctk.CTkLabel(
-            win, text="Tag images from the main window's Tags field first.",
-            text_color="gray60", font=ctk.CTkFont(size=11), wraplength=320,
-        ).pack(padx=16, pady=(6, 0), anchor="w")
+        body = sheet.body
 
-        def do_save() -> None:
+        ctk.CTkLabel(body, text="Collection name").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        name_var = ctk.StringVar(value=draft["name"])
+        ctk.CTkEntry(body, textvariable=name_var).grid(row=1, column=0, sticky="ew")
+
+        ctk.CTkLabel(body, text="Match images tagged with any of").grid(
+            row=2, column=0, sticky="w", pady=(16, 4))
+        selector = ui_components.TagSelector(
+            body, known=self._all_known_tags(),
+            on_change=lambda tags: on_tags_changed(tags),
+            on_close_requested=sheet.cancel,
+        )
+        selector.grid(row=3, column=0, sticky="ew")
+        selector.set_tags(draft["tags_any"])
+
+        match_label = ctk.CTkLabel(
+            body, text="", text_color="gray60", font=ctk.CTkFont(size=11), anchor="w")
+        match_label.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+
+        def validate() -> None:
             name = name_var.get().strip()
-            tags_any = dedupe_preserve_order([t.strip() for t in tags_var.get().split(",") if t.strip()])
-            if not name or not tags_any:
-                messagebox.showerror(
-                    APP_NAME, "Collection needs a name and at least one tag.", parent=win
-                )
+            if not name:
+                sheet.set_error("Collection needs a name.")
+                sheet.set_valid(False)
+            elif not draft["tags_any"]:
+                sheet.set_error("Select at least one tag.")
+                sheet.set_valid(False)
+            else:
+                sheet.set_error("")
+                sheet.set_valid(True)
+
+        def refresh_match_count() -> None:
+            tags_snapshot = list(draft["tags_any"])
+            if not tags_snapshot:
+                match_label.configure(text="")
                 return
+            match_label.configure(text="Checking match count…")
+            future = self._executor.submit(collection_match_count, self.cfg, tags_snapshot)
+            future.add_done_callback(
+                lambda fut: self.after(0, on_match_done, fut, tags_snapshot)
+            )
+
+        def on_match_done(future, tags_snapshot: list[str]) -> None:
+            if not sheet.winfo_exists() or draft["tags_any"] != tags_snapshot:
+                return  # superseded by a later edit — never paint a stale count
+            try:
+                count = future.result()
+            except Exception as exc:
+                log.warning("Collection match-count failed: %s", exc)
+                return
+            noun = "image" if count == 1 else "images"
+            suffix = "" if count else "  (not an error — tag images first)"
+            match_label.configure(text=f"{count} {noun} match{suffix}")
+
+        def on_tags_changed(tags: tuple[str, ...]) -> None:
+            draft["tags_any"] = list(tags)
+            validate()
+            refresh_match_count()
+
+        def do_save() -> Optional[str]:
+            name = name_var.get().strip()
+            tags_any = draft["tags_any"]
+            if not name:
+                return "Collection needs a name."
+            if not tags_any:
+                return "Select at least one tag."
             if collection is None:
                 created = {"id": new_id(), "name": name, "tags_any": tags_any}
                 self.cfg["collections"].append(created)
@@ -2667,18 +2778,14 @@ class DesktopVista(ctk.CTk):
                 collection["name"] = name
                 collection["tags_any"] = tags_any
                 if self._active_kind == "collection" and self._active_id == collection["id"]:
-                    self._load_source("collection", collection["id"])
-                else:
-                    self._refresh_source_menu()
+                    self._rebuild_playback_after_filter_change()
+                self._refresh_source_menu()
             self._flush_save()
-            win.destroy()
+            return None
 
-        btns = ctk.CTkFrame(win, fg_color="transparent")
-        btns.pack(padx=16, pady=12, fill="x")
-        ctk.CTkButton(btns, text="Save", command=do_save).pack(
-            side="left", expand=True, fill="x", padx=(0, 4))
-        ctk.CTkButton(btns, text="Cancel", fg_color="gray30", hover_color="gray25",
-                      command=win.destroy).pack(side="left", expand=True, fill="x", padx=(4, 0))
+        name_var.trace_add("write", lambda *_a: validate())
+        validate()
+        refresh_match_count()
 
     def _edit_active_collection(self) -> None:
         if self._active_kind != "collection":

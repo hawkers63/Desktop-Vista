@@ -678,6 +678,34 @@ def test_unhide_only_image_restores_preview_at_index_zero(tmp_path):
     assert cfg["favourites"] == []  # unhide must not touch favourites
 
 
+# ---------------------------------------------------------------------------
+# collection_match_count (notes_007 §1.1 — collection editor live count)
+# ---------------------------------------------------------------------------
+
+def test_collection_match_count_empty_tags_is_zero():
+    assert dv.collection_match_count({"folders": [], "tags": {}}, []) == 0
+
+
+def test_collection_match_count_matches_resolve_source_images(tmp_path):
+    folder = tmp_path
+    (folder / "a.jpg").write_bytes(b"x")
+    (folder / "b.jpg").write_bytes(b"x")
+    cfg = {
+        "folders": [str(folder)],
+        "playlists": [],
+        "hidden": [],
+        "tags": {str(folder / "a.jpg"): ["nature"]},
+    }
+    assert dv.collection_match_count(cfg, ["nature"]) == 1
+    assert dv.collection_match_count(cfg, ["not-a-real-tag"]) == 0
+
+
+def test_collection_match_count_does_not_mutate_cfg_collections(tmp_path):
+    cfg = {"folders": [], "playlists": [], "hidden": [], "tags": {}, "collections": []}
+    dv.collection_match_count(cfg, ["nature"])
+    assert cfg["collections"] == []  # the draft snapshot must not leak into real cfg
+
+
 def test_about_copy_has_rights_and_owner_no_local_paths():
     joined = "\n".join(dv.ABOUT_COPY)
     assert "All rights reserved" in joined
