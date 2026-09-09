@@ -1,0 +1,690 @@
+Desktop Vista: architecture and UX review
+
+**All my drives. One perfect view.**  
+Review date: 9 September 2026. Baseline: the local `desktop_vista.py`, labelled **v1.2-dev**, its tests, configuration, `ROADMAP.md`, original design note, and supplied icon assets.
+
+This is a design and review deliverable. Code below is proposed integration material, not an implemented application upgrade. Existing application code, live configuration, assets and roadmap were not edited. The working tree already contained a deleted README and untracked icon assets before this review.
+
+## 1. Recommendation and baseline correction
+
+Finish the reliability and branding work in v1.2, then make cross-folder playlists the next substantial release. Retain CustomTkinter and the existing single-image workflow. Introduce a playback controller with explicit state before adding power rules or monitor assignments. Bring in COM behind a small wallpaper backend boundary, retaining the current global backend for explicitly global operations.
+
+The supplied v1.0 summary is historical. Background preview loading, responsive sizing, a Fisher–Yates deck, atomic configuration replacement, tray support, startup registration and custom intervals already exist. Their presence does not establish complete resilience: several implementation gaps remain below. `ROADMAP.md` already places playlists in v1.3, power awareness in v1.4, topology/tags in v1.5 and per-monitor output in v2.0. Preserve those release names; the requested v1.1/v1.2/v2.0 matrix buckets are reconciled explicitly in section 3.
+
+### Review findings, ordered by practical impact
+
+Line references refer to the source at review time.
+
+| Severity | Evidence | User-visible consequence | Targeted recommendation |
+|---|---|---|---|
+| High | `_show_current`, around line 835, closes over `exc` in a deferred lambda inside `except` | Python clears the exception binding at the end of the handler; the later callback can raise `NameError` instead of displaying the intended error | Carry the exception as queue message data; immediate minimal repair is `lambda exc=exc: ...` |
+| High | `_load_folder` line 764 and `_refresh_folder_menu` line 710 perform enumeration/status checks synchronously; `_set_wallpaper` line 936 may decode and write WebP on Tk | A slow NAS, inaccessible share or large conversion can freeze controls and tray actions | Move enumeration, file probes and preparation off Tk; keep apply operations serialized |
+| High | `_show_current` calls `self.after` from pool workers; tray handlers do likewise; `_on_close` destroys Tk while work may still run | Callbacks can race shutdown; calling `after` still enters Tcl from another thread | Workers publish plain data to queues; only the Tk thread polls and touches widgets |
+| High | `_on_tray_next` / `_on_tray_prev` call `_next` / `_prev`; these only update the preview | “Next Wallpaper” does not set the desktop, including while the window is hidden | Add explicit navigate-and-apply commands; preserve preview-only navigation in the main window |
+| Medium | `_start_tray_icon` stores an Icon before the background `run` has succeeded; startup hide checks only for non-null | A tray startup failure can leave a hidden window without a working restoration surface | Require a ready event, catch failures inside the runner, and show the window on failure |
+| Medium | `_load_folder` returns without invalidating the preview token when its new list is empty; removing the last folder also leaves old work valid | A completed preview from the former folder can repaint an empty view | Invalidate generation at every source change, even when no new image is submitted |
+| Medium | No periodic reconnect watcher or rescan; offline badge updates are event-driven within existing UI actions | A folder loaded while absent stays empty on reconnection; the roadmap's general resume claim is too strong | Track unavailable sources independently and refresh asynchronously |
+| Medium | Two-worker executor has no bounded submission queue or LRU; resize events submit additional work | Rapid navigation or resizing accumulates obsolete decodes despite generation checks | One active foreground decode plus one replaceable pending request; bounded byte-based cache |
+| Medium | `_load_preview_image` calls `ImageOps.exif_transpose` before `draft` | Transpose can load pixels before JPEG decoder reduction is requested, undermining the advertised fast decode | Read orientation and original dimensions, request draft with orientation-aware bounds, then transpose and thumbnail |
+| Medium | `dict(DEFAULT_CONFIG)` shares nested default lists; tray validation uses `bool(value)`; custom numeric validation accepts non-finite floats | Defaults can be contaminated; `"false"` becomes true; `int(inf)` can raise an uncaught overflow | Deep-copy defaults, require literal booleans, accept bounded finite integers for intervals |
+| Medium | `save_config` uses a shared `.tmp` name; startup detection checks only value existence | Two app instances can race configuration saves and wallpaper updates; stale startup commands appear valid | Single-instance guard; unique temporary sibling files; compare actual Run command with expected executable |
+| Low | `_advance_shuffle` uses `pop(0)` and manual navigation does not reconcile the deck | Avoidable list shifting and ambiguous no-repeat expectations | Use a deque/cursor and define shuffle-cycle membership precisely |
+
+These are source review findings, not claims that every failure was reproduced in a live desktop session. Windows integration checks remain essential even if pure helper tests pass.
+
+## 2. Existing icon review and integration plan
+
+Inspected assets:
+
+* `D:\Desktop_Vista\icon\desktop_vista.png`: **96 × 96, RGBA**.
+* `D:\Desktop_Vista\icon\desktop_vista.ico`: **one embedded size, 128 × 128**.
+
+The supplied design is a rounded blue tile containing a white monitor and cog. It reads clearly as a desktop utility and matches the blue theme. It is closer to a settings symbol than to the original landscape/aperture concepts. Use this supplied branding now; a redesign is optional. The current application still generates a procedural placeholder and does not load either supplied file.
+
+Use the ICO for the window and packaged executable, and its 128-pixel frame for the tray's Pillow image. The small PNG is suitable for an in-app logo at modest size. Prefer future exports from a larger original at 16, 20, 24, 32, 48, 64, 128 and 256 pixels in one ICO. Upscaling the 96-pixel PNG cannot recover missing detail. Test the cog at 16 and 20 pixels against both light and dark notification areas before deciding whether a simplified tray-only asset is necessary.
+
+**Proposed insertion:** immediately below `build_tray_icon_image`, add this loader. In `_start_tray_icon`, replace only the `build_tray_icon_image()` call with `load_brand_icon()`. Existing fallback remains useful for missing/corrupt resources.
+
+```python
+def load_brand_icon(size: int = 64) -> Image.Image:
+    try:
+        with Image.open(APP_DIR / "icon" / "desktop_vista.ico") as source:
+            result = source.convert("RGBA")
+        result.thumbnail((size, size), Image.Resampling.LANCZOS)
+        return result
+    except (OSError, ValueError):
+        log.warning("Brand icon unavailable; using fallback", exc_info=True)
+        return build_tray_icon_image(size)
+```
+
+**Proposed insertion:** in `DesktopVista.__init__`, after setting the window title, schedule window icon assignment after initial theme setup. Catch `tkinter.TclError` and `OSError` in the eventual helper. Check that CustomTkinter's delayed default icon does not replace it; a short delayed call around 300 ms is an integration starting point, not a guaranteed timing contract. For a packaged executable, include `icon/desktop_vista.ico` as a resource and as the executable icon, and resolve bundled resources separately from writable user settings. A stable application ID should be set before creating Tk if taskbar grouping is required.
+
+No new branding asset was generated or substituted during this review.
+
+## 3. Executive feature matrix
+
+“Target version” below uses the requested three planning buckets. v1.1 means existing hardening baseline; v1.2 means completion of the current milestone; v2.0 includes the already planned v1.3–v1.5 stepping stones. The delivery column is authoritative for chronological scheduling and avoids silently renumbering existing releases.
+
+| Feature name | Category | User impact | Implementation complexity | Target version | Delivery / present state |
+|---|---|---|---|---|---|
+| Atomic validated configuration | Reliability | High | Med | v1.1 | Present; strengthen validation in v1.2 |
+| Responsive aspect-preserving preview | UX | High | Med | v1.1 | Present; DPI and queue refinements in v1.2 |
+| No-repeat shuffle deck | Playback | High | Med | v1.1 | Present; cycle semantics in v1.2 |
+| Tray lifecycle and complete context menu | Automation | High | Med | v1.2 | Present in part; fix actual apply and readiness |
+| Supplied icon integration | Branding | Med | Low | v1.2 | Assets available, integration pending |
+| Startup / minimized launch | Automation | Med | Low | v1.2 | Present; packaged-command and failure checks |
+| Custom seconds/minutes/hours | Playback | High | Low | v1.2 | Seconds present; improve units and validation |
+| Latest-request preview and LRU | Performance | High | Med | v1.2 | Background decode present; cache missing |
+| Reveal in Explorer / copy path | Curation | Med | Low | v1.2 | Reveal present; clipboard missing |
+| Unified cross-drive playlists | Library | High | Med | v2.0 | v1.3 |
+| Reconnect detection and local fallback | Reliability | High | High | v2.0 | Basic skip in v1.2; full recovery in v1.3 |
+| Favourites / hidden images | Curation | High | Med | v2.0 | v1.3 |
+| Battery Saver and on-battery policy | Automation | High | Med | v2.0 | v1.4 |
+| Fullscreen / presentation suppression | Automation | High | Med | v2.0 | v1.4; heuristic with override |
+| Daily wall-clock schedules | Scheduling | Med | Med | v2.0 | v1.4 |
+| Mica / Acrylic experiment | UX | Low | Med | v2.0 | Optional v1.4–v1.5 |
+| Monitor topology and selector cards | Displays | High | Med | v2.0 | Read-only v1.5, output v2.0 |
+| Manual tags and virtual collections | Library | High | Med | v2.0 | v1.5 groundwork |
+| Dawn / day / dusk / night presets | Scheduling | Med | High | v2.0 | v1.5 model, v2.0 apply |
+| Different wallpaper per monitor | Displays | High | High | v2.0 | COM milestone |
+| Panorama / ultrawide span assistant | Displays | High | High | v2.0 | After topology and COM validation |
+| Preview crossfade | UX | Med | Low | v2.0 | Optional, reduced-motion aware |
+| Desktop crossfade | Displays | Low | High | v2.0 | Research gate; no promised release |
+| Lock screen setter | Integration | Med | High | v2.0 | Capability research gate |
+
+## 4. Architectural blueprint
+
+```mermaid
+flowchart LR
+    UI[CustomTkinter main thread] --> PC[Playback controller]
+    Tray[Tray thread] --> Q[Command queue]
+    Q --> PC
+    PC --> CAT[Catalogue and playlist resolver]
+    CAT --> SCAN[Background source scanners]
+    CAT --> DB[(Local SQLite metadata)]
+    PC --> PRE[Preview worker and byte LRU]
+    PRE --> OUT[Result mailbox]
+    OUT --> UI
+    PC --> POL[Schedule and suppression policy]
+    POL --> APPLY[Serialized preparation and apply worker]
+    APPLY --> SPI[Global SPI backend]
+    APPLY --> COM[STA COM backend]
+```
+
+Start with a few helpers and explicit controller state in the existing file. Extract modules when a boundary is exercised by a feature, rather than splitting everything upfront. Proposed later ownership boundaries are `catalogue.py`, `playback.py`, `preview_service.py`, `windows_wallpaper.py`, and `config_store.py`.
+
+The controller owns selected source/image, **last successfully applied image per target**, history, shuffle deck/cursor, playback intent, pause reasons and next due time. UI selection and successful desktop output are different states. Tray “Current” should report the applied image, while the main window labels its preview as selected. All apply requests carry an immutable target, image ID, source revision and generation. Recheck eligibility after slow preparation; discard superseded requests before entering the OS call. Already-running OS calls cannot be undone by cancelling a Python future.
+
+Maintain one slideshow authority: Desktop Vista's controller. Do not run a native Windows slideshow alongside the custom scheduler. On COM failure, show the error for a selected monitor; never silently fall back to a global SPI call that changes every screen.
+
+### Track A: multi-drive aggregation and recovery
+
+Represent a source with a stable application ID, type (`local`, `removable`, `network`), configured root, recursion choice and optional volume identity. Retain drive-letter paths for convenience, but map removable sources through volume identity plus relative path where available. Do not equate every reappearing `F:` with the same device. UNC sources retain canonical server/share roots; Desktop Vista should not store network passwords.
+
+A playlist references source IDs and/or image IDs. Resolve membership as a union, normalize Windows paths, then apply hidden/tag/favourite filters and deduplicate by catalogue identity. Do not hash every 4K file merely to scan a folder. Add optional content hashes lazily for exact duplicate detection; path aliases, hard links and reparse points need explicit handling. Default recursion off to preserve current behaviour, avoid traversing junctions by default, and allow users to opt into subfolders.
+
+Store metadata locally in SQLite: `sources`, `images`, `tags`, `image_tags`, plus stable IDs and schema migrations. Images carry source ID, relative path, size, nanosecond mtime, dimensions, favourite and hidden flags. Add indexes for source and tag membership. Keep large per-image data out of `config.json`. Use a single database-writer owner and transactions; no connection sharing across arbitrary worker threads. Virtual collections are saved filter expressions over this catalogue and never duplicate or modify image files.
+
+Use asynchronous status probes every roughly 15 seconds while relevant sources are unavailable, with longer exponential backoff for unreachable shares. Optional `WM_DEVICECHANGE` can request an immediate rescan of local volumes; it is not a replacement for UNC polling. Track `online`, `offline`, `permission_denied`, `scanning`, and `error` separately. Directory existence alone does not prove readability. Any Windows message integration must preserve the previous window procedure, pointer widths and callback lifetime; defer it until polling is reliable.
+
+**Bounded network work:** a thread timeout does not cancel blocked filesystem I/O. Do not let two unresponsive NAS probes occupy the same pool as preview decoding. Allow at most one outstanding probe per source. For a hard timeout and predictable process exit, use a separate scanner process with structured results and a kill/restart boundary. Never terminate threads forcibly.
+
+When a source disappears, preserve its catalogue rows and playlist membership, mark it unavailable, skip its remaining candidates within a bounded search and keep the last successful desktop. Try an available playlist source; otherwise enter “Waiting for sources” without a busy loop. An optional local last-good wallpaper cache can keep an explicitly opted-in fallback. Cache thumbnails and full-resolution fallback images separately, with configurable quotas and pruning that protects current/pending output. On reconnect, diff the source and resume only if playback was intended to run. Do not undo a user's manual pause.
+
+### Track B: display model and COM
+
+`IDesktopWallpaper` is available for desktop apps from Windows 8, so it fits the Windows 10/11 target. Enumerate IDs using `GetMonitorDevicePathCount` / `GetMonitorDevicePathAt`, then obtain rectangles using `GetMonitorRECT`. Enumeration can include disconnected displays; preserve their assignments and exclude invalid/empty active rectangles. [Microsoft interface documentation](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-idesktopwallpaper), [monitor enumeration details](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-idesktopwallpaper-getmonitordevicepathat).
+
+Persist device paths, never ordinal numbers such as “Monitor 2” as identity. User-facing numbers are labels generated for the current topology and may differ from Windows Settings numbering unless explicitly reconciled. A docking or driver change can alter IDs; preserve an orphan assignment and request reassignment rather than guessing. Refresh on display changes and session resume.
+
+`SetWallpaper(monitor_id, path)` targets a monitor; passing a null monitor ID targets all monitors. `SetPosition` has no monitor argument: **fit mode is global**. Do not expose independent per-monitor fit settings backed only by that call. Later per-monitor crop requirements need pre-rendered images sized for each display and a compatible shared fit mode. [SetWallpaper](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-idesktopwallpaper-setwallpaper), [SetPosition](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-idesktopwallpaper-setposition).
+
+For topology cards, compute the union of active rectangles, including negative left/top coordinates. Use one uniform scale and translate by the union's minimum x/y so arrangements, portrait displays, offsets and gaps remain visible. Device resolution and physical monitor size are different; describe the strip as desktop geometry, not physical measurements. Account for Tk's logical units versus display pixels when producing previews.
+
+Span is a global composition mode, not a separate panorama for arbitrary monitor subsets. Offer “All displays · Span” distinctly from independent assignments. Show the image over the whole desktop bounding rectangle with seams/gaps overlaid. Warn within the crop preview about lost image areas; mixed DPI, portrait displays and non-aligned tops require physical validation. Native span does not automatically add bezel correction. Windows' position enum includes centre, tile, stretch, fit, fill and span. [Position enum](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/ne-shobjidl_core-desktop_wallpaper_position).
+
+### Track C: tray, startup, power and fullscreen
+
+Keep Tk on the main thread. On Windows, pystray permits `Icon.run()` on a separate thread. Publish commands to a queue and refresh immutable menu snapshots from controller state. Track tray readiness and failure explicitly; never hide the only window before the notification icon is ready. Close-to-tray and minimize-to-tray are separate preferences. A normal minimize currently need not mean tray hide. [pystray lifecycle and menus](https://pystray.readthedocs.io/en/latest/usage.html).
+
+Tray menu: current applied filename (disabled header), Next Wallpaper, Previous Wallpaper, Pause/Resume Slideshow, Reveal in Explorer, Copy Image Path, Open Desktop Vista, Exit. Disable image actions without an applied image and explain automatic pauses in a status item. Previous should traverse successful apply history; Next consumes the playlist deck. Tray actions apply immediately, subject to the chosen manual-override policy. UI arrows retain preview-only behaviour until the user presses Apply.
+
+Startup remains opt-in under the existing HKCU Run value with `--minimized`; distinguish script execution (`pythonw.exe` plus script) from a packaged executable (executable plus flag only). Quote through `subprocess.list2cmdline` for generated Windows argument lists, not string concatenation. Compare the registry command, not just value existence, and implement single-instance ownership before login launches become routine. Treat startup registration and slideshow autostart as separate choices.
+
+`GetSystemPowerStatus` provides AC state and a distinct Battery Saver flag (`SystemStatusFlag`). Being on battery is not itself Battery Saver. Check the API result and unknown values; use optional on-battery throttling separately from Battery Saver pause. Maintain a set of pause reasons (`user`, `battery_saver`, `fullscreen`, `no_source`) so clearing one cannot accidentally resume another. [SYSTEM_POWER_STATUS](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-system_power_status).
+
+`SHQueryUserNotificationState` reports conditions such as busy, fullscreen Direct3D and presentation mode. It is a useful suppression signal, not a comprehensive detector of every borderless game or a measure of performance. Combine it, if necessary, with a conservative foreground-window-versus-monitor rectangle check, exclusions for the shell/app, and an explicit “Pause until resumed” control. Check HRESULTs and debounce state changes. On resume, schedule one next deadline; never replay all missed changes. [Notification-state API](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shqueryusernotificationstate).
+
+### Track D: schedule and shuffle semantics
+
+Fixed intervals use a monotonic clock. Wall-clock schedules use timezone-aware datetimes, an explicit timezone policy and a once-per-local-date record. Define daylight-saving behaviour: for a nonexistent local time, run at the first valid time after it; for a repeated local time, run once. After sleep or clock jumps, apply at most one currently due transition. Keep a cheap periodic scheduler tick instead of relying on enormous millisecond values in Tk.
+
+Start time-of-day presets with four configurable local times. Solar mode is optional and uses user-provided coarse coordinates; do not silently obtain location or introduce a network dependency. Define “dawn” as a chosen twilight boundary (for example civil dawn), “day” as sunrise, “dusk” as sunset and “night” as civil dusk; use a tested solar library behind an adapter. Handle polar day/night through explicit fallback times. Recompute for date, location and timezone changes. No solar library or accuracy claim is validated in this review.
+
+For shuffle, deduplicate and filter eligible image IDs first, then use `random.Random(seed).shuffle` once per cycle. A deck guarantees no repeated ID within that fixed cycle. Avoid repeating the last applied image at the next cycle boundary by swapping the first element with a randomly chosen later element if needed; retain all IDs. On the first cycle, remove the already displayed image if it counts as consumed. New members join the next cycle; removed/hidden/offline members are skipped without refilling repeatedly. Define “no repeat” relative to eligible membership, and disclose when the set shrinks to one item. Persist deck order, cursor and membership revision if restart continuity is required; a seed alone does not preserve cursor/history. Use a deque or index cursor, not `pop(0)`.
+
+### Track E: preview, curation and Fluent polish
+
+Show “Image preview” versus “Desktop crop preview” modes. Image preview preserves source aspect ratio with neutral letter/pillarboxes. Crop preview uses the selected monitor's actual ratio and global fit style, including background colour. A hard-coded 16:9 box remains a useful default, not the multi-monitor contract. Debounce resize by around 120–180 ms and decode to a quantized physical-pixel target; cap excessive target sizes. Preserve original metadata before decoder draft and EXIF rotation. A small source cannot become sharp at arbitrary size: show its actual resolution and avoid promising otherwise. [Pillow orientation and image operations](https://pillow.readthedocs.io/en/stable/reference/ImageOps.html).
+
+Favourites and hidden status belong in local metadata. Hide offers Undo and removes the image from future playback without deleting it; an already applied image can remain until the next eligible change. Add keyboard-accessible labels and focus order to heart/hide controls. Copy Path uses Tk clipboard APIs on the main thread. Reveal uses `explorer.exe` without a command shell and reports missing files plainly.
+
+Preview crossfade can blend two modest Pillow images briefly, capped near 15–30 fps, with cancellation on navigation and a reduced-motion setting. Desktop crossfade is a different engineering problem: `IDesktopWallpaper` exposes no documented transition-duration control. Drawing on desktop device contexts or parenting windows into undocumented shell surfaces is fragile. Recommend no custom desktop renderer in v2.0 unless an isolated prototype passes Explorer restart, RDP, multi-monitor and fullscreen tests. Avoid repeated wallpaper API calls as an animation technique.
+
+Lock screen remains a capability spike. `Windows.System.UserProfile.LockScreen.SetImageFileAsync` accepts an `IStorageFile` and returns an asynchronous action. Verify its behaviour from the actual packaged/unpackaged Python host, policy restrictions and supported Windows builds before presenting a working command. Report failures and retain the existing lock screen; do not promise compatibility based on namespace availability alone. [Microsoft method reference](https://learn.microsoft.com/en-us/uwp/api/windows.system.userprofile.lockscreen.setimagefileasync?view=winrt-26100).
+
+For Windows 11, try the documented DWM system backdrop attribute after obtaining the correct top-level HWND. Its modern backdrop enum requires Windows 11 build 22621; retain solid dark backgrounds on earlier systems. CustomTkinter's opaque child surfaces may obscure the backdrop, so test a limited title/header region first. Respect contrast/transparency settings. Avoid undocumented Acrylic recipes as the default Windows 10 path. [DWM backdrop support](https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwm_systembackdrop_type).
+
+## 5. Concrete Python integration blueprints
+
+These samples demonstrate boundaries and lifecycle rules. They need integration into the application's state model and focused tests. They are not an instruction to paste several competing event loops into the current class.
+
+### 5.1 A tray-to-Tk command bridge
+
+**Insertion point:** helper below `build_tray_icon_image`. Construct it in `DesktopVista.__init__` after UI creation; replace `_start_tray_icon` and `_on_tray_*` dispatch with this bridge. Keep `_on_close_request`, adding a `ready` check. Call `bridge.close()` before destroying Tk. Pass an existing Pillow icon and main-thread callbacks. The `next_apply` and `previous_apply` callbacks must navigate and actually apply; eventually use controller history rather than preview indices.
+
+```python
+import queue
+import threading
+
+
+class TrayBridge:
+    def __init__(self, root, icon_image, actions, on_ready, on_failure):
+        self.root = root
+        self.actions = actions
+        self.on_ready = on_ready
+        self.on_failure = on_failure
+        self.messages = queue.SimpleQueue()
+        self.closed = False
+        self.ready = False
+        entries = [
+            ("Next Wallpaper", "next_apply"),
+            ("Previous Wallpaper", "previous_apply"),
+            ("Pause / Resume Slideshow", "toggle"),
+            ("Reveal in Explorer", "reveal"),
+            ("Copy Image Path", "copy"),
+            ("Open Desktop Vista", "restore"),
+            ("Exit", "exit"),
+        ]
+        menu = pystray.Menu(*(pystray.MenuItem(
+            label, self._callback(command), default=command == "restore"
+        ) for label, command in entries))
+        self.icon = pystray.Icon("DesktopVista", icon_image, APP_NAME, menu)
+        self.job = root.after(40, self._poll)
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _callback(self, command):
+        return lambda icon, item: self.messages.put(("command", command))
+
+    def _run(self):
+        try:
+            def setup(icon):
+                icon.visible = True
+                self.messages.put(("ready", None))
+            self.icon.run(setup=setup)
+        except Exception as error:
+            self.messages.put(("failed", str(error)))
+
+    def _poll(self):
+        if self.closed:
+            return
+        for _ in range(32):
+            try:
+                kind, value = self.messages.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "ready":
+                self.ready = True
+                self.on_ready()
+            elif kind == "failed":
+                self.ready = False
+                self.on_failure(value)
+            else:
+                try:
+                    self.actions[value]()
+                except Exception:
+                    log.exception("Tray action failed: %s", value)
+            if self.closed:
+                return
+        self.job = self.root.after(40, self._poll)
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.ready = False
+        self.root.after_cancel(self.job)
+        # Stop after readiness to avoid a stop-before-run startup race.
+        def stop_when_ready():
+            while self.thread.is_alive():
+                try:
+                    kind, _ = self.messages.get(timeout=0.1)
+                except queue.Empty:
+                    if self.icon.visible:
+                        self.icon.stop()
+                        return
+                    continue
+                if kind == "ready" or self.icon.visible:
+                    self.icon.stop()
+                    return
+        threading.Thread(target=stop_when_ready, daemon=True).start()
+```
+
+This minimal bridge uses static labels. Production integration should rebuild the menu from a locked immutable snapshot of applied filename, available actions and pause reasons, then call `update_menu`. Add a startup-ready deadline that restores the window if no acknowledgement arrives. Shutdown should record a failure if the tray thread does not exit within a bounded grace period; do not block Tk indefinitely waiting for threads.
+
+### 5.2 COM integration with a small explicit interface
+
+**Insertion point:** a proposed `windows_wallpaper.py` module when the COM milestone begins. Import it lazily on Windows. The interface below intentionally declares the **vtable prefix through SetPosition in native order**, including unused methods that occupy slots; do not reorder or omit the intervening methods. It is sufficient for this sample, not a full slideshow COM binding. Use one owning STA thread; initialize and release on that thread. Do not pass the COM pointer between worker threads.
+
+```python
+import ctypes
+from ctypes import POINTER, c_int, c_uint, c_void_p, c_wchar_p
+from ctypes.wintypes import RECT
+import comtypes
+from comtypes import COMMETHOD, GUID, HRESULT, IUnknown
+from comtypes.client import CreateObject
+
+
+class IDesktopWallpaper(IUnknown):
+    _iid_ = GUID("{B92B56A9-8B55-4E14-9A89-0199BBB6F93B}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "SetWallpaper",
+                  (["in"], c_wchar_p, "monitor"),
+                  (["in"], c_wchar_p, "path")),
+        COMMETHOD([], HRESULT, "GetWallpaper",
+                  (["in"], c_wchar_p, "monitor"),
+                  (["out"], POINTER(c_void_p), "path")),
+        COMMETHOD([], HRESULT, "GetMonitorDevicePathAt",
+                  (["in"], c_uint, "index"),
+                  (["out"], POINTER(c_void_p), "monitor")),
+        COMMETHOD([], HRESULT, "GetMonitorDevicePathCount",
+                  (["out"], POINTER(c_uint), "count")),
+        COMMETHOD([], HRESULT, "GetMonitorRECT",
+                  (["in"], c_wchar_p, "monitor"),
+                  (["out"], POINTER(RECT), "rect")),
+        COMMETHOD([], HRESULT, "SetBackgroundColor",
+                  (["in"], c_uint, "color")),
+        COMMETHOD([], HRESULT, "GetBackgroundColor",
+                  (["out"], POINTER(c_uint), "color")),
+        COMMETHOD([], HRESULT, "SetPosition",
+                  (["in"], c_int, "position")),
+    ]
+
+
+def com_wallpaper_operation(prepared_path=None, monitor_id=None, style="Fill"):
+    # Run on a Windows STA owner. A persistent backend should retain one
+    # instance and pump its STA messages between queued operations.
+    comtypes.CoInitializeEx(comtypes.COINIT_APARTMENTTHREADED)
+    wallpaper = None
+    try:
+        wallpaper = CreateObject(
+            GUID("{C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD}"),
+            interface=IDesktopWallpaper,
+            clsctx=comtypes.CLSCTX_ALL,
+        )
+        free = ctypes.OleDLL("ole32").CoTaskMemFree
+        free.argtypes = [c_void_p]
+        free.restype = None
+        monitors = []
+        for index in range(wallpaper.GetMonitorDevicePathCount()):
+            address = wallpaper.GetMonitorDevicePathAt(index)
+            try:
+                device_id = ctypes.wstring_at(address)
+            finally:
+                free(address)
+            rect = wallpaper.GetMonitorRECT(device_id)
+            if rect.right > rect.left and rect.bottom > rect.top:
+                monitors.append((device_id, (rect.left, rect.top,
+                                             rect.right, rect.bottom)))
+        if prepared_path is not None:
+            if monitor_id is not None and monitor_id not in {m[0] for m in monitors}:
+                raise ValueError("Selected monitor is no longer connected")
+            positions = {"Centre": 0, "Stretch": 2, "Fit": 3, "Fill": 4, "Span": 5}
+            if style == "Span" and monitor_id is not None:
+                raise ValueError("Span requires the all-displays target")
+            wallpaper.SetPosition(positions[style])  # Global fit policy.
+            wallpaper.SetWallpaper(monitor_id, str(prepared_path))
+        return monitors
+    finally:
+        # Drop the sole local COM reference before balancing this init call.
+        wallpaper = None
+        comtypes.CoUninitialize()
+```
+
+GetMonitorDevicePathAt returns allocated text: preserve its pointer until it is copied and free it with CoTaskMemFree. Production code must also check HRESULT/S_FALSE topology edge cases and handle topology changing during enumeration. COM calls are not an atomic multi-monitor transaction: report partial success, retain previous paths for an explicit rollback attempt, and never claim that all displays changed when only one succeeded. Validate this binding against the Windows SDK and installed comtypes version on x64 Windows before adoption; it was not invoked here.
+
+### 5.3 Background pre-decoding with a bounded LRU
+
+**Insertion point:** helper below `_load_preview_image`; replace `_show_current` executor submission with `service.request(token, path, pixel_box)`. Poll `service.results` from Tk and call `_on_preview_ready` only when token, path and source revision still match. Create CTkImage on Tk only. The illustrative service below keeps one active decode, one replaceable pending request, one latest result, and a byte-budgeted cache. Stat and decode happen on its worker.
+
+```python
+from collections import OrderedDict
+import queue
+import threading
+import warnings
+from pathlib import Path
+from PIL import Image, ImageOps
+
+
+class PreviewService:
+    def __init__(self, budget_bytes=64 * 1024 * 1024):
+        self.budget = budget_bytes
+        self.cache = OrderedDict()
+        self.bytes = 0
+        self.pending = None
+        self.closed = False
+        self.condition = threading.Condition()
+        self.results = queue.Queue(maxsize=1)
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def request(self, token, path, box):
+        with self.condition:
+            if not self.closed:
+                self.pending = (token, path, box)  # Latest request wins.
+                self.condition.notify()
+
+    def _decode(self, path, box):
+        stat = Path(path).stat()
+        key = (path, stat.st_mtime_ns, stat.st_size, box)
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key][0]
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(path) as source:
+                width, height = source.size
+                rotated = source.getexif().get(274, 1) in (5, 6, 7, 8)
+                draft_box = (box[1], box[0]) if rotated else box
+                source.draft("RGB", draft_box)
+                image = ImageOps.exif_transpose(source).convert("RGB")
+                image.thumbnail(box, Image.Resampling.LANCZOS)
+                image = image.copy()
+        if rotated:
+            width, height = height, width
+        value = (image, width, height, stat.st_size)
+        cost = image.width * image.height * 3
+        if cost <= self.budget:
+            while self.cache and self.bytes + cost > self.budget:
+                _, (_, old_cost) = self.cache.popitem(last=False)
+                self.bytes -= old_cost
+            self.cache[key] = (value, cost)
+            self.bytes += cost
+        return value
+
+    def _run(self):
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.closed or self.pending is not None)
+                if self.closed:
+                    return
+                token, path, box = self.pending
+                self.pending = None
+            try:
+                message = (token, path, self._decode(path, box), None)
+            except Exception as error:
+                message = (token, path, None, str(error))
+            with self.condition:
+                if self.closed:
+                    return
+            try:
+                self.results.get_nowait()
+            except queue.Empty:
+                pass
+            self.results.put_nowait(message)
+
+    def close(self):
+        with self.condition:
+            self.closed = True
+            self.pending = None
+            self.condition.notify()
+```
+
+Do not mutate cached Pillow images after publication. The 64 MiB limit covers cached RGB pixels, not decoder buffers, Tk copies or the whole process. Bound source pixel counts and target sizes as well. A 4K RGB image alone is about 24 MiB; decoding PNG may still require the full raster. Worker exceptions become messages, so their lifetime is independent of an `except` scope. For transparent images, add explicit background compositing shared with wallpaper preparation rather than discarding alpha blindly.
+
+This sample is a foreground pipeline. Add at most one low-priority prefetch candidate for the next deck item when no foreground request is pending; publish prefetched pixels only into the LRU, never directly into the preview. A foreground request replaces pending prefetch. For a NAS stall requiring hard cancellation, use the process boundary discussed in Track A; the thread sample cannot cancel a blocked open. Check source stat again after decode if concurrent file replacement must be detected, and do not cache under an obsolete identity.
+
+## 6. UI/UX wireframes
+
+```text
++------------------------------------------------------------------------------+
+| [brand] Desktop Vista                       All my drives. One perfect view. |
++-------------------------+----------------------------------------------------+
+| LIBRARY                 | Apply to: [All displays v] [Independent | Span]    |
+| [Folders | Playlists]   |    +-----------+  +-----------------------+         |
+| All available images    |    | 2 Portrait|  | 1 Main display        |         |
+| Workday                 |    |           |  | 3840 x 2160 [selected]|         |
+| Favourites              |    +-----------+  +-----------------------+         |
+| + New playlist          | [Image preview | Desktop crop preview]             |
+|                         | +------------------------------------------------+ |
+| SOURCES                 | |                                                | |
+| C: Photos       Online  | |         aspect-preserving selected image       | |
+| D: Landscapes   Online  | |        or selected-monitor crop simulation     | |
+| F: Travel       Offline | |                                                | |
+| NAS: Photos     Scanning| +------------------------------------------------+ |
+| + Add folder            | landscape.jpg   3840 x 2160   4.2 MB   14 / 320    |
+|                         | [< Previous] [Random] [Next >] [Heart] [Hide]      |
+| PLAYBACK                | [Reveal] [Copy path]              [Apply to Main]  |
+| Interval [15] [minutes] |                                                    |
+| [x] Shuffle             | Selected: landscape.jpg                            |
+| Fit [Fill v] (global)   | Applied to Main: coast.jpg                         |
+| [Start slideshow]       | Next change: 14:32 · 2 sources available            |
+| [Settings]              |                                                    |
++-------------------------+----------------------------------------------------+
+```
+
+The topology strip above is illustrative; real cards use actual desktop rectangles. Collapse it to one card on a single monitor. Avoid crowding the compact default: secondary source details, tags, schedules and appearance belong in separate panels. Retain a stable main preview and visible apply action. Fit controls clearly state their global scope.
+
+```text
+Playlist: Workday                              [Save] [Cancel]
+Sources                                       Include subfolders
+[x] C:\Photos                                 [ ]
+[x] D:\Landscapes                             [x]
+[x] F:\Travel (offline; membership retained)   [ ]
+Filter: [Any tags v] [Nature] [Minimalist]   [ ] Favourites only
+Hidden images: excluded
+320 available · 85 offline · duplicate paths removed
+
+Tray menu
+Current: coast.jpg
+Next Wallpaper
+Previous Wallpaper
+Pause Slideshow / Resume Slideshow
+Paused automatically: Battery Saver   (when applicable)
+Reveal in File Explorer
+Copy Image Path
+Open Desktop Vista
+Exit
+```
+
+Keyboard rules: Left/Right browse, Enter applies, R consumes a random/deck selection, F toggles favourite, Space toggles playback when focus is not in an editor. Do not intercept typing in text fields. Provide tooltips/accessibility text for icon-only actions, visible keyboard focus, and explicit offline/error states in text as well as colour.
+
+## 7. Configuration schema v2 and migration
+
+Schema version is independent of application release. Keep the existing unversioned config as v1 input. Store preferences and playlist definitions in JSON; store the catalogue in local SQLite and transient deck/history state in a separate versioned playback-state file or database transaction. The following is a valid **example document**, followed by a structural JSON Schema. IDs and example monitor paths are illustrative.
+
+```json
+{
+  "schema_version": 2,
+  "sources": [
+    {"id": "src-local", "path": "C:\\Photos", "kind": "local", "recursive": false, "volume_id": null},
+    {"id": "src-usb", "path": "F:\\Travel", "kind": "removable", "recursive": true, "volume_id": null}
+  ],
+  "playlists": [
+    {"id": "playlist-workday", "name": "Workday", "source_ids": ["src-local", "src-usb"], "image_ids": [], "tags_any": [], "favourites_only": false}
+  ],
+  "playback_source": {"kind": "playlist", "id": "playlist-workday"},
+  "playback": {"shuffle": true, "autostart": false, "resume_after_reconnect": true},
+  "schedule": {"mode": "interval", "seconds": 900, "daily_times": ["08:00"], "timezone": "system", "missed": "apply_once"},
+  "wallpaper": {"backend": "spi", "target": "all", "position": "Fill", "monitor_assignments": []},
+  "tray": {"enabled": true, "close_to_tray": true, "minimize_to_tray": false, "run_at_startup": false},
+  "power": {"pause_on_battery_saver": true, "on_battery": "normal", "battery_interval_seconds": 1800, "pause_fullscreen": true},
+  "cache": {"preview_mib": 64, "wallpaper_mib": 512, "keep_last_good": true},
+  "solar": {"enabled": false, "latitude": null, "longitude": null, "fallback_times": ["06:00", "08:00", "18:00", "21:00"]},
+  "ui": {"preview_mode": "image", "reduced_motion": true},
+  "legacy_v1": {}
+}
+```
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Desktop Vista configuration v2",
+  "type": "object",
+  "required": ["schema_version", "sources", "playlists", "playback_source", "playback", "schedule", "wallpaper", "tray", "power", "cache", "solar", "ui", "legacy_v1"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": 2},
+    "sources": {"type": "array", "items": {"$ref": "#/$defs/source"}},
+    "playlists": {"type": "array", "items": {"$ref": "#/$defs/playlist"}},
+    "playback_source": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/selection"}]},
+    "playback": {
+      "type": "object", "additionalProperties": false,
+      "required": ["shuffle", "autostart", "resume_after_reconnect"],
+      "properties": {"shuffle": {"type": "boolean"}, "autostart": {"type": "boolean"}, "resume_after_reconnect": {"type": "boolean"}}
+    },
+    "schedule": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "seconds", "daily_times", "timezone", "missed"],
+      "properties": {
+        "mode": {"enum": ["interval", "daily", "solar"]},
+        "seconds": {"type": "integer", "minimum": 5, "maximum": 604800},
+        "daily_times": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/time"}},
+        "timezone": {"type": "string", "minLength": 1},
+        "missed": {"const": "apply_once"}
+      },
+      "allOf": [{"if": {"properties": {"mode": {"const": "daily"}}}, "then": {"properties": {"daily_times": {"minItems": 1}}}}]
+    },
+    "wallpaper": {
+      "type": "object", "additionalProperties": false,
+      "required": ["backend", "target", "position", "monitor_assignments"],
+      "properties": {
+        "backend": {"enum": ["spi", "com"]},
+        "target": {"enum": ["all", "per_monitor"]},
+        "position": {"enum": ["Fill", "Fit", "Stretch", "Centre", "Span"]},
+        "monitor_assignments": {"type": "array", "items": {
+          "type": "object", "additionalProperties": false,
+          "required": ["device_path", "source"],
+          "properties": {"device_path": {"$ref": "#/$defs/id"}, "source": {"$ref": "#/$defs/selection"}}
+        }}
+      },
+      "allOf": [
+        {"if": {"properties": {"target": {"const": "per_monitor"}}}, "then": {"properties": {"backend": {"const": "com"}, "position": {"enum": ["Fill", "Fit", "Stretch", "Centre"]}, "monitor_assignments": {"minItems": 1}}}},
+        {"if": {"properties": {"position": {"const": "Span"}}}, "then": {"properties": {"target": {"const": "all"}}}}
+      ]
+    },
+    "tray": {
+      "type": "object", "additionalProperties": false,
+      "required": ["enabled", "close_to_tray", "minimize_to_tray", "run_at_startup"],
+      "properties": {"enabled": {"type": "boolean"}, "close_to_tray": {"type": "boolean"}, "minimize_to_tray": {"type": "boolean"}, "run_at_startup": {"type": "boolean"}}
+    },
+    "power": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pause_on_battery_saver", "on_battery", "battery_interval_seconds", "pause_fullscreen"],
+      "properties": {"pause_on_battery_saver": {"type": "boolean"}, "on_battery": {"enum": ["normal", "throttle", "pause"]}, "battery_interval_seconds": {"type": "integer", "minimum": 5, "maximum": 604800}, "pause_fullscreen": {"type": "boolean"}}
+    },
+    "cache": {
+      "type": "object", "additionalProperties": false,
+      "required": ["preview_mib", "wallpaper_mib", "keep_last_good"],
+      "properties": {"preview_mib": {"type": "integer", "minimum": 8, "maximum": 512}, "wallpaper_mib": {"type": "integer", "minimum": 0, "maximum": 8192}, "keep_last_good": {"type": "boolean"}}
+    },
+    "solar": {
+      "type": "object", "additionalProperties": false,
+      "required": ["enabled", "latitude", "longitude", "fallback_times"],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "latitude": {"type": ["number", "null"], "minimum": -90, "maximum": 90},
+        "longitude": {"type": ["number", "null"], "minimum": -180, "maximum": 180},
+        "fallback_times": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"$ref": "#/$defs/time"}}
+      },
+      "allOf": [{"if": {"properties": {"enabled": {"const": true}}}, "then": {"properties": {"latitude": {"type": "number"}, "longitude": {"type": "number"}}}}]
+    },
+    "ui": {
+      "type": "object", "additionalProperties": false,
+      "required": ["preview_mode", "reduced_motion"],
+      "properties": {"preview_mode": {"enum": ["image", "desktop_crop"]}, "reduced_motion": {"type": "boolean"}}
+    },
+    "legacy_v1": {"type": "object"}
+  },
+  "$defs": {
+    "id": {"type": "string", "minLength": 1},
+    "time": {"type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$"},
+    "selection": {
+      "type": "object", "additionalProperties": false, "required": ["kind", "id"],
+      "properties": {"kind": {"enum": ["source", "playlist"]}, "id": {"$ref": "#/$defs/id"}}
+    },
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "path", "kind", "recursive", "volume_id"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "path": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["local", "removable", "network"]}, "recursive": {"type": "boolean"},
+        "volume_id": {"type": ["string", "null"]}
+      }
+    },
+    "playlist": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "name", "source_ids", "image_ids", "tags_any", "favourites_only"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "name": {"type": "string", "minLength": 1},
+        "source_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "image_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "tags_any": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/id"}},
+        "favourites_only": {"type": "boolean"}
+      }
+    }
+  }
+}
+```
+
+Beyond structural validation, enforce unique source/playlist IDs, valid references, unique monitor assignments, absolute local/UNC paths, available timezone identifiers, and ordered solar fallback times. Require `solar.enabled` when schedule mode is solar. Reject non-finite numeric input during JSON loading. Offline paths are valid configuration; do not delete them because they cannot currently be resolved. Validate referenced image/tag IDs against catalogue state with a repair report rather than silently dropping them.
+
+**Migration algorithm:**
+
+1. Read without side effects. Missing version means v1; version 2 validates directly; newer unknown versions open in recovery/read-only mode rather than being overwritten.
+2. Deep-copy and strictly validate old fields. Map each normalized unique `folders` path to a stable source ID. Retain missing drives and preserve order; recursion defaults to false. UNC paths map to network sources; detect removable media when available rather than inferring solely from drive letter.
+3. Map `current_folder` to `playback_source`; if it is absent from the source list, retain the original value in `legacy_v1` and select the first source or null. Resolve `current_image` into playback state after catalogue discovery, retaining its original string for offline recovery.
+4. Map old `style`, `shuffle`, known interval labels and valid `interval_custom_seconds`; old tray settings map directly with safe defaults for new keys. Do not enable startup, solar or slideshow autostart during migration. Retain a copy of the original object in `legacy_v1` to support diagnosis and export.
+5. Validate the entire candidate and referential integrity before saving. Create a non-overwritten version-1 backup, then write a unique temporary sibling, flush/fsync it and use atomic replacement. Report write errors; keep the original intact. Treat database creation and JSON migration as recoverable staged operations, not an assumed cross-file transaction.
+6. Migration is idempotent. The new app reads v1 and v2. **The old app is not forward-compatible**: its validator discards unfamiliar fields. Provide an explicit v1 export or restore the backup for downgrade; never run the old writer against the only v2 file.
+
+For installed builds, migrate writable settings from the application directory into a per-user local application-data directory; keep an explicit portable mode if wanted. Do not mix that location migration with a silent reset of the user's current library.
+
+## 8. Phased implementation roadmap and acceptance gates
+
+Sprint durations below are planning estimates for one developer, not delivery commitments. Each sprint is independently reviewable. No application implementation sprint was performed by this review.
+
+| Sprint | Release | Scope | Acceptance gate |
+|---|---|---|---|
+| 1 · 3–5 days | v1.2 completion | Exception capture, queue dispatch, source-generation invalidation, tray apply semantics/readiness, supplied icon | Corrupt image displays a useful error; empty-source switch never shows old preview; tray Next actually applies; failed tray start retains visible window |
+| 2 · 4–6 days | v1.2 completion | Bounded decode/LRU, conversion worker, strict config, shutdown/single instance | 500 rapid navigation/resize requests remain bounded; no post-destroy Tcl callbacks; malformed booleans and infinite intervals recover safely |
+| 3 · 1–2 weeks | v1.3 | Schema migration, catalogue, cross-folder playlist resolver | Two-drive playlist deduplicates paths; version-1 backup and restart restore selection; catalogue failures do not overwrite config |
+| 4 · 1 week | v1.3 | Offline probes, retry policy, cache fallback, favourites/hidden | Unplug/replug USB and timed-out NAS recover without Tk stalls; manual pause remains respected; source files remain unchanged |
+| 5 · 1 week | v1.4 | Explicit playback state, power/fullscreen policy, wall-clock schedules | Combined pause reasons, sleep/resume and DST cases pass; no catch-up storm; unknown power state behaves predictably |
+| 6 · 1–2 weeks | v1.5 | Read-only topology strip, tags and collections, solar model | Portrait/negative-coordinate layouts render correctly; reconnect preserves assignments; virtual collections span sources without copying |
+| 7 · 1–2 weeks | v2.0 | COM per-monitor output, global fit model, span crop assistant | Change one selected screen without altering others' images; disconnected-target apply fails clearly; span and mixed-DPI checks pass |
+| 8 · optional, time-boxed | v2.0 experiments | Preview transitions, Mica, lock screen; desktop-crossfade go/no-go | Each feature can be disabled independently; unsupported systems retain usable UI; no undocumented renderer enters the core by default |
+
+### Validation plan
+
+Pure tests: strict config types/ranges, v1 migration idempotence, referential integrity, duplicate and offline source resolution, 5,000-image shuffle cycles and cycle boundaries, hidden-image reconciliation, combined pause reasons, monotonic interval behaviour, DST folds/gaps, stale preview/source cancellation and LRU eviction. Test invariants and observable outcomes, not internal implementation mirrors.
+
+Windows integration: a disposable test profile for actual wallpaper writes; Win10 and Win11; one/two/three displays; mixed scaling (100/150/200%); portrait and negative coordinates; USB disconnection mid-read; unavailable/denied NAS; sleep/resume; Explorer restart; startup before tray readiness; packaged and script launches. Verify windows, tray and taskbar branding separately. UI thread safety and per-monitor correctness cannot be certified by helper-only tests.
+
+Performance targets to measure, not claimed results: input reaction below 100 ms during local decode, cached preview typically below 50 ms, current local uncached 4K preview typically below 250 ms on recorded hardware, and a stable memory ceiling under repeated browsing. Measure p50/p95, working set, queue depth, startup time and idle CPU; distinguish local SSD, USB and NAS. A 64 MiB preview cache is a starting budget. Network timeouts need their own results, not inclusion in an optimistic average.
+
+### Review completion record
+
+Completed: source/configuration/roadmap inspection, supplied-icon visual and size inspection, primary-source API research, feature matrix, architecture and Python blueprints, wireframes, v2 schema/migration design, and phased acceptance plan.
+
+Verification completed:
+
+* Existing helper suite: `python -B -m pytest -q -p no:cacheprovider` — **41 passed in 3.25 seconds**.
+* All four Python code blocks parse successfully using Python's AST parser. This confirms syntax, not tray/COM integration correctness.
+* Preview-service sample exercised in memory with temporary test images: successful decode, cache reuse, missing-file error reporting and worker shutdown passed.
+* Both JSON blocks parse successfully. The `jsonschema` package is unavailable in the current Python environment, so Draft 2020-12 metaschema validation and automated example-against-schema validation were not run. Structural and semantic constraints were reviewed manually.
+* ICO frame inventory and PNG dimensions verified with Pillow 12.1.1; PNG visually inspected.
+* Working-tree check shows this review as the only new review artifact; the pre-existing README deletion and icon directory remain present.
+
+Proposed feature implementations and live Windows tray, wallpaper, startup, COM, power, lock-screen and backdrop checks remain pending by design. No changes were applied to the user's desktop wallpaper or startup registry during this review.
