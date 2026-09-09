@@ -55,5 +55,14 @@
     "longitude": null,
     "fallback_times": ["06:00", "08:00", "18:00", "21:00"]
   },
-  "wallpaper_target": "spi"
+  "wallpaper_target": "spi",
+  "hotkeys": {
+    "enabled": true,
+    "next": "Win+Alt+N",
+    "prev": "Win+Alt+P",
+    "favourite": "Win+Alt+L",
+    "hide": "Win+Alt+H",
+    "undo": "Win+Alt+Z",
+    "toggle": "Win+Alt+S"
+  }
 }

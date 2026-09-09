@@ -8,7 +8,7 @@
 # See the LICENSE file in the project root for the full proprietary notice.
 """
 Desktop Vista  —  All my drives. One perfect view.
-Version 1.5.1  (September 2026)
+Version 1.6  (September 2026)
 
 A lightweight Windows wallpaper manager.
 
@@ -116,9 +116,40 @@ v1.5.1 — v2.0 groundwork, not v2.0 itself:
       hardware. Treat the per-monitor claim as unconfirmed until checked.
 
 Still ahead for the full v2.0 milestone: independent per-monitor
-slideshow/navigation state, the span crop assistant, wiring solar/tags
-into the *applied* wallpaper (not just the UI), and a go/no-go decision
-on desktop crossfade — see ROADMAP.md.
+slideshow/navigation state, the span crop assistant, wiring tags into the
+*applied* wallpaper (not just the UI), and a go/no-go decision on desktop
+crossfade — see ROADMAP.md.
+
+New in v1.6 "Scriptable companion" (notes/notes_005.txt) — last release
+before the multi-monitor rewrite; nothing here requires a second display:
+    - Fixed a real v1.5 defect: a saved collection playback_source was
+      silently dropped on restart (_validate_config's kind whitelist and
+      _resolve_initial_source had no "collection" branch)
+    - Playback history ring (100 applied wallpapers, playback_state.json)
+      with Undo; tray "Previous" now walks this history instead of
+      decrementing the raw index, since shuffle order isn't linear
+    - 1 Hz scheduler heartbeat replaces one long after(seconds * 1000):
+      polls a due-time instead of arming a single-shot timer, so a
+      sleep/hibernate gap finds "due" true at most once on resume rather
+      than firing a catch-up burst
+    - Solar dawn/day/dusk/night wired into the live slideshow (schedule.py):
+      advances at real sun-position boundaries when a location is set,
+      biases the next pick toward phase-tagged images when the library has
+      any, and never stalls a library with no solar tags
+    - Single-instance guard (CreateMutexW) — a second launch forwards to
+      the running instance instead of opening a duplicate window
+    - Named-pipe CLI IPC (ipc.py): --next/--prev/--pause/--resume/--toggle/
+      --status/--set/--favourite/--hide/--undo control the running
+      instance from a script or Task Scheduler; pipe is owner-only (SDDL),
+      not world-accessible
+    - Global hotkeys (hotkeys.py, RegisterHotKey on a dedicated thread):
+      Win+Alt+N/P/L/H/Z/S by default; a bind conflict with another running
+      application is logged and shown, never silently retried
+    - Preview decode cancellation: navigating rapidly cancels the previous
+      still-queued decode instead of letting a burst of stale work run to
+      completion; the 15s reconnect poll now probes folder reachability
+      off the Tk thread so an unreachable NAS/UNC path can no longer
+      freeze the window
 """
 
 from __future__ import annotations
@@ -135,11 +166,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 # Optional Windows-only modules — must not break import on Linux (tests).
 try:
@@ -170,6 +203,10 @@ import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageOps
 from tkinter import Canvas, filedialog, messagebox, simpledialog
 
+import hotkeys
+import ipc
+import schedule
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -185,7 +222,7 @@ log = logging.getLogger("desktop_vista")
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Desktop Vista"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6"
 TAGLINE = "All my drives. One perfect view."
 
 # Frozen (PyInstaller) builds extract bundled files under a temporary
@@ -202,7 +239,10 @@ else:
     RESOURCE_DIR = APP_DIR
 
 CONFIG_PATH = APP_DIR / "config.json"
+PLAYBACK_STATE_PATH = APP_DIR / "playback_state.json"
 BRAND_ICON_PATH = RESOURCE_DIR / "icon" / "desktop_vista.ico"
+
+HISTORY_MAX = 100  # ring of successfully-applied wallpapers, for tray Previous/Undo
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 NATIVE_WALLPAPER_EXTS = {".jpg", ".jpeg", ".bmp", ".png"}
@@ -229,6 +269,13 @@ SLIDESHOW_INTERVALS = {
 CUSTOM_INTERVAL_LABEL = "Custom…"
 MIN_CUSTOM_INTERVAL_SECONDS = 5
 MAX_CUSTOM_INTERVAL_SECONDS = 86400
+
+SCHEDULE_MODE_LABELS = {
+    "interval": "Fixed interval",
+    "daily": "Daily times",
+    "solar": "Solar (dawn/day/dusk/night)",
+}
+SCHEDULE_LABEL_TO_MODE = {label: mode for mode, label in SCHEDULE_MODE_LABELS.items()}
 
 OFFLINE_SUFFIX = "  (offline)"
 
@@ -266,13 +313,35 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # v2.0 experimental — "spi" (default, global SystemParametersInfoW) never
     # touches windows_wallpaper_com; "com" opts into the per-monitor engine.
     "wallpaper_target": "spi",
+    # v1.6 — global hotkeys (RegisterHotKey), default set from notes_005 §2.3.1.
+    # Bindings are "Mod+Mod+Key" text so a future rebind UI needs no schema
+    # change; each is independently re-validated with hotkeys.parse_binding.
+    "hotkeys": {
+        "enabled": True,
+        "next": "Win+Alt+N",
+        "prev": "Win+Alt+P",
+        # "F" (notes_005's suggested mnemonic) collides with an existing
+        # system-wide binding on Mark's dev machine (likely a GPU driver
+        # overlay) — verified live via RegisterHotKey; "L" (for "Like") is
+        # free there and just as mnemonic. Still independently rebindable
+        # per-action in config.json if it ever collides with something else.
+        "favourite": "Win+Alt+L",
+        "hide": "Win+Alt+H",
+        "undo": "Win+Alt+Z",
+        "toggle": "Win+Alt+S",
+    },
 }
+
+HOTKEY_ACTIONS = ("next", "prev", "favourite", "hide", "undo", "toggle")
+# Stable per-action ids for RegisterHotKey/WM_HOTKEY (arbitrary but fixed).
+HOTKEY_ACTION_IDS = {action: i + 1 for i, action in enumerate(HOTKEY_ACTIONS)}
 
 STARTUP_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "DesktopVista"
 
 RECONNECT_POLL_MS = 15_000
 POWER_POLL_MS = 5_000
+SCHEDULER_TICK_MS = 1_000
 DAILY_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 # SHQueryUserNotificationState values worth suppressing on: a fullscreen D3D
 # app or a presentation is running. QUNS_BUSY/QUIET_TIME are deliberately
@@ -315,9 +384,23 @@ def is_folder_online(folder: str) -> bool:
         return False
 
 
-def folder_display_label(folder: str) -> str:
-    """Decorate *folder* with an offline badge when its drive is unreachable."""
-    return folder if is_folder_online(folder) else f"{folder}{OFFLINE_SUFFIX}"
+def folder_display_label(folder: str, online_cache: Optional[dict[str, bool]] = None) -> str:
+    """Decorate *folder* with an offline badge when its drive is unreachable.
+
+    *online_cache*, when given, is consulted instead of probing the
+    filesystem directly — an unreachable NAS/UNC path can make is_folder_online
+    block for the OS's network timeout (tens of seconds), which must never
+    happen on the Tk thread. Callers on a recurring/automatic path (the
+    reconnect poll) pass the cache the background probe last populated;
+    one-off, user-initiated dialogs (playlist editor, etc.) still probe
+    directly since a single brief check there is expected UI behaviour,
+    same as a native file picker validating a path.
+    """
+    if online_cache is not None:
+        online = online_cache.get(folder, True)
+    else:
+        online = is_folder_online(folder)
+    return folder if online else f"{folder}{OFFLINE_SUFFIX}"
 
 
 def new_id() -> str:
@@ -338,20 +421,29 @@ def find_playlist(cfg: dict, playlist_id: str) -> dict | None:
     return next((p for p in cfg.get("playlists", []) if p.get("id") == playlist_id), None)
 
 
-def playlist_folder_status(playlist: dict) -> tuple[int, int]:
-    """Return (online_count, total_count) for a playlist's member folders."""
+def playlist_folder_status(
+    playlist: dict, online_cache: Optional[dict[str, bool]] = None
+) -> tuple[int, int]:
+    """Return (online_count, total_count) for a playlist's member folders.
+    See folder_display_label for *online_cache*."""
     folders = playlist.get("folders", [])
-    online = sum(1 for f in folders if is_folder_online(f))
+    if online_cache is not None:
+        online = sum(1 for f in folders if online_cache.get(f, True))
+    else:
+        online = sum(1 for f in folders if is_folder_online(f))
     return online, len(folders)
 
 
-def source_display_label(cfg: dict, kind: str, source_id: str) -> str:
-    """Human-readable label for a folder, playlist, or collection source."""
+def source_display_label(
+    cfg: dict, kind: str, source_id: str, online_cache: Optional[dict[str, bool]] = None
+) -> str:
+    """Human-readable label for a folder, playlist, or collection source.
+    See folder_display_label for *online_cache*."""
     if kind == "playlist":
         playlist = find_playlist(cfg, source_id)
         if playlist is None:
             return f"(missing playlist {source_id})"
-        online, total = playlist_folder_status(playlist)
+        online, total = playlist_folder_status(playlist, online_cache)
         name = f"▶ {playlist.get('name', '(unnamed)')}"
         if total and online < total:
             return f"{name}  ({online}/{total} drives online)"
@@ -361,7 +453,7 @@ def source_display_label(cfg: dict, kind: str, source_id: str) -> str:
         if collection is None:
             return f"(missing collection {source_id})"
         return f"# {collection.get('name', '(unnamed)')}"
-    return folder_display_label(source_id)
+    return folder_display_label(source_id, online_cache)
 
 
 def find_collection(cfg: dict, collection_id: str) -> dict | None:
@@ -759,21 +851,9 @@ def _validate_config(raw: dict) -> dict[str, Any]:
             log.warning("Invalid '%s' in config; using default.", list_key)
             cfg[list_key] = []
 
-    playback_source = raw.get("playback_source")
-    if (
-        isinstance(playback_source, dict)
-        and playback_source.get("kind") in ("folder", "playlist")
-        and isinstance(playback_source.get("id"), str)
-        and playback_source.get("id")
-    ):
-        kind, sid = playback_source["kind"], playback_source["id"]
-        valid_ref = (
-            (kind == "folder" and sid in cfg["folders"])
-            or (kind == "playlist" and find_playlist(cfg, sid) is not None)
-        )
-        cfg["playback_source"] = {"kind": kind, "id": sid} if valid_ref else None
-    else:
-        cfg["playback_source"] = None
+    # playback_source is validated further down, once collections (v1.5) has
+    # also been populated — a saved collection reference needs both lists
+    # to check against, not just playlists.
 
     # ---- v1.4 additions (all additive; absent/invalid -> safe defaults) ----
 
@@ -798,7 +878,12 @@ def _validate_config(raw: dict) -> dict[str, Any]:
             else []
         )
         cfg["schedule"] = {
-            "mode": mode if mode in ("interval", "daily") else "interval",
+            # "solar" (v1.6): advance at dawn/day/dusk/night boundaries
+            # instead of a fixed interval — see _compute_next_due/_solar_advance.
+            # No dependency on solar.enabled/coordinates being valid here;
+            # an unset location degrades to the fallback_times at run time
+            # rather than being rejected at load time.
+            "mode": mode if mode in ("interval", "daily", "solar") else "interval",
             "daily_times": valid_times,
         }
     else:
@@ -847,6 +932,23 @@ def _validate_config(raw: dict) -> dict[str, Any]:
         log.warning("Invalid 'collections' in config; using default.")
     cfg["collections"] = valid_collections
 
+    playback_source = raw.get("playback_source")
+    if (
+        isinstance(playback_source, dict)
+        and playback_source.get("kind") in ("folder", "playlist", "collection")
+        and isinstance(playback_source.get("id"), str)
+        and playback_source.get("id")
+    ):
+        kind, sid = playback_source["kind"], playback_source["id"]
+        valid_ref = (
+            (kind == "folder" and sid in cfg["folders"])
+            or (kind == "playlist" and find_playlist(cfg, sid) is not None)
+            or (kind == "collection" and find_collection(cfg, sid) is not None)
+        )
+        cfg["playback_source"] = {"kind": kind, "id": sid} if valid_ref else None
+    else:
+        cfg["playback_source"] = None
+
     solar_raw = raw.get("solar", DEFAULT_CONFIG["solar"])
     if isinstance(solar_raw, dict):
         solar_defaults = DEFAULT_CONFIG["solar"]
@@ -881,6 +983,28 @@ def _validate_config(raw: dict) -> dict[str, Any]:
 
     wallpaper_target = raw.get("wallpaper_target", DEFAULT_CONFIG["wallpaper_target"])
     cfg["wallpaper_target"] = wallpaper_target if wallpaper_target in ("spi", "com") else "spi"
+
+    # ---- v1.6 additions (all additive; absent/invalid -> safe defaults) ----
+
+    hotkeys_raw = raw.get("hotkeys", DEFAULT_CONFIG["hotkeys"])
+    hotkeys_defaults = DEFAULT_CONFIG["hotkeys"]
+    if isinstance(hotkeys_raw, dict):
+        enabled = hotkeys_raw.get("enabled")
+        valid_hotkeys = {"enabled": enabled if isinstance(enabled, bool) else hotkeys_defaults["enabled"]}
+        for action in HOTKEY_ACTIONS:
+            binding = hotkeys_raw.get(action)
+            # Each binding is independently re-validated (must still parse
+            # as "Mod+Mod+Key") rather than trusted verbatim from disk —
+            # falls back to the factory default per-action, not en masse.
+            valid_hotkeys[action] = (
+                binding
+                if isinstance(binding, str) and hotkeys.parse_binding(binding) is not None
+                else hotkeys_defaults[action]
+            )
+        cfg["hotkeys"] = valid_hotkeys
+    else:
+        log.warning("Invalid 'hotkeys' in config; using default.")
+        cfg["hotkeys"] = copy.deepcopy(hotkeys_defaults)
 
     return cfg
 
@@ -917,6 +1041,45 @@ def save_config(cfg: dict, path: Path | None = None) -> None:
         os.replace(tmp_path, cfg_path)
     except OSError as exc:
         log.error("Could not save config: %s", exc)
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
+
+
+def load_history(path: Path | None = None) -> list[str]:
+    """Load the persisted applied-wallpaper history ring (oldest first,
+    most recently applied last). Separate from config.json so a corrupt
+    or missing state file never affects settings load."""
+    state_path = path if path is not None else PLAYBACK_STATE_PATH
+    if state_path.exists():
+        try:
+            raw = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                entries = raw.get("history", [])
+                if isinstance(entries, list) and all(isinstance(p, str) for p in entries):
+                    return entries[-HISTORY_MAX:]
+        except (json.JSONDecodeError, OSError) as exc:
+            log.warning("Could not read playback history (%s); starting empty.", exc)
+    return []
+
+
+def save_history(history: Sequence[str], path: Path | None = None) -> None:
+    """Atomically persist the applied-wallpaper history ring, same
+    unique-temp-file pattern as save_config (safe under two instances)."""
+    state_path = path if path is not None else PLAYBACK_STATE_PATH
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=state_path.stem + ".", suffix=".tmp", dir=str(state_path.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        data = json.dumps({"history": list(history)}, indent=2)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp_path, state_path)
+    except OSError as exc:
+        log.error("Could not save playback history: %s", exc)
         try:
             if tmp_path.exists():
                 tmp_path.unlink()
@@ -1150,9 +1313,15 @@ def load_brand_icon(size: int = 64) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 class DesktopVista(ctk.CTk):
-    def __init__(self, start_minimized: bool = False) -> None:
+    def __init__(self, start_minimized: bool = False, mutex_handle: Any = None) -> None:
         super().__init__()
         self._start_minimized = start_minimized
+        # Held for the process lifetime once __main__ has already claimed
+        # single-instance ownership via ipc.try_become_primary(); released
+        # on close so a later launch can become primary in turn.
+        self._mutex_handle = mutex_handle
+        self._ipc_server: Optional[ipc.IpcServer] = None
+        self._hotkey_listener: Optional[hotkeys.HotkeyListener] = None
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
@@ -1165,6 +1334,11 @@ class DesktopVista(ctk.CTk):
         self.index: int = -1
         self._active_kind: str = "folder"
         self._active_id: Optional[str] = None
+        # Populated off the Tk thread by _reconnect_tick's background probe.
+        # Empty at startup — folder_display_label/playlist_folder_status
+        # treat a missing key as "online" (True) rather than pessimistically
+        # badging every folder offline before the first probe completes.
+        self._folder_online_cache: dict[str, bool] = {}
         self._source_label_to_key: dict[str, tuple[str, str]] = {}
         self._reconnect_job: Any = None
         # "Running" reflects user intent (Start/Stop Slideshow); _slideshow_job
@@ -1181,12 +1355,23 @@ class DesktopVista(ctk.CTk):
         self._target_monitor_label_to_id: dict[str, Optional[str]] = {"All Displays": None}
         self._preview_ref = None  # keep CTkImage alive
         self._slideshow_job: Any = None
+        # A 1 Hz heartbeat polls these due-times rather than arming one long
+        # single-shot after() — that way a sleep/hibernate gap finds "due"
+        # true at most once on the next poll instead of Tk trying to fire a
+        # backlog of missed intervals. Interval mode uses monotonic time
+        # (immune to wall-clock/DST changes); daily mode keeps the existing
+        # wall-clock trigger so its self-correcting DST behaviour (v1.4) is
+        # unchanged. Exactly one of the two is set at a time.
+        self._next_due_mono: Optional[float] = None
+        self._next_due_wall: Optional[datetime] = None
         self._save_job: Any = None
         self._shuffle_order: list[int] = []
         self._shuffle_cursor: int = 0
+        self._history: deque[str] = deque(load_history(), maxlen=HISTORY_MAX)
         self._load_token: int = 0
         self._preview_size: tuple[int, int] = (PREVIEW_W, PREVIEW_H)
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="dv-img")
+        self._preview_future: Any = None
         self._closing = False
         self.tray_icon: Any = None
         self._tray_thread: Optional[threading.Thread] = None
@@ -1205,6 +1390,8 @@ class DesktopVista(ctk.CTk):
         self._sync_startup_state()
         self._start_reconnect_watcher()
         self._start_power_monitor()
+        self._start_ipc_server()
+        self._start_hotkeys()
         if self._start_minimized:
             if self._tray_is_ready():
                 self.withdraw()
@@ -1329,9 +1516,9 @@ class DesktopVista(ctk.CTk):
                       command=self._on_power_settings_changed).grid(
             row=row(), column=0, padx=16, pady=(4, 6), sticky="w")
         self.schedule_mode_var = ctk.StringVar(
-            value="Daily times" if self.cfg["schedule"]["mode"] == "daily" else "Fixed interval")
+            value=SCHEDULE_MODE_LABELS.get(self.cfg["schedule"]["mode"], "Fixed interval"))
         ctk.CTkOptionMenu(side, variable=self.schedule_mode_var,
-                          values=["Fixed interval", "Daily times"],
+                          values=list(SCHEDULE_MODE_LABELS.values()),
                           command=self._on_schedule_mode_changed).grid(
             row=row(), column=0, padx=16, pady=(0, 4), sticky="ew")
         self.daily_times_var = ctk.StringVar(value=", ".join(self.cfg["schedule"]["daily_times"]))
@@ -1340,6 +1527,23 @@ class DesktopVista(ctk.CTk):
         self.daily_times_entry.grid(row=row(), column=0, padx=16, sticky="ew")
         ctk.CTkButton(side, text="Apply times", fg_color="gray30", hover_color="gray25",
                       command=self._on_daily_times_apply).grid(
+            row=row(), column=0, padx=16, pady=(4, 0), sticky="ew")
+
+        # Solar mode's location — only consulted when schedule mode is
+        # "Solar"; an unset/disabled location falls back to the fallback
+        # times above at run time rather than blocking the mode switch.
+        self.solar_enabled_var = ctk.BooleanVar(value=self.cfg["solar"]["enabled"])
+        ctk.CTkSwitch(side, text="Use solar location (else fallback times)",
+                      variable=self.solar_enabled_var,
+                      command=self._on_solar_settings_changed).grid(
+            row=row(), column=0, padx=16, pady=(6, 0), sticky="w")
+        self.solar_coords_var = ctk.StringVar(value=self._format_solar_coords())
+        self.solar_coords_entry = ctk.CTkEntry(
+            side, textvariable=self.solar_coords_var,
+            placeholder_text="latitude, longitude e.g. 51.5074, -0.1278")
+        self.solar_coords_entry.grid(row=row(), column=0, padx=16, sticky="ew")
+        ctk.CTkButton(side, text="Apply location", fg_color="gray30", hover_color="gray25",
+                      command=self._on_solar_coords_apply).grid(
             row=row(), column=0, padx=16, pady=(4, 0), sticky="ew")
 
         # Monitor topology (read-only; v1.5 groundwork — no per-monitor apply yet)
@@ -1374,6 +1578,22 @@ class DesktopVista(ctk.CTk):
         self.target_monitor_menu.grid(row=row(), column=0, padx=16, pady=(0, 4), sticky="ew")
         if self.cfg.get("wallpaper_target") == "com":
             self._refresh_com_monitor_menu()
+
+        # Global hotkeys (v1.6) — fixed default bindings (see HOTKEY_ACTIONS);
+        # per-binding rebinding UI is not in scope, only enable/disable.
+        ctk.CTkLabel(side, text="HOTKEYS", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
+        self.hotkeys_enabled_var = ctk.BooleanVar(value=self.cfg["hotkeys"]["enabled"])
+        self.hotkeys_switch = ctk.CTkSwitch(
+            side, text="Global hotkeys enabled", variable=self.hotkeys_enabled_var,
+            command=self._on_hotkeys_enabled_changed)
+        self.hotkeys_switch.grid(row=row(), column=0, padx=16, pady=(4, 0), sticky="w")
+        if not hotkeys.is_available():
+            self.hotkeys_switch.configure(state="disabled")
+        self.hotkeys_status_label = ctk.CTkLabel(
+            side, text="", text_color="gray60", font=ctk.CTkFont(size=10),
+            wraplength=260, justify="left")
+        self.hotkeys_status_label.grid(row=row(), column=0, padx=16, pady=(2, 0), sticky="w")
 
         # Startup
         ctk.CTkLabel(side, text="STARTUP", font=ctk.CTkFont(size=11, weight="bold"),
@@ -1587,6 +1807,8 @@ class DesktopVista(ctk.CTk):
                 return kind, sid
             if kind == "playlist" and find_playlist(self.cfg, sid) is not None:
                 return kind, sid
+            if kind == "collection" and find_collection(self.cfg, sid) is not None:
+                return kind, sid
         current_folder = self.cfg.get("current_folder")
         if current_folder and current_folder in self.cfg["folders"]:
             return "folder", current_folder
@@ -1624,11 +1846,11 @@ class DesktopVista(ctk.CTk):
         labels: list[str] = []
         mapping: dict[str, tuple[str, str]] = {}
         for folder in self.cfg["folders"]:
-            label = folder_display_label(folder)
+            label = folder_display_label(folder, self._folder_online_cache)
             labels.append(label)
             mapping[label] = ("folder", folder)
         for playlist in self.cfg["playlists"]:
-            label = source_display_label(self.cfg, "playlist", playlist["id"])
+            label = source_display_label(self.cfg, "playlist", playlist["id"], self._folder_online_cache)
             labels.append(label)
             mapping[label] = ("playlist", playlist["id"])
         for collection in self.cfg["collections"]:
@@ -2052,17 +2274,47 @@ class DesktopVista(ctk.CTk):
     def _reconnect_tick(self) -> None:
         if self._closing:
             return
+        # is_folder_online()/list_images() are OS filesystem calls — for an
+        # unreachable NAS/UNC path these can block for the network timeout
+        # (tens of seconds), so every bit of this probe runs off the Tk
+        # thread; only the *result* is marshalled back via after(0, ...).
+        all_folders = dedupe_preserve_order(
+            list(self.cfg["folders"])
+            + [f for p in self.cfg["playlists"] for f in p.get("folders", [])]
+        )
         had_no_images = not self.images
-        self._refresh_source_menu()  # refreshes offline badges without user action
-        if had_no_images and self._active_id is not None:
-            images = resolve_source_images(self.cfg, self._active_kind, self._active_id)
-            if images:
-                self.images = images
-                self.index = 0
-                self._load_token += 1
-                self._set_status("Source reconnected — resuming.")
-                self._show_current()
+        active_kind, active_id = self._active_kind, self._active_id
+        cfg_snapshot = self.cfg
+
+        def probe() -> tuple[dict[str, bool], Optional[list[str]]]:
+            online = {f: is_folder_online(f) for f in all_folders}
+            images = (
+                resolve_source_images(cfg_snapshot, active_kind, active_id)
+                if had_no_images and active_id is not None
+                else None
+            )
+            return online, images
+
+        future = self._executor.submit(probe)
+        future.add_done_callback(lambda fut: self.after(0, self._on_reconnect_probe_done, fut))
         self._reconnect_job = self.after(RECONNECT_POLL_MS, self._reconnect_tick)
+
+    def _on_reconnect_probe_done(self, future) -> None:
+        if self._closing:
+            return
+        try:
+            online, images = future.result()
+        except Exception as exc:
+            log.warning("Reconnect probe failed: %s", exc)
+            return
+        self._folder_online_cache = online
+        self._refresh_source_menu()  # refreshes offline badges without user action
+        if images:
+            self.images = images
+            self.index = 0
+            self._load_token += 1
+            self._set_status("Source reconnected — resuming.")
+            self._show_current()
 
     # ---------------- Preview sizing ----------------
 
@@ -2117,7 +2369,14 @@ class DesktopVista(ctk.CTk):
                 lambda: self._on_preview_ready(token, path, img, width, height, size_bytes),
             )
 
-        self._executor.submit(work)
+        if self._preview_future is not None:
+            # Cancels only if the previous decode hasn't started yet (a
+            # no-op otherwise) — bounds the executor queue during a burst
+            # of rapid navigation instead of letting hundreds of already-
+            # stale decodes (their result would be dropped by the token
+            # check anyway) run to completion one by one.
+            self._preview_future.cancel()
+        self._preview_future = self._executor.submit(work)
         # Debounced save of current_image — do NOT write on every show synchronously.
         self._schedule_save()
 
@@ -2226,9 +2485,49 @@ class DesktopVista(ctk.CTk):
         self._schedule_save()
 
     def _on_schedule_mode_changed(self, value: str) -> None:
-        self.cfg["schedule"]["mode"] = "daily" if value == "Daily times" else "interval"
+        self.cfg["schedule"]["mode"] = SCHEDULE_LABEL_TO_MODE.get(value, "interval")
         self._flush_save()
         if self._slideshow_running:
+            self._stop_slideshow(update_status=False)
+            self._start_slideshow()
+
+    def _format_solar_coords(self) -> str:
+        lat, lon = self.cfg["solar"]["latitude"], self.cfg["solar"]["longitude"]
+        return f"{lat}, {lon}" if lat is not None and lon is not None else ""
+
+    def _on_solar_settings_changed(self) -> None:
+        self.cfg["solar"]["enabled"] = bool(self.solar_enabled_var.get())
+        self._flush_save()
+        if self._slideshow_running and self.cfg["schedule"]["mode"] == "solar":
+            self._stop_slideshow(update_status=False)
+            self._start_slideshow()
+
+    def _on_solar_coords_apply(self) -> None:
+        raw = self.solar_coords_var.get().strip()
+        if not raw:
+            self.cfg["solar"]["latitude"] = None
+            self.cfg["solar"]["longitude"] = None
+            self._flush_save()
+            self._set_status("Solar location cleared — solar mode will use fallback times.")
+            return
+        parts = [p.strip() for p in raw.split(",")]
+        if len(parts) != 2:
+            messagebox.showerror(APP_NAME, "Enter coordinates as: latitude, longitude")
+            return
+        try:
+            lat, lon = float(parts[0]), float(parts[1])
+        except ValueError:
+            messagebox.showerror(APP_NAME, "Latitude/longitude must be numbers.")
+            return
+        if not (math.isfinite(lat) and math.isfinite(lon) and -90 <= lat <= 90 and -180 <= lon <= 180):
+            messagebox.showerror(APP_NAME, "Latitude must be -90..90 and longitude -180..180.")
+            return
+        self.cfg["solar"]["latitude"] = lat
+        self.cfg["solar"]["longitude"] = lon
+        self.solar_coords_var.set(f"{lat}, {lon}")
+        self._flush_save()
+        self._set_status("Solar location updated.")
+        if self._slideshow_running and self.cfg["schedule"]["mode"] == "solar":
             self._stop_slideshow(update_status=False)
             self._start_slideshow()
 
@@ -2248,11 +2547,10 @@ class DesktopVista(ctk.CTk):
             self._stop_slideshow(update_status=False)
             self._start_slideshow()
 
-    def _set_wallpaper(self, silent: bool = False) -> None:
-        if not (0 <= self.index < len(self.images)):
-            self._set_status("Nothing selected.")
-            return
-        path = self.images[self.index]
+    def _apply_path(self, path: str, silent: bool) -> bool:
+        """Apply *path* as the desktop wallpaper via the configured backend.
+        Returns True on success. Does not touch self.index/self.images or
+        the history ring — callers decide whether to sync those."""
         try:
             if self.cfg.get("wallpaper_target") == "com":
                 backend = self._get_com_backend()
@@ -2265,6 +2563,7 @@ class DesktopVista(ctk.CTk):
             else:
                 set_windows_wallpaper(path, self.style_var.get())
                 self._set_status(f"Wallpaper set: {Path(path).name}")
+            return True
         except Exception as exc:
             if silent:
                 # Unattended slideshow: never block on a modal dialog — most
@@ -2274,6 +2573,38 @@ class DesktopVista(ctk.CTk):
                 self._refresh_source_menu()
             else:
                 messagebox.showerror(APP_NAME, f"Could not set wallpaper:\n{exc}")
+            return False
+
+    def _record_history(self, path: str) -> None:
+        """Append a successfully-applied path to the history ring (no-op if
+        it's already the most recent entry) and persist it immediately."""
+        if not self._history or self._history[-1] != path:
+            self._history.append(path)
+            save_history(self._history)
+
+    def _set_wallpaper(self, silent: bool = False) -> None:
+        if not (0 <= self.index < len(self.images)):
+            self._set_status("Nothing selected.")
+            return
+        path = self.images[self.index]
+        if self._apply_path(path, silent):
+            self._record_history(path)
+
+    def _history_back(self) -> None:
+        """Step backward through the applied-wallpaper history. This is
+        what tray Previous and Undo both do: 'previous' means the wallpaper
+        actually shown before this one, not a deck-rewind — shuffle order
+        isn't linear, so decrementing the index wouldn't retrace it."""
+        if len(self._history) < 2:
+            self._set_status("Nothing to undo.")
+            return
+        target = self._history[-2]
+        if self._apply_path(target, silent=True):
+            self._history.pop()
+            if target in self.images:
+                self.index = self.images.index(target)
+                self._show_current()
+            save_history(self._history)
 
     # ---------------- Slideshow ----------------
 
@@ -2332,39 +2663,124 @@ class DesktopVista(ctk.CTk):
         self._set_wallpaper(silent=True)
         self._schedule_next()
 
+    def _next_solar_trigger(self, now: datetime) -> Optional[datetime]:
+        """Next dawn/sunrise/sunset/dusk boundary, using real sun-position
+        math when a location is set and the sun actually crosses the
+        relevant altitudes today; otherwise the four fallback_times via the
+        same DST-safe helper daily mode uses, so an unset location or a
+        polar date both degrade to something sane instead of stalling."""
+        solar_cfg = self.cfg.get("solar", {})
+        lat, lon = solar_cfg.get("latitude"), solar_cfg.get("longitude")
+        if solar_cfg.get("enabled") and lat is not None and lon is not None:
+            boundary = schedule.next_boundary(lat, lon, now)
+            if boundary is not None:
+                return boundary
+        return next_daily_trigger(now, solar_cfg.get("fallback_times", []))
+
+    def _solar_phase_now(self, now: datetime) -> str:
+        solar_cfg = self.cfg.get("solar", {})
+        lat, lon = solar_cfg.get("latitude"), solar_cfg.get("longitude")
+        fallback_times = solar_cfg.get("fallback_times", [])
+        if solar_cfg.get("enabled") and lat is not None and lon is not None:
+            return schedule.current_phase(lat, lon, now, fallback_times)
+        return schedule.phase_from_fallback(now, fallback_times)
+
+    def _solar_advance(self) -> str:
+        """Pick the next image for a solar-mode boundary tick: prefer
+        images tagged for the current phase (dawn/day/dusk/night and their
+        aliases), falling back to the full source — with an honest status
+        line — when nothing in the library is tagged for that phase, so a
+        library with no solar tags never stalls (notes_005 §2.2.1)."""
+        phase = self._solar_phase_now(datetime.now())
+        eligible = [
+            i for i, path in enumerate(self.images)
+            if schedule.phase_tag_matches(phase, get_tags(self.cfg, path))
+        ]
+        filtered = bool(eligible)
+        if not eligible:
+            eligible = list(range(len(self.images)))
+        if self.shuffle_var.get() and len(eligible) > 1:
+            choices = [i for i in eligible if i != self.index] or eligible
+            self.index = random.choice(choices)
+        else:
+            later = [i for i in eligible if i > self.index]
+            self.index = later[0] if later else eligible[0]
+        self._show_current()
+        suffix = "" if filtered else f" (unfiltered — no #{phase} tags)"
+        return f"Slideshow · {phase}{suffix}"
+
+    def _compute_next_due(self) -> None:
+        """Set the wall-clock or monotonic time the next slideshow advance
+        is due, from *now*. Recomputed fresh on every call (start, manual
+        nav reset, resume-from-pause) rather than cached — same
+        self-correcting behaviour v1.4 established for daily mode, now also
+        how interval mode tolerates clock/monotonic-base changes."""
+        mode = self.cfg["schedule"]["mode"]
+        if mode == "daily":
+            trigger = next_daily_trigger(datetime.now(), self.cfg["schedule"]["daily_times"])
+            if trigger is not None:
+                self._next_due_wall = trigger
+                self._next_due_mono = None
+                return
+            # No valid daily times configured — fall back to the fixed
+            # interval so the slideshow doesn't silently stall forever.
+        elif mode == "solar":
+            trigger = self._next_solar_trigger(datetime.now())
+            if trigger is not None:
+                self._next_due_wall = trigger
+                self._next_due_mono = None
+                return
+            # Solar math unavailable and no fallback times either — same
+            # last-resort as daily mode above.
+        seconds = resolve_interval_seconds(
+            self.interval_var.get(), self.cfg.get("interval_custom_seconds")
+        )
+        self._next_due_mono = time.monotonic() + seconds
+        self._next_due_wall = None
+
     def _schedule_next(self) -> None:
         if not self.images:
             self._stop_slideshow()
             return
-        if self.cfg["schedule"]["mode"] == "daily":
-            trigger = next_daily_trigger(datetime.now(), self.cfg["schedule"]["daily_times"])
-            seconds = (
-                max(1, int((trigger - datetime.now()).total_seconds()))
-                if trigger is not None
-                # No valid daily times configured — fall back to the fixed
-                # interval so the slideshow doesn't silently stall forever.
-                else resolve_interval_seconds(
-                    self.interval_var.get(), self.cfg.get("interval_custom_seconds")
-                )
-            )
+        self._compute_next_due()
+        if self._slideshow_job is None:
+            self._slideshow_job = self.after(SCHEDULER_TICK_MS, self._scheduler_heartbeat)
+
+    def _scheduler_heartbeat(self) -> None:
+        """1 Hz poll: is the armed due-time in the past? A single long
+        after(seconds * 1000) would either overflow Tk's millisecond arg for
+        very long intervals or, worse, behave unpredictably across a
+        sleep/hibernate gap; polling a due-time instead means at most one
+        tick fires no matter how long the gap was — never a catch-up burst."""
+        self._slideshow_job = None
+        if not self._slideshow_running or self._auto_pause_reasons or not self.images:
+            return  # _power_monitor_tick / _schedule_next re-arm when appropriate
+        due = (
+            datetime.now() >= self._next_due_wall
+            if self._next_due_wall is not None
+            else self._next_due_mono is not None and time.monotonic() >= self._next_due_mono
+        )
+        if due:
+            self._slideshow_tick()
         else:
-            seconds = resolve_interval_seconds(
-                self.interval_var.get(), self.cfg.get("interval_custom_seconds")
-            )
-        self._slideshow_job = self.after(seconds * 1000, self._slideshow_tick)
+            self._slideshow_job = self.after(SCHEDULER_TICK_MS, self._scheduler_heartbeat)
 
     def _slideshow_tick(self) -> None:
-        self._slideshow_job = None
         if not self.images:
             self._stop_slideshow()
             return
         # Advance without treating this as manual nav (avoids timer reset races).
-        if self.shuffle_var.get():
+        solar_status = None
+        if self.cfg["schedule"]["mode"] == "solar":
+            solar_status = self._solar_advance()
+        elif self.shuffle_var.get():
             self._advance_shuffle()
         else:
             self.index = (self.index + 1) % len(self.images)
             self._show_current()
         self._set_wallpaper(silent=True)
+        if solar_status:
+            self._set_status(solar_status)
         if self.images:
             self._schedule_next()
         else:
@@ -2378,6 +2794,8 @@ class DesktopVista(ctk.CTk):
             except Exception:
                 pass
             self._slideshow_job = None
+        self._next_due_mono = None
+        self._next_due_wall = None
         try:
             self.slide_btn.configure(
                 text="Start Slideshow", fg_color="#2e7d32", hover_color="#27682a"
@@ -2469,6 +2887,7 @@ class DesktopVista(ctk.CTk):
             pystray.MenuItem("Open Desktop Vista", self._on_tray_restore, default=True),
             pystray.MenuItem("Next Wallpaper", self._on_tray_next),
             pystray.MenuItem("Previous Wallpaper", self._on_tray_prev),
+            pystray.MenuItem("Undo Last Applied", self._on_tray_undo),
             pystray.MenuItem(
                 "Pause Slideshow" if slideshow_running else "Resume Slideshow",
                 self._on_tray_toggle_slideshow,
@@ -2538,11 +2957,15 @@ class DesktopVista(ctk.CTk):
         self.after(0, self._tray_navigate_and_apply, 1)
 
     def _on_tray_prev(self, _icon=None, _item=None) -> None:
-        self.after(0, self._tray_navigate_and_apply, -1)
+        # "Previous" walks applied history, not the deck — see _history_back.
+        self.after(0, self._history_back)
+
+    def _on_tray_undo(self, _icon=None, _item=None) -> None:
+        self.after(0, self._history_back)
 
     def _tray_navigate_and_apply(self, delta: int) -> None:
-        """Tray "Next/Previous Wallpaper" must change the desktop, not just
-        the in-window preview — the main window's arrow buttons keep the
+        """Tray "Next Wallpaper" must change the desktop, not just the
+        in-window preview — the main window's arrow buttons keep the
         preview-only behaviour via `_step`/`_prev`/`_next`."""
         self._step(delta)
         self._set_wallpaper(silent=True)
@@ -2568,6 +2991,149 @@ class DesktopVista(ctk.CTk):
 
     def _on_tray_exit(self, _icon=None, _item=None) -> None:
         self.after(0, self._on_close)
+
+    # ---------------- CLI / scripting IPC ----------------
+
+    def _start_ipc_server(self) -> None:
+        if not ipc.is_available():
+            return
+        try:
+            self._ipc_server = ipc.IpcServer(self._handle_ipc_command, lambda fn: self.after(0, fn))
+            self._ipc_server.start()
+        except Exception as exc:
+            log.warning("IPC server unavailable: %s", exc)
+            self._ipc_server = None
+
+    def _stop_ipc_server(self) -> None:
+        if self._ipc_server is not None:
+            try:
+                self._ipc_server.stop()
+            except Exception:
+                pass
+            self._ipc_server = None
+
+    def _handle_ipc_command(self, payload: dict) -> dict:
+        """Runs on the Tk thread (marshalled by ipc.IpcServer via after(0, ...))
+        — safe to touch widgets/self.cfg directly, same as any other handler."""
+        cmd = payload.get("cmd")
+        if cmd == "ping":
+            return {"ok": True}
+        if cmd == "status":
+            return {
+                "ok": True,
+                "version": APP_VERSION,
+                "running": self._slideshow_running,
+                "paused": sorted(self._auto_pause_reasons),
+                "current": self.images[self.index] if 0 <= self.index < len(self.images) else None,
+                "source": {"kind": self._active_kind, "id": self._active_id},
+            }
+        if cmd == "show":
+            self._tray_restore()
+            return {"ok": True}
+        try:
+            if cmd == "next":
+                self._step(1)
+                self._set_wallpaper(silent=True)
+            elif cmd in ("prev", "undo"):
+                self._history_back()
+            elif cmd == "pause":
+                if self._slideshow_running:
+                    self._stop_slideshow()
+            elif cmd == "resume":
+                if not self._slideshow_running:
+                    self._start_slideshow()
+            elif cmd == "toggle":
+                self._toggle_slideshow()
+            elif cmd == "favourite":
+                self._toggle_favourite()
+            elif cmd == "hide":
+                self._hide_current()
+            elif cmd == "set":
+                path = payload.get("path")
+                if not isinstance(path, str) or not path:
+                    return {"ok": False, "error": "missing 'path'"}
+                if not self._apply_path(path, silent=True):
+                    return {"ok": False, "error": f"could not apply {path}"}
+                self._record_history(path)
+                if path in self.images:
+                    self.index = self.images.index(path)
+                    self._show_current()
+            else:
+                return {"ok": False, "error": f"unknown command: {cmd!r}"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {
+            "ok": True,
+            "applied": self.images[self.index] if 0 <= self.index < len(self.images) else None,
+        }
+
+    # ---------------- Global hotkeys ----------------
+
+    def _start_hotkeys(self) -> None:
+        if not hotkeys.is_available() or not self.cfg.get("hotkeys", {}).get("enabled", True):
+            self._set_hotkey_status_text(enabled=False)
+            return
+        bindings: list[tuple[int, int, int]] = []
+        for action in HOTKEY_ACTIONS:
+            parsed = hotkeys.parse_binding(self.cfg["hotkeys"][action])
+            if parsed is not None:
+                mods, vk = parsed
+                bindings.append((HOTKEY_ACTION_IDS[action], mods, vk))
+        if not bindings:
+            self._set_hotkey_status_text(enabled=False)
+            return
+        try:
+            self._hotkey_listener = hotkeys.HotkeyListener(
+                bindings, on_hotkey=lambda hid: self.after(0, self._on_hotkey_fired, hid)
+            )
+            self._hotkey_listener.start()
+        except Exception as exc:
+            log.warning("Global hotkeys unavailable: %s", exc)
+            self._hotkey_listener = None
+            self._set_hotkey_status_text(enabled=False)
+            return
+        # RegisterHotKey is effectively instant; a short bounded wait here
+        # (once, at startup) lets a conflict be reported immediately rather
+        # than silently, without risking an indefinite UI freeze.
+        self._hotkey_listener.ready.wait(timeout=1.0)
+        if self._hotkey_listener.conflicts:
+            conflicts = ", ".join(self._hotkey_listener.conflicts)
+            log.warning("Hotkey binding conflict (already in use elsewhere): %s", conflicts)
+        self._set_hotkey_status_text(enabled=True)
+
+    def _stop_hotkeys(self) -> None:
+        if self._hotkey_listener is not None:
+            try:
+                self._hotkey_listener.stop()
+            except Exception:
+                pass
+            self._hotkey_listener = None
+
+    def _set_hotkey_status_text(self, enabled: bool) -> None:
+        label = getattr(self, "hotkeys_status_label", None)
+        if label is None:
+            return
+        if not enabled:
+            label.configure(text="Hotkeys unavailable or disabled.")
+            return
+        conflicts = self._hotkey_listener.conflicts if self._hotkey_listener else []
+        lines = [
+            f"{action}: {self.cfg['hotkeys'][action]}"
+            + (" (conflict)" if hotkeys.format_binding(*hotkeys.parse_binding(self.cfg["hotkeys"][action])) in conflicts else "")
+            for action in HOTKEY_ACTIONS
+        ]
+        label.configure(text="  ·  ".join(lines))
+
+    def _on_hotkey_fired(self, hotkey_id: int) -> None:
+        action = next((a for a, i in HOTKEY_ACTION_IDS.items() if i == hotkey_id), None)
+        if action is not None:
+            self._handle_ipc_command({"cmd": action})
+
+    def _on_hotkeys_enabled_changed(self) -> None:
+        self.cfg["hotkeys"]["enabled"] = bool(self.hotkeys_enabled_var.get())
+        self._flush_save()
+        self._stop_hotkeys()
+        self._start_hotkeys()
 
     # ---------------- Close ----------------
 
@@ -2595,6 +3161,10 @@ class DesktopVista(ctk.CTk):
         self._cancel_after_jobs()
         self._write_config()
         self._stop_tray_icon()
+        self._stop_ipc_server()
+        self._stop_hotkeys()
+        ipc.release_primary(self._mutex_handle)
+        self._mutex_handle = None
         if self._com_backend is not None:
             try:
                 self._com_backend.close()
@@ -2620,6 +3190,35 @@ def run_selftest() -> int:
     print(f"COM backend module: {windows_wallpaper_com is not None}")
     win32_monitors = enumerate_monitors()
     print(f"Win32 monitor enumeration: {len(win32_monitors)} monitor(s) -> {win32_monitors}")
+
+    # v1.6 — single-instance mutex, named-pipe IPC, global hotkeys, solar math.
+    print(f"ipc available:      {ipc.is_available()}")
+    if ipc.is_available():
+        mutex_handle, is_primary = ipc.try_become_primary()
+        print(f"mutex acquire: is_primary={is_primary}"
+              + ("" if is_primary else " (another instance is already running)"))
+        if is_primary:
+            server = ipc.IpcServer(lambda payload: {"ok": True, "echo": payload}, lambda fn: fn())
+            server.start()
+            try:
+                time.sleep(0.2)  # let the server's first CreateNamedPipeW/ConnectNamedPipe settle
+                reply = ipc.send_command({"cmd": "ping"}, timeout=2.0)
+                print(f"named-pipe round trip: {reply}")
+            except Exception as exc:
+                print(f"named-pipe round trip FAILED: {exc}")
+            finally:
+                server.stop()
+                server.join(timeout=2.0)
+        ipc.release_primary(mutex_handle)
+
+    print(f"hotkeys available:  {hotkeys.is_available()}")
+    default_bindings = {k: v for k, v in DEFAULT_CONFIG["hotkeys"].items() if k != "enabled"}
+    parsed_ok = all(hotkeys.parse_binding(b) is not None for b in default_bindings.values())
+    print(f"default hotkey bindings parse OK: {parsed_ok} {default_bindings}")
+
+    solar_events = schedule.solar_phase_boundaries(51.5074, -0.1278, datetime(2026, 6, 21, 12, 0))
+    print(f"solar calc (London, 2026-06-21 fixture): {sorted(solar_events.keys())}")
+
     if windows_wallpaper_com is None:
         return 0
     try:
@@ -2640,5 +3239,23 @@ if __name__ == "__main__":
         sys.exit(run_selftest())
     if sys.platform != "win32":
         print("Desktop Vista is designed for Windows.")
-    start_minimized = "--minimized" in sys.argv[1:]
-    DesktopVista(start_minimized=start_minimized).mainloop()
+
+    _argv = sys.argv[1:]
+    _mutex_handle, _is_primary = ipc.try_become_primary()
+
+    if not _is_primary:
+        # Another instance already owns the mutex — never open a second
+        # Tk window (notes_005 §2.6: two instances would both apply
+        # wallpapers and race save_config). Forward any recognised CLI
+        # command to it over the named pipe instead, and exit.
+        _payload = ipc.cli_payload(_argv) or {"cmd": "show"}
+        try:
+            _reply = ipc.send_command(_payload)
+        except OSError as exc:
+            print(f"Could not reach the running {APP_NAME} instance: {exc}")
+            sys.exit(1)
+        print(json.dumps(_reply))
+        sys.exit(0 if _reply.get("ok") else 1)
+
+    start_minimized = "--minimized" in _argv
+    DesktopVista(start_minimized=start_minimized, mutex_handle=_mutex_handle).mainloop()

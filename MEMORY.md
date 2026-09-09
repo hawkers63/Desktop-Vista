@@ -200,3 +200,83 @@ milestone (see ROADMAP.md's "Still ahead" list under v1.5.1), or circling
 back to notes_004's deferred structural items (preview LRU cache, tray/Tk
 command-queue bridge, single-instance guard) that were explicitly
 carried forward rather than done in the v1.2.1 pass.
+
+## 2026-09-09 (later still) — v1.6 "Scriptable companion" shipped
+
+**Context:** Mark dropped `notes/notes_005.txt` — a Grok-authored
+functional/systems architecture pack (matching `AGENT_5_FUNCTIONAL_
+ENHANCEMENTS.md`'s brief, saved under the filename `PROMPTS_OVERVIEW.md`
+had reassigned to a *different*, not-yet-produced UI redesign pack —
+flagged the mismatch, proceeded on the functional content since that's
+what was actually there). Asked to continue the scope/roadmap; picked up
+notes_005's own recommended next session — all 8 of its v1.6 items, in
+its stated order — matching this project's established rhythm.
+
+**Shipped, all in one session, all unit-tested and live-verified against
+this real machine (not just mocked):**
+- Fixed a real v1.5 defect: `playback_source.kind == "collection"` was
+  silently dropped on restart (`_validate_config`'s whitelist and
+  `_resolve_initial_source` both lacked a collection branch).
+- Playback history ring (100 applied, `playback_state.json`) + Undo; tray
+  "Previous" now walks applied history rather than decrementing the raw
+  index (shuffle isn't linear, so a deck-rewind wouldn't retrace what was
+  actually shown).
+- Replaced the single `after(seconds * 1000)` slideshow timer with a 1 Hz
+  heartbeat polling a due-time (monotonic for interval, wall-clock for
+  daily/solar) — a sleep/hibernate gap now finds "due" true at most once
+  on resume instead of bursting missed ticks.
+- Solar dawn/day/dusk/night wired into live playback via new, pure
+  `schedule.py` (NOAA-style sun-position math, unit tested against a
+  London fixture and a Svalbard polar fixture).
+- New `ipc.py`: `CreateMutexW` single-instance guard + a named-pipe CLI/
+  scripting bridge (`--next/--status/--set/...`), owner-only pipe ACL via
+  SDDL (not world-accessible).
+- New `hotkeys.py`: global hotkeys via `RegisterHotKey` on a **dedicated
+  thread** running its own `GetMessage` loop — deliberately *not*
+  notes_005's suggested WndProc-subclass-of-Tk's-own-window approach,
+  which carries real GC-lifetime/reentrancy hazards; the thread-owned
+  message queue is the standard, safer pattern for a hotkey confined to no
+  particular window. Default Win+Alt+N/P/L/H/Z/S.
+- Preview-decode cancellation on rapid navigation (a burst of 500
+  navigations now triggers ~3 real decodes, not 500) + moved the 15s
+  reconnect poll's folder-online/listing probes off the Tk thread (an
+  unreachable NAS/UNC path could previously freeze the whole window for
+  the OS network timeout, every 15 seconds, forever).
+
+**Live-verification highlights (this machine, real desktop, real running
+instance — same hazard MEMORY.md already flags: these tests really do
+change the actual wallpaper):**
+- `--status`/`--next`/`--undo` over the real pipe genuinely changed and
+  restored the real desktop wallpaper (`C:\Program Files\Glow\Windows 11
+  - Glow1.jpg` → `Glow12.jpg` → back).
+- A second `python desktop_vista.py` launch with no argv correctly
+  deferred to the running instance (single process the whole time, "ok":
+  true reply) instead of opening a duplicate window.
+- A *real* physical hotkey fired via `keybd_event` (Win+Alt+S) flipped the
+  running instance's slideshow state end-to-end.
+- One of the six default bindings (`Win+Alt+F`, notes_005's suggested
+  mnemonic for "favourite") turned out to already be claimed by something
+  else on this machine (`ERROR_HOTKEY_ALREADY_REGISTERED`, confirmed via a
+  standalone `RegisterHotKey` probe after killing the test instance) —
+  swapped the shipped default to `Win+Alt+L`. Only found by testing live;
+  the conflict-detection code path itself worked correctly (logged it,
+  didn't retry/steal, kept the other five bindings).
+- Measured `_on_close()` shutdown timing after adding the new stop paths:
+  each of `_stop_ipc_server()`/`_stop_hotkeys()` completes in <1ms: no
+  deadlock from the IPC server's self-connect wake-up trick (worth
+  re-checking if that pattern is copied elsewhere — the ordering that
+  makes it safe is `_stop_event.set()` strictly *before* the wake-up
+  `send_command` call, so the server thread skips dispatch entirely
+  instead of trying to marshal onto a Tk thread that's mid-shutdown).
+
+148/148 tests passing (up from 96 at the start of this session), across
+`test_desktop_vista.py`, `test_schedule.py`, `test_ipc.py`, `test_hotkeys.py`.
+`--selftest` extended to cover mutex/pipe/hotkey/solar fixtures.
+APP_VERSION bumped to "1.6".
+
+**Still open:** the UI redesign pack (`AGENT_4_UI_IMPROVEMENTS.md`'s
+brief) has not been produced under any filename — see the note left in
+ROADMAP.md. The full v2.0 milestone (independent per-monitor playback,
+span assist, device-path reconciliation) is next per notes_005's own
+sequencing; v2.1 (SQLite catalogue, weather, accent sync, curation, feeds)
+waits on v2.0's assignment model existing first.

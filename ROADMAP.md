@@ -124,9 +124,30 @@ from two different drives and filtered into a virtual collection (✅).
 
 ---
 
+## v1.6 — "Scriptable companion" ✅ Done (2026-09-09)
+
+Goal: land everything that does not require a second physical display to be correct, per the architecture/viability review in [`notes/notes_005.txt`](notes/notes_005.txt). This is deliberately the **last single-pipeline release** — one shared image index/navigation/slideshow state, same as every release before it; independent per-monitor state is v2.0's job.
+
+| Priority | Item | Status |
+| :---: | :--- | :--- |
+| P0 | Fix v1.5 defect: saved `playback_source.kind == "collection"` was dropped on restart | ✅ Done — `_validate_config`'s kind whitelist and `_resolve_initial_source` both gained a `"collection"` branch |
+| P1 | Playback history ring (100 applied wallpapers) + Undo | ✅ Done — `playback_state.json`; tray "Previous" and a new "Undo Last Applied" tray item both walk applied history rather than the raw index (shuffle order isn't linear, so a deck-rewind wouldn't retrace what was actually shown) |
+| P1 | 1 Hz scheduler replacing one `after(seconds * 1000)` | ✅ Done — a repeating heartbeat polls a due-time (monotonic for interval mode, wall-clock for daily/solar) instead of arming a single long timer, so a sleep/hibernate gap finds "due" true at most once on resume, never a catch-up burst |
+| P1 | Solar mode wired into the live scheduler | ✅ Done — new `schedule.py` (pure, unit-tested NOAA-style sun-position math); `schedule.mode: "solar"` advances at real dawn/sunrise/sunset/dusk boundaries, biases the next pick toward phase-tagged images when the library has any, and discloses an honest unfiltered status when it doesn't |
+| P1 | Single-instance mutex (`CreateMutexW`) | ✅ Done — new `ipc.py`; a second launch never opens a duplicate window, it forwards to the running instance instead |
+| P1 | Named-pipe CLI IPC (`--next`, `--status`, `--set`, ...) | ✅ Done — `ipc.py`'s `IpcServer`, owner-only pipe security descriptor (SDDL, not world-accessible); the tray daemon is now scriptable from Task Scheduler/Stream Deck/a shell |
+| P1 | Global hotkeys (`RegisterHotKey`) | ✅ Done — new `hotkeys.py`; a dedicated thread owns registration + the `GetMessage` loop rather than subclassing Tk's own window (avoids the WndProc-subclass GC/reentrancy hazards); default Win+Alt+N/P/L/H/Z/S, per-action rebindable in config, a bind conflict is logged and shown, never silently retried |
+| P2 | Preview LRU + off-thread folder enum (notes_004 leftover, carried since v1.2.1) | ✅ Done, scoped down — no unbounded cache existed to bound, so the actual fix is (a) cancelling a still-queued stale preview decode on rapid navigation instead of letting it run to completion, and (b) moving the 15s reconnect poll's `is_folder_online`/`list_images` calls off the Tk thread, since an unreachable NAS/UNC path can block for the OS network timeout |
+
+**Implementation note:** every new Win32 surface (mutex, named pipe, hotkeys) is ctypes-only, no pywin32, matching the rest of the app. All three were live-verified against this machine's real desktop and real running instance — not just unit tests — including a genuine `--next`/`--undo` wallpaper change and restore over the pipe, a real global hotkey firing end-to-end (`keybd_event` → `RegisterHotKey` → the app), and a measured `_on_close()` shutdown that stays under a few milliseconds for the new stop paths. One of the six default hotkey bindings (`Win+Alt+F`) collided with an existing binding on this dev machine (a driver overlay, unidentified) — swapped the shipped default to `Win+Alt+L`, discovered only by testing live rather than assuming the notes' suggested mnemonic was conflict-free.
+
+**Exit criteria:** collection playback source survives a restart (✅, unit tested); 96 pre-v1.6 tests plus new coverage for all eight items stay green (✅ — 148/148 as of this release); `--selftest` on a frozen build reports mutex/pipe/hotkey/solar fixtures (✅, extended this release).
+
+---
+
 ## Beyond this window — v2.0 "One Perfect View"
 
-`IDesktopWallpaper` COM integration for true per-monitor wallpapers, panoramic/ultrawide span assist, wiring tags/collections and solar cycles into the *applied* wallpaper (not just the UI), and a go/no-go decision on desktop crossfade. The legacy `SystemParametersInfoW` path stays live behind a `wallpaper_target` feature flag until the COM path is proven (see `notes/notes_002.txt` §5 cross-cutting notes).
+`IDesktopWallpaper` COM integration for true per-monitor wallpapers, panoramic/ultrawide span assist, independent per-monitor playback state, and a go/no-go decision on desktop crossfade. Solar cycles are wired into the applied wallpaper already (v1.6, against the single shared pipeline); v2.0's job is giving each display its own index/navigation/slideshow/solar state instead of one shared one. The legacy `SystemParametersInfoW` path stays live behind a `wallpaper_target` feature flag until the COM path is proven (see `notes/notes_002.txt` §5 cross-cutting notes).
 
 ### v1.5.1 — v2.0 groundwork landed (2026-09-09)
 
@@ -141,12 +162,12 @@ Shipped ahead of the full milestone, gated behind `wallpaper_target: "com"` (def
 
 **Still ahead for the full v2.0 milestone** (none of this is done):
 
-- Independent per-monitor playback state — right now there is one shared image index/navigation/slideshow; a real per-monitor experience needs separate assignment and (per the wireframes) possibly separate slideshows per display.
-- Span crop assistant and mixed-DPI/portrait-display validation (notes_004 Track B).
-- Wiring `tags`/`collections` (v1.5) and the `solar` data model (v1.5) into what's actually *applied*, not just selectable in the UI.
-- Device-path persistence/reconciliation across docking or driver changes (`GetMonitorDevicePathAt` identity is not guaranteed stable — notes_004 Track B).
+- Independent per-monitor playback state — v1.6 kept one shared image index/navigation/slideshow/schedule (interval, daily, and now solar) across the whole app; a real per-monitor experience needs separate assignment and (per the wireframes) possibly separate slideshows per display, per notes_005 §2.1's `PlaybackController`/`ApplyQueue` design.
+- Span crop assistant and mixed-DPI/portrait-display validation (notes_004 Track B, notes_005 §2.1.3).
+- Device-path persistence/reconciliation across docking or driver changes (`GetMonitorDevicePathAt` identity is not guaranteed stable — notes_004 Track B, notes_005 §2.1.4's fingerprinting scheme).
 - Desktop crossfade go/no-go (research gate — no committed direction).
-- Lock Screen WinRT setter (carried over from v1.5, still just a research spike).
+- Lock Screen WinRT setter (carried over from v1.5, still just a research spike — notes_005 §2.3.2 has the spike plan).
+- SQLite catalogue, weather bias, accent-colour sync, curation (focal crop/dedupe/EXIF), curated feeds — all scoped to **v2.1** in notes_005, deliberately after v2.0 since a catalogue's `display_assignments` table would encode a fiction before per-monitor assignment exists.
 
 ---
 
@@ -154,4 +175,5 @@ Shipped ahead of the full milestone, gated behind `wallpaper_target: "com"` (def
 
 - Version numbers above are release numbers, not calendar dates — fit the cadence to actual capacity.
 - Update `notes/notes_002.txt`'s schema/wireframe sections as each release's config keys land, and keep `config.example.json` in sync. `config.json` itself stays gitignored.
-- Source backlog: `notes/notes_001.txt` (design intent), `notes/notes_002.txt` (feature matrix + phased plan), `notes/notes_003.txt` (v1.1 hardening audit), `notes/notes_004.txt` (v1.2 architecture/UX review + supplied icon assets), `AGENT_1_FEATURE_INNOVATION.md`.
+- Source backlog: `notes/notes_001.txt` (design intent), `notes/notes_002.txt` (feature matrix + phased plan), `notes/notes_003.txt` (v1.1 hardening audit), `notes/notes_004.txt` (v1.2 architecture/UX review + supplied icon assets), `notes/notes_005.txt` (v1.6 → v2.1 functional/systems architecture pack — viability matrix, module blueprints, DB schema, phased plan), `AGENT_1_FEATURE_INNOVATION.md`, `AGENT_5_FUNCTIONAL_ENHANCEMENTS.md` (the brief notes_005 was written against).
+- A companion UI/UX redesign pack (`AGENT_4_UI_IMPROVEMENTS.md`'s brief — sidebar/HUD/topology-widget rework) has not yet been produced under its own notes file; `PROMPTS_OVERVIEW.md` currently expects it as a distinct `notes_005.txt`/`notes_006.txt` pair with the functional pack, but only the functional pack exists so far.

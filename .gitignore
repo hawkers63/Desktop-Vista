@@ -1,6 +1,7 @@
 # Desktop Vista — local secrets & user config (never commit)
 config.json
 config.json.tmp
+playback_state.json
 
 # Temporary / backup files
 *.tmp

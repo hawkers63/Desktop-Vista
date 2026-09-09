@@ -1,0 +1,1440 @@
+# Desktop Vista — Functional Enhancements & Advanced Systems Architecture
+**Deliverable** · Grok AI - Principal Systems Architect, Automation Engineer & Feature Strategist
+**Project:** Desktop Vista · **Tagline:** *All my drives. One perfect view.*
+**Baseline:** v1.5.1 (`desktop_vista.py` ~2640 lines, `windows_wallpaper_com.py`, 96 tests) · **Date:** 9 September 2026
+**Audience:** Engineering, product, and release planning
+**Status:** Design and architecture deliverable. Code below is proposed integration material, not an implemented upgrade. Existing application code, live configuration, assets and roadmap were not edited.
+
+---
+
+## Document purpose
+
+v1.5.1 established a reliable local cycler with tray residency, multi-source aggregation, curator tools, power/fullscreen auto-pause, a solar *data model*, and an opt-in `IDesktopWallpaper` apply path. Slideshow, navigation and index remain **one shared global state**. Solar is stored, not scheduled. Tags are a filter, not an analyser. The catalogue is still JSON arrays keyed by absolute path.
+
+This pack turns the six v2.x investigation tracks into a concrete architecture: a viability matrix, module boundaries and Python patterns that fit the current process model, a SQLite catalogue with a zero-data-loss migration from `config.json` v1.5, hardware/OS edge cases that the COM backend has not yet faced, and a phased plan with explicit exit criteria.
+
+**Non-goals of this document:** implementing the features; renaming existing releases; quietly resurrecting items already dropped (Mica/Acrylic, undocumented desktop crossfade). Those remain where `ROADMAP.md` left them.
+
+**House rules carried forward**
+
+| Constraint | Why it still binds |
+| :--- | :--- |
+| Tk owns the main thread; workers publish data, never widgets | notes_003 / notes_004; `self.after` is the only legal UI marshal |
+| One wallpaper authority — Desktop Vista's controller, never a parallel Windows slideshow | COM `SetSlideshow` is undeclared in `windows_wallpaper_com.py` on purpose |
+| `SetPosition` is global; there is no per-monitor fit style | `IDesktopWallpaper` contract; per-monitor crop must be pre-rendered |
+| COM device paths are session-ephemeral | module docstring of `windows_wallpaper_com.py`; do not persist them as primary keys |
+| SPI remains the default until COM per-monitor independence is verified on real multi-display hardware | v1.5.1 verification record: one display only |
+| No NumPy, no pywin32 | frozen `DesktopVista.exe` is ~19.5 MB because NumPy was excluded; ctypes + stdlib only |
+| Never silently geolocate, never store network passwords | notes_004 Track A/D |
+| On COM failure, never silently fall back to SPI (would stamp every screen) | notes_004 §4 |
+
+---
+
+## 0. As-built baseline (v1.5.1) — what the next architecture must actually replace
+
+A design that pretends the playback engine is already modular will not integrate. The live process is:
+
+```
+CustomTkinter main thread (DesktopVista)
+  ├── self.images / self.index / self._shuffle_order / self._shuffle_cursor   ← ONE deck
+  ├── self._slideshow_running  +  self._slideshow_job  +  self._auto_pause_reasons
+  ├── self.cfg  (JSON; tags keyed by absolute path; no schema_version)
+  ├── ThreadPoolExecutor(max_workers=2)   preview decode
+  ├── pystray daemon thread               menu actions via self.after(0, …)
+  ├── 15 s reconnect poll  +  5 s power/fullscreen poll
+  ├── SPI path: set_windows_wallpaper()   registry + SystemParametersInfoW
+  └── COM path (opt-in): one STA thread, CreateObject per call, 5 s timeout
+```
+
+Relevant facts, with source:
+
+1. **Single playback pipeline.** `_slideshow_tick` (around line 2356) advances `self.index` and calls `_set_wallpaper(silent=True)`. `_set_wallpaper` (around line 2251) reads *one* `self.target_monitor_var`. Enabling COM and picking "Display 2" still plays the same deck; it just aims the apply at one device path. There is no per-monitor index, interval, source or shuffle.
+2. **Two identity spaces for monitors.** `enumerate_monitors()` uses `EnumDisplayMonitors` / `GetMonitorInfoW` and yields GDI names (`\\.\DISPLAY1`) plus RECTs. `ComWallpaperBackend.enumerate_monitors()` yields `GetMonitorDevicePathAt` strings (`\\?\DISPLAY#…`) plus RECTs. The UI topology strip and the COM picker do not share a join key. `_refresh_com_monitor_menu` labels them "Display 1", "Display 2" by enumeration order — the exact ordinal identity notes_004 forbade persisting.
+3. **Solar is dead config.** `DEFAULT_CONFIG["solar"]` validates `enabled`, lat/lon, four fallback times. `schedule.mode` is only `"interval"` or `"daily"`. Nothing reads solar at tick time.
+4. **Collection playback does not survive a restart.** `_load_source` writes `playback_source.kind = "collection"`, but `_validate_config` only accepts `("folder", "playlist")` (around line 765), and `_resolve_initial_source` has no collection branch for a saved `playback_source`. Selecting a collection, quitting, and relaunching falls back to `current_folder`. This is a v1.5.1 defect and a P0 for v1.6 — it is not a v2.0 feature.
+5. **Pause policy is session-wide, and that is correct for the APIs in use.** `GetSystemPowerStatus` and `SHQueryUserNotificationState` are not per-monitor. A fullscreen game on one display pauses the only slideshow. Independent per-monitor pause cannot be built on those two calls alone.
+6. **Apply is not transactional.** `ComWallpaperBackend._set_wallpaper_sta` calls `SetPosition` then `SetWallpaper` once. Multi-monitor span slicing will issue N calls; a failure mid-loop cannot roll back the displays that already changed. The architecture must report partial success, not pretend atomicity.
+7. **JSON catalogue will not scale to tens of thousands of images.** `tags` is `{abs_path: [str]}`. `favourites` / `hidden` are path arrays. `resolve_collection_candidate_images` walks every known folder on the Tk thread. That is acceptable for hundreds of files; it is not a 50,000-image design.
+
+These seven facts are the design inputs. Every blueprint below either preserves them, replaces them at a named release, or names the API that makes them immovable.
+
+---
+
+## 1. Executive Functional Matrix & Viability Assessment
+
+Impact and complexity are qualitative (High / Med / Low) against this codebase, not industry abstracts. "Technical risk" is the chance of a wrong Windows behaviour that unit tests cannot catch.
+
+| Feature Name | Subsystem | Value / Impact | Technical Risk / Complexity | Recommended Release |
+| :--- | :--- | :---: | :---: | :---: |
+| **P0 defect: persist collection `playback_source`** | Library | High (data loss on restart) | Low | **v1.6** |
+| Playback history ring (last 100 applied) + Undo | Playback | High | Low | **v1.6** |
+| Global hotkeys (`RegisterHotKey`) | Integration | High | Med — conflict, UIPI, fullscreen | **v1.6** |
+| Single-instance mutex (`CreateMutexW`) | Process | High | Med — packaged vs script, elevation | **v1.6** |
+| Named-pipe CLI IPC (`--next`, `--pause`, `--status`, `--set`) | Process | High | Med — STA/Tk marshalling, ACL | **v1.6** |
+| Solar scheduler wired to the live tick | Schedule | High | Med — polar, DST, no-tag libraries | **v1.6** |
+| Cheap 1 Hz scheduler replacing per-job `after(N*1000)` | Schedule | Med | Low | **v1.6** |
+| Bounded preview LRU (carried from notes_004) | Preview | High | Med | **v1.6** |
+| Folder enumeration / offline probe off the Tk thread | Resilience | High | Med | **v1.6** |
+| Independent per-monitor `PlaybackController` | Displays | High | High — unverified COM independence | **v2.0** |
+| Per-monitor source / interval / shuffle / history | Displays | High | High | **v2.0** |
+| Display fingerprint + dock/undock reconciliation | Displays | High | High — driver path volatility | **v2.0** |
+| `WM_DISPLAYCHANGE` / session-resume topology refresh | Displays | High | Med | **v2.0** |
+| Ultrawide / multi-monitor span slicer + bezel compensation | Displays | Med–High | High — mixed DPI, portrait, gaps | **v2.0** |
+| COM as default backend once independence is verified; SPI retained | Displays | High | High (hardware gate) | **v2.0** |
+| Per-monitor crop preview (selected display's actual ratio) | UX | High | Med | **v2.0** |
+| Weather-reactive bias (Open-Meteo, no API key) | Schedule | Med | Med — network, empty-filter trap | **v2.1** |
+| Windows accent-colour sync (opt-in) | Integration | Med | High — Win11 may ignore registry writes | **v2.1** |
+| Lock-screen setter (WinRT) | Integration | Med | High — unpackaged host, policy | **v2.1** (research gate first) |
+| SQLite catalogue `desktop_vista.db` | Library | High (at 10k+ images) | High — migration, locking, frozen build | **v2.1** |
+| Boolean tag expressions (`nature AND (4k OR 8k) NOT car`) | Library | Med | Med | **v2.1** |
+| Play-count / last-played tracking | Library | Med | Low (needs catalogue) | **v2.1** |
+| Perceptual duplicate detection (`dhash`/`phash`) | Curation | Med | Med — false positives, NAS cost | **v2.1** |
+| Resolution down-rank vs native display | Curation | Med | Low | **v2.1** |
+| EXIF inspector + "Show on Map" | Curation | Med | Low (GPS privacy) | **v2.1** |
+| Entropy / contrast focal-point crop | Curation | High | Med | **v2.1** |
+| Lightweight ONNX saliency model | Curation | Med | High — exe size, CPU, no NumPy | **Future** |
+| Bing Daily Wallpaper feed | Feeds | Med | Low | **v2.1** (opt-in) |
+| NASA APOD feed | Feeds | Med | Low | **v2.1** (opt-in) |
+| Unsplash / Wallhaven (user API key) | Feeds | Low–Med | Med — keys, ToS, rate limits | **Future** |
+| Download sandbox + quota / auto-purge | Feeds | Med | Med | **v2.1** (with first feed) |
+| Per-monitor fullscreen detection (foreground HWND ∩ RECT) | Power | Med | High — borderless, UWP | **Future** |
+| Battery throttle (slower interval, not only pause) | Power | Low | Low | **v2.1** |
+| Desktop crossfade | Displays | Low | High | **Research gate — no committed release** |
+| Mica / Acrylic on Tk | UX | Low | High | **Dropped (v1.4 decision stands)** |
+
+### Why these version numbers
+
+- **v1.6** is the last *single-pipeline* release. It lands everything that does not require a second physical display to be correct: the collection-restore defect, history/undo, hotkeys, single-instance + CLI, solar on the existing tick, the deferred LRU/off-thread scan. It makes the tray daemon scriptable. It does **not** claim per-monitor independence.
+- **v2.0** is the display rewrite. Exit criteria are visual and hardware-bound. Shipping it without a two-or-more-monitor verification session would repeat the v1.5.1 honesty problem as a lie.
+- **v2.1** is intelligence and scale: catalogue, weather, accent, lock screen, curation, first curated feed. None of it is useful until v2.0's assignment model exists, because "this image is for the portrait display" is a display fact.
+- **Future** items either bloat the frozen build (ONNX, Unsplash client) or rest on APIs that notes_004 already classified as research gates.
+
+### Deliberate non-features
+
+| Idea | Verdict |
+| :--- | :--- |
+| Native Windows slideshow COM methods | Do not declare or call them. Two schedulers will fight. |
+| Silent SPI fallback on COM error | Would stamp every monitor. Surface the error; keep last successful per-target image. |
+| k-means via NumPy for accent colour | Violates the exe-size contract. Pillow `quantize` is enough. |
+| `pywin32` for named pipes / mutex / EDID | ctypes against `kernel32` / `user32` / SetupAPI. Same reason. |
+| Auto-enable solar from timezone alone | Coarse and wrong at timezone edges. Require lat/lon or use fallback times. |
+| Hash every file at scan time | Notes_004 Track A still holds. Path + mtime_ns + size is identity; content hashes are lazy. |
+| Cloud feeds on by default | Offline-first product. Feeds are an opt-in source kind that degrade to local. |
+
+---
+
+## 2. Deep-Dive Architectural Blueprints
+
+### 2.0 Target process model
+
+Do not split `desktop_vista.py` on day one. Extract a module when a v1.6/v2.0 feature *exercises* the boundary. Planned ownership:
+
+```
+desktop_vista.py          UI shell, config I/O, tray, Tk lifecycle
+windows_wallpaper_com.py  STA COM backend (already extracted)
+playback.py               PlaybackController, ShuffleDeck, HistoryStack, ApplyRequest
+displays.py               topology join, fingerprint, span slicer, assignment store
+schedule.py               interval / daily / solar / weather due-time
+ipc.py                    mutex, named pipe server/client, CLI parser
+hotkeys.py                RegisterHotKey + WndProc subclass
+catalogue.py              SQLite (v2.1)
+curation.py               dhash/phash, entropy crop, EXIF (v2.1)
+feeds.py                  opt-in fetchers + quota (v2.1)
+```
+
+```mermaid
+flowchart TB
+    subgraph ui [Tk main thread]
+      UI[DesktopVista UI]
+      TRAY[Tray snapshots]
+      HK[Hotkey WndProc]
+      CLI[Named-pipe reader marshalled via after]
+    end
+
+    subgraph control [Controllers — one per assignment]
+      P1[PlaybackController monitor A]
+      P2[PlaybackController monitor B]
+      PS[PlaybackController span-group]
+    end
+
+    subgraph shared [Shared, serialised]
+      SCH[1 Hz Scheduler]
+      POL[Pause policy battery / fullscreen]
+      AQ[ApplyQueue generation-token]
+      COM[STA COM backend]
+      SPI[SPI backend]
+      CAT[Catalogue JSON v1.6 / SQLite v2.1]
+    end
+
+    UI --> P1
+    UI --> P2
+    TRAY --> P1
+    HK --> P1
+    CLI --> P1
+    SCH --> P1
+    SCH --> P2
+    SCH --> PS
+    POL --> P1
+    POL --> P2
+    P1 --> AQ
+    P2 --> AQ
+    PS --> AQ
+    AQ --> COM
+    AQ --> SPI
+    P1 --> CAT
+    P2 --> CAT
+```
+
+**One slideshow authority.** Controllers propose `ApplyRequest(target, image_id, source_revision, generation, prepared_path, style)`. The ApplyQueue owns the OS call. A controller may cancel a *queued* request by generation; it cannot cancel an in-flight COM call (5 s timeout, blocking on the STA thread). Recheck eligibility after `ensure_wallpaper_path` returns — the file may have vanished during transcode.
+
+**UI selection ≠ applied output.** The preview shows the selected image for the *focused* assignment. Tray "Current" reports the last successful apply for the primary assignment. This split is already implicit (preview navigation vs tray Next-and-apply) and becomes mandatory once two monitors show different images.
+
+---
+
+### 2.1 Track 1 — True autonomous multi-monitor playback
+
+#### 2.1.1 Independent per-monitor controllers
+
+v1.5.1 state that must be **cloned per assignment**, not shared:
+
+| Field today (global) | Per-assignment in v2.0 |
+| :--- | :--- |
+| `self.images` / `self.index` | `controller.images` / `controller.index` |
+| `_shuffle_order` / `_shuffle_cursor` | own `ShuffleDeck` |
+| `_slideshow_running` | `controller.intent` (`running` / `stopped`) |
+| `_slideshow_job` | none — the 1 Hz scheduler holds `next_due_mono` |
+| `cfg["playback_source"]` | `assignment.source: {kind, id}` |
+| `cfg["interval"]` / shuffle / schedule.mode | inherit-or-override per assignment |
+| `_auto_pause_reasons` | **stay global** in v2.0 (API limitation) |
+| `style_var` | stay global (COM `SetPosition` is global) |
+
+A user-visible configuration that v2.0 must support without further invention:
+
+- Monitor 1 (4K 16:9, primary) — playlist "High-Res Landscapes", 30 minutes, shuffle.
+- Monitor 2 (portrait 9:16) — collection `#vertical`, 1 hour, shuffle.
+- Monitor 3 (3440×1440) — folder "Cyberpunk Panoramas", interval inherit.
+
+**State machine** (each controller):
+
+```
+                    start
+         ┌──────────────────────────┐
+         ▼                          │
+       IDLE ──start──► RUNNING ◄────┘
+         ▲                │
+         │ stop           │ tick / next / prev
+         │                ▼
+         │            APPLYING ──ok──► RUNNING (record history, arm next_due)
+         │                │
+         │                └──fail──► RUNNING (skip, bounded search, do not busy-loop)
+         │
+         RUNNING ──user pause──► PAUSED_USER
+         RUNNING ──policy ─────► PAUSED_POLICY  (reasons non-empty; intent still running)
+         PAUSED_POLICY ──reasons empty && intent running──► RUNNING (arm one next_due, no catch-up)
+         RUNNING ──source empty──► WAITING_SOURCE
+         WAITING_SOURCE ──reconnect && intent running──► RUNNING
+```
+
+Policy pause must not clear user pause — the v1.4 `intent` vs `job` split is the correct model and simply moves from one object onto N.
+
+#### 2.1.2 Concrete controller pattern
+
+Insertion: new `playback.py`. `DesktopVista` holds a `dict[fingerprint, PlaybackController]` plus one optional `SpanController`. The existing `_slideshow_tick` becomes a dispatcher.
+
+```python
+# playback.py — proposed v2.0 controller. Not a drop-in rewrite of DesktopVista.
+from __future__ import annotations
+
+import random
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Callable, Optional
+
+
+@dataclass(frozen=True)
+class ApplyRequest:
+    generation: int
+    fingerprint: Optional[str]      # None = all-displays target
+    path: str
+    style: str
+    source_revision: int
+    reason: str                     # slideshow | manual | hotkey | undo | solar | span
+
+
+@dataclass
+class ShuffleDeck:
+    order: list[int] = field(default_factory=list)
+    cursor: int = 0
+
+    def rebuild(self, n: int, current: int = -1) -> None:
+        order = list(range(n))
+        for i in range(n - 1, 0, -1):
+            j = random.randint(0, i)
+            order[i], order[j] = order[j], order[i]
+        if n > 1 and 0 <= current < n and order and order[0] == current:
+            order.append(order.pop(0))
+        self.order, self.cursor = order, 0
+
+    def next_index(self, n: int, current: int) -> int:
+        if n <= 0:
+            return -1
+        if n == 1:
+            return 0
+        if self.cursor >= len(self.order) or len(self.order) != n:
+            self.rebuild(n, current)
+        idx = self.order[self.cursor]
+        self.cursor += 1
+        return idx
+
+
+class PlaybackController:
+    """One assignment: one display fingerprint, or one span-group id."""
+
+    def __init__(self, assignment_id: str, resolve_images: Callable[[], list[str]]):
+        self.assignment_id = assignment_id
+        self._resolve = resolve_images
+        self.images: list[str] = []
+        self.index: int = -1
+        self.deck = ShuffleDeck()
+        self.history: deque[str] = deque(maxlen=100)
+        self.intent_running: bool = False
+        self.shuffle: bool = False
+        self.interval_seconds: int = 900
+        self.schedule_mode: str = "inherit"   # inherit | interval | daily | solar
+        self.next_due_mono: Optional[float] = None
+        self.source_revision: int = 0
+        self.last_applied: Optional[str] = None
+        self.generation: int = 0
+
+    def reload(self) -> None:
+        current = self.images[self.index] if 0 <= self.index < len(self.images) else None
+        self.images = self._resolve()
+        self.source_revision += 1
+        self.deck = ShuffleDeck()
+        if current in self.images:
+            self.index = self.images.index(current)
+        elif self.images:
+            self.index = 0
+        else:
+            self.index = -1
+            self.next_due_mono = None
+
+    def current_path(self) -> Optional[str]:
+        if 0 <= self.index < len(self.images):
+            return self.images[self.index]
+        return None
+
+    def step(self, delta: int = 1) -> Optional[str]:
+        if not self.images:
+            return None
+        if self.shuffle and delta > 0:
+            self.index = self.deck.next_index(len(self.images), self.index)
+        else:
+            self.index = (self.index + delta) % len(self.images)
+        return self.current_path()
+
+    def undo(self) -> Optional[str]:
+        if len(self.history) < 2:
+            return None
+        self.history.pop()                 # drop current
+        path = self.history[-1]
+        if path in self.images:
+            self.index = self.images.index(path)
+        return path
+
+    def arm_interval(self, now_mono: float) -> None:
+        if self.intent_running and self.images:
+            self.next_due_mono = now_mono + max(5, self.interval_seconds)
+        else:
+            self.next_due_mono = None
+
+    def due(self, now_mono: float) -> bool:
+        return (
+            self.intent_running
+            and bool(self.images)
+            and self.next_due_mono is not None
+            and now_mono >= self.next_due_mono
+        )
+
+    def propose(self, path: str, style: str, reason: str) -> ApplyRequest:
+        self.generation += 1
+        return ApplyRequest(
+            generation=self.generation,
+            fingerprint=self.assignment_id if self.assignment_id != "all" else None,
+            path=path,
+            style=style,
+            source_revision=self.source_revision,
+            reason=reason,
+        )
+
+    def record_success(self, path: str) -> None:
+        self.last_applied = path
+        if not self.history or self.history[-1] != path:
+            self.history.append(path)
+```
+
+**ApplyQueue** (lives next to the COM backend; called only from Tk):
+
+```python
+class ApplyQueue:
+    """Serialise wallpaper applies. COM is not re-entrant and not atomic."""
+
+    def __init__(self, apply_fn, on_done):
+        self._apply_fn = apply_fn          # (request) -> None, may block briefly
+        self._on_done = on_done            # (request, error_or_none) on Tk
+        self._inflight: Optional[ApplyRequest] = None
+        self._pending: dict[Optional[str], ApplyRequest] = {}
+
+    def submit(self, request: ApplyRequest) -> None:
+        # Latest generation per target wins; do not enqueue a backlog of ticks.
+        self._pending[request.fingerprint] = request
+        self._kick()
+
+    def _kick(self) -> None:
+        if self._inflight is not None or not self._pending:
+            return
+        _, request = self._pending.popitem()
+        self._inflight = request
+        # Real integration: run ensure_wallpaper_path + COM on a worker,
+        # then marshal the result with root.after(0, …). Never call COM
+        # from the preview decoder pool (notes_004: STA affinity).
+        try:
+            self._apply_fn(request)
+            self._on_done(request, None)
+        except Exception as exc:
+            self._on_done(request, exc)
+        finally:
+            self._inflight = None
+            self._kick()
+```
+
+**1 Hz scheduler** — replace `_schedule_next`'s `after(seconds * 1000)` (which overflows Tk's signed 32-bit millisecond limit for anything near a week, and drifts across sleep). A one-second `after` tick:
+
+- Recomputes daily/solar due times from wall clock (v1.4 already does this for daily; keep it).
+- Compares interval due times against `time.monotonic()` so sleep/hibernate does not fire a catch-up storm: after resume, at most one currently-due transition per controller (notes_004 Track D).
+- Is the single place weather/solar filters are applied before `controller.step()`.
+
+v1.6 can introduce this scheduler against the *existing* single controller. v2.0 then iterates `controllers.values()`.
+
+#### 2.1.3 Ultrawide & panoramic span slicer
+
+Windows `Span` (`DESKTOP_WALLPAPER_POSITION = 5`, Registry `WallpaperStyle=22`) is a **global composition**: one image stretched across the virtual desktop bounding rectangle. It does not:
+
+- correct bezels,
+- handle mixed DPI (the virtual desktop is in pixels, not millimetres),
+- let a subset of monitors participate,
+- survive a topology change without a re-apply.
+
+v2.0 therefore offers two distinct modes, never mixed on the same display:
+
+| Mode | Mechanism | When |
+| :--- | :--- | :--- |
+| Independent | one `SetWallpaper(device_path, path)` per assignment | default; different sources per display |
+| Span group | pre-slice one image into N files sized to each RECT (+ optional bezel), apply with **Fill** (not Span) | user groups two-or-more currently connected displays |
+
+Native Span remains available as "All displays · Span" for users who *want* the OS compositor and accept its limits. The slicer is an alternative, not a wrapper around `SetPosition(Span)`.
+
+**Algorithm** (pure function, unit-testable with synthetic RECTs — same spirit as today's `compute_topology_layout`):
+
+```python
+# displays.py — proposed. Inputs are virtual-desktop pixel RECTs.
+
+def span_slices(image_size: tuple[int, int], monitors: list[dict], bezel_px: dict) -> list[dict]:
+    """
+    Map *image_size* (w, h) onto the union of monitor RECTs using Cover
+    (equivalent to wallpaper Fill), then return per-monitor crop boxes in
+    image pixel space.
+
+    monitors: [{"fingerprint", "rect": (l,t,r,b), "dpi"}, ...]
+    bezel_px: {(fp_a, fp_b): pixels to expand the crop toward the neighbour}
+    """
+    w, h = image_size
+    lefts = [m["rect"][0] for m in monitors]
+    tops = [m["rect"][1] for m in monitors]
+    rights = [m["rect"][2] for m in monitors]
+    bottoms = [m["rect"][3] for m in monitors]
+    union = (min(lefts), min(tops), max(rights), max(bottoms))
+    uw, uh = union[2] - union[0], union[3] - union[1]
+    scale = max(uw / w, uh / h)          # Cover
+    rw, rh = w * scale, h * scale
+    ox = union[0] - (rw - uw) / 2
+    oy = union[1] - (rh - uh) / 2
+    slices = []
+    for m in monitors:
+        l, t, r, b = m["rect"]
+        # Bezel: expand this crop toward each neighbour so content hiding
+        # under the frame is skipped. Expansion is in desktop pixels, then
+        # mapped back through the same affine transform.
+        for n in monitors:
+            if n is m:
+                continue
+            gap = _adjacent_gap(m["rect"], n["rect"])
+            if gap is None:
+                continue
+            extra = bezel_px.get((m["fingerprint"], n["fingerprint"]), 0)
+            l, t, r, b = _expand_toward(l, t, r, b, gap.side, extra)
+        crop = (
+            int((l - ox) / scale), int((t - oy) / scale),
+            int((r - ox) / scale), int((b - oy) / scale),
+        )
+        slices.append({"fingerprint": m["fingerprint"], "crop": _clamp(crop, w, h)})
+    return slices
+```
+
+Rendered crops land in `%LOCALAPPDATA%\DesktopVista\cache\span\<group_id>\<image_hash>_<fp>.jpg` and are subject to the wallpaper cache quota. Apply each with COM `SetWallpaper(device_path, crop_path)` and a shared `SetPosition(Fill)`. Partial failure: keep successful crops on-screen, report the failed fingerprint, do not call SPI.
+
+**Bezel compensation** is opt-in millimetres per gap, converted with the *source* monitor's DPI (`bezel_px = mm / 25.4 * dpi`). Default 0. Mixed-DPI groups convert per edge, not with a single global DPI. Portrait + landscape in one group is supported geometrically and must be visually confirmed — the crop of a 16:9 panorama onto a 9:16 portrait will look like a slice, which is correct, and should be previewed as such.
+
+**Detection of "this looks like a span setup"** is a hint, not an automatic mode switch: if two-or-more displays share a top or side edge, are the same height (or width), and the user drops a single image whose aspect is within 10 % of the union aspect, offer "Span across these displays". Never auto-enable.
+
+#### 2.1.4 Display hot-plug, docking, and fingerprinting
+
+`GetMonitorDevicePathAt` is documented as a device-path string. Driver updates, dock firmware, USB-C MST hubs and GPU switching (Intel ↔ NVIDIA) routinely mint a new instance-id tail. GDI `\\.\DISPLAY1` is even worse: it is an ordinal. Persisting either as `assignment.device_path` is how wallpapers jump screens after a dock event.
+
+**Fingerprint, v2.0 (no EDID yet):**
+
+```
+fingerprint = sha1(
+    manufacturer_product   # DISPLAY#GSM76F5 portion of the COM path, if present
+    + "x"
+    + native_width + "x" + native_height
+    + "@" + relative_slot    # "primary" | "left-of-primary" | "right-of-primary" | "above" | "below" | "other"
+)
+```
+
+Store, for reconciliation:
+
+```
+{
+  "fingerprint": "...",
+  "last_device_path": "\\\\?\\DISPLAY#GSM76F5#...",
+  "last_gdi_name": "\\\\.\\DISPLAY2",
+  "last_rect": [1920, 0, 3840, 1080],
+  "native": [1920, 1080],
+  "is_primary": false,
+  "orphaned": false
+}
+```
+
+**Reconciliation on `WM_DISPLAYCHANGE`, COM enumeration, and power-resume:**
+
+1. Enumerate live COM monitors (device_path, RECT) and live GDI monitors (gdi_name, RECT, primary). Join *within the session* by RECT equality with a 1-pixel tolerance — that join is the only reliable bridge between the two APIs.
+2. For each live monitor, score stored records: exact `last_device_path` (1.0), same manufacturer_product + native size (0.8), same native size + same relative_slot (0.5), same native size only (0.2). Take the unique best score ≥ 0.5.
+3. Ambiguous scores → mark both as needing reassignment; do not guess. Keep the last successful wallpaper on that screen (Windows already is). Surface a tray balloon / status line: "Display arrangement changed — confirm assignments".
+4. Unmatched stored records with `intent_running` become `orphaned=true` and pause *that* controller (`WAITING_SOURCE` equivalent). Do not delete the assignment.
+5. A laptop lid-close that disables the internal panel is a disconnect of that fingerprint, not a config wipe.
+
+**v2.1 upgrade:** EDID serial via SetupAPI (`GUID_DEVINTERFACE_MONITOR`) or DXGI, ctypes-only. When present, it replaces manufacturer_product+size as the 1.0 key. When absent (some hubs strip EDID), the v2.0 heuristic remains.
+
+**Do not** use `WM_DEVICECHANGE` as the sole docking signal. Notes_004 Track A already recorded that it is not a replacement for polling. Pair it with the existing 15 s reconnect poll, now also comparing topology fingerprints.
+
+---
+
+### 2.2 Track 2 — Context-aware intelligence & ambient scheduling
+
+#### 2.2.1 Live solar scheduler
+
+v1.5 stored the model; v1.6 *uses* it. No new dependency. NOAA solar-position arithmetic in pure `math` (stdlib). Coordinates remain user-supplied; the UI already has the fields, they are just not shown — add a compact "Location for solar" block under POWER & SCHEDULE, default off.
+
+**Phase definitions** (civil twilight, matching notes_004 Track D):
+
+| Phase | Tag aliases | Boundary |
+| :--- | :--- | :--- |
+| dawn | `#dawn`, `#sunrise`, `#golden-hour-am` | civil dawn → sunrise |
+| day | `#day`, `#daytime`, `#noon` | sunrise → sunset |
+| dusk | `#dusk`, `#sunset`, `#golden-hour-pm` | sunset → civil dusk |
+| night | `#night`, `#dark` | civil dusk → next civil dawn |
+
+Civil twilight is sun altitude −6°. Polar day/night (no sunrise or no civil dawn): ignore computed events for that date and fire the four `fallback_times` instead. Log once per day, do not spam.
+
+```python
+# schedule.py — proposed v1.6 solar engine. Pure, unit-testable.
+from __future__ import annotations
+
+import math
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+CIVIL_TWILIGHT_DEG = -6.0  # geometric centre of the sun
+
+
+def _julian_day(dt: datetime) -> float:
+    utc = dt.astimezone(timezone.utc)
+    y, m, d = utc.year, utc.month, utc.day + (
+        utc.hour + utc.minute / 60 + utc.second / 3600
+    ) / 24
+    if m <= 2:
+        y -= 1
+        m += 12
+    a = math.floor(y / 100)
+    b = 2 - a + math.floor(a / 4)
+    return math.floor(365.25 * (y + 4716)) + math.floor(30.6001 * (m + 1)) + d + b - 1524.5
+
+
+def _sun_times(lat: float, lon: float, day: datetime, altitude_deg: float) -> Optional[tuple[datetime, datetime]]:
+    """Return (morning, evening) local datetimes when the sun crosses altitude_deg.
+    None if the sun never crosses that altitude this date (polar)."""
+    jd = _julian_day(day.replace(hour=12, minute=0, second=0, microsecond=0))
+    n = jd - 2451545.0 + 0.0008
+    j_star = n - lon / 360.0
+    m = (357.5291 + 0.98560028 * j_star) % 360
+    m_rad = math.radians(m)
+    c = 1.9148 * math.sin(m_rad) + 0.0200 * math.sin(2 * m_rad) + 0.0003 * math.sin(3 * m_rad)
+    lam = (m + 102.9372 + c + 180) % 360
+    j_transit = 2451545.0 + j_star + 0.0053 * math.sin(m_rad) - 0.0069 * math.sin(2 * math.radians(lam))
+    sin_dec = math.sin(math.radians(lam)) * math.sin(math.radians(23.4397))
+    dec = math.asin(sin_dec)
+    lat_r = math.radians(lat)
+    alt_r = math.radians(altitude_deg)
+    cos_ha = (math.sin(alt_r) - math.sin(lat_r) * math.sin(dec)) / (math.cos(lat_r) * math.cos(dec))
+    if cos_ha < -1.0 or cos_ha > 1.0:
+        return None
+    ha = math.degrees(math.acos(cos_ha))
+    j_rise = j_transit - ha / 360.0
+    j_set = j_transit + ha / 360.0
+
+    def jd_to_local(j: float) -> datetime:
+        unix = (j - 2440587.5) * 86400.0
+        return datetime.fromtimestamp(unix, tz=timezone.utc).astimezone(day.tzinfo)
+
+    return jd_to_local(j_rise), jd_to_local(j_set)
+
+
+def solar_phases(lat: float, lon: float, now: datetime) -> dict[str, datetime]:
+    """Next boundary times from *now*. Missing keys mean polar; caller uses fallbacks."""
+    local = now if now.tzinfo else now.replace(tzinfo=datetime.now().astimezone().tzinfo)
+    events: dict[str, datetime] = {}
+    sunrise = _sun_times(lat, lon, local, -0.833)   # refraction-corrected horizon
+    civil = _sun_times(lat, lon, local, CIVIL_TWILIGHT_DEG)
+    if sunrise:
+        events["sunrise"], events["sunset"] = sunrise
+    if civil:
+        events["civil_dawn"], events["civil_dusk"] = civil
+    return events
+
+
+def current_phase(lat: float, lon: float, now: datetime, fallback_times: list[str]) -> str:
+    events = solar_phases(lat, lon, now)
+    if {"civil_dawn", "sunrise", "sunset", "civil_dusk"} <= events.keys():
+        t = now.timetz() if False else now.time()
+        order = [
+            ("dawn", events["civil_dawn"]),
+            ("day", events["sunrise"]),
+            ("dusk", events["sunset"]),
+            ("night", events["civil_dusk"]),
+        ]
+        phase = "night"
+        for name, when in order:
+            if now >= when:
+                phase = name
+        return phase
+    # Polar / computation failure — map fallback HH:MM onto the four names.
+    names = ("dawn", "day", "dusk", "night")
+    hhmm = [tuple(map(int, s.split(":"))) for s in fallback_times[:4]]
+    phase = names[-1]
+    for name, (h, m) in zip(names, hhmm):
+        if (now.hour, now.minute) >= (h, m):
+            phase = name
+    return phase
+
+
+def next_solar_trigger(lat, lon, now, fallback_times) -> datetime:
+    events = solar_phases(lat, lon, now)
+    candidates = [v for v in events.values() if v > now]
+    if candidates:
+        return min(candidates)
+    # Fall back to the v1.4 daily-times helper already in desktop_vista.py.
+    from desktop_vista import next_daily_trigger
+    trigger = next_daily_trigger(now.replace(tzinfo=None), fallback_times)
+    return trigger or (now + timedelta(hours=6))
+```
+
+**Wiring into playback (v1.6, single controller; v2.0, each controller with `schedule_mode in ("inherit", "solar")`):**
+
+1. `schedule.mode` gains `"solar"`. Validation: if mode is solar and `solar.enabled` is true, lat/lon must be finite; otherwise refuse to switch and keep interval.
+2. On each scheduler tick, compute `phase`. If the eligible set (hidden-filtered source list) contains **any** image tagged with that phase's aliases, restrict the next draw to that subset. If not, play the unfiltered source — **never stall a library that has no solar tags**. Disclose in status: `Slideshow · dusk (unfiltered — no #dusk tags)`.
+3. Fire an apply at each phase boundary even if the interval has not elapsed. This is the point of solar mode. Missed boundaries across sleep: apply *once* for the *current* phase, do not replay dawn then day then dusk.
+4. Golden-hour aliases are tags only; they do not create extra boundaries in v1.6.
+
+Reuse `next_daily_trigger`'s DST rule: nonexistent local time → first valid later time; repeated local time → run once.
+
+#### 2.2.2 Weather-reactive bias
+
+Optional, off by default, v2.1. Open-Meteo needs no key:
+
+`https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=weather_code,is_day,cloud_cover&timezone=auto`
+
+Poll every 15 minutes from a **dedicated** network worker (do not share the preview pool — notes_004 Track A: a blocked NAS probe must not occupy decode workers; the same applies to HTTPS). Timeout 3 s. Cache last document for 24 h. Offline → last cache, else ignore weather.
+
+WMO code → tag aliases:
+
+| WMO | Aliases |
+| :--- | :--- |
+| 0–1 | `#clear`, `#sunny` |
+| 2–3 | `#cloudy`, `#overcast` |
+| 45, 48 | `#fog` |
+| 51–67, 80–82 | `#rain`, `#wet` |
+| 71–77, 85–86 | `#snow`, `#winter` |
+| 95–99 | `#storm`, `#thunder` |
+
+Bias, not a hard filter: when matching images exist, draw the next shuffle item from the matching subset; if the subset is empty, draw from the full source. Weather never overrides a user-paused controller and never introduces a network dependency on the apply path — the last known code is a scheduler input, not a wallpaper-apply input.
+
+Do not scrape Windows Weather. There is no supported local API; the widget's state is not a contract.
+
+#### 2.2.3 Windows accent-colour synchronisation
+
+Opt-in, v2.1, default off. After a successful apply, extract a dominant colour from a downscaled preview (already decoded) using Pillow `quantize(colors=8, method=Image.MEDIANCUT)` — no NumPy, no k-means. Skip near-grey (`sat < 0.15`) and near-white/black; pick the remaining swatch with highest `sat * count`.
+
+Write, then broadcast:
+
+```
+HKCU\Software\Microsoft\Windows\DWM
+    ColorizationColor     DWORD  0xAABBGGRR
+    AccentColor           DWORD  0xAABBGGRR
+    ColorPrevalence       DWORD  1           # optional; do not force if user disabled coloured title bars
+HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent
+    AccentColorMenu       DWORD
+```
+
+`SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "ImmersiveColorSet", …)` afterwards. `DwmFlush` is not sufficient on Windows 11 22H2+; the Settings app's accent is increasingly policy-controlled. Treat this feature as **best-effort** and document that a group-policy-locked accent will not move. Never touch the wallpaper engine's apply result if the colour write fails.
+
+Store the previous accent on first enable and restore it when the user turns the feature off. That restore path is a v2.1 exit criterion.
+
+---
+
+### 2.3 Track 3 — Global system integration
+
+#### 2.3.1 Global hotkeys (`RegisterHotKey`)
+
+Tk does not dispatch `WM_HOTKEY` unless the HWND's WndProc sees it. Register from the **Tk thread** (the thread that owns the window) and subclass that HWND. A second GetMessage thread is unnecessary and would fight pystray's own Win32 loop.
+
+Default bindings (user-configurable; these are the recommended factory set):
+
+| Binding | Action | Notes |
+| :--- | :--- | :--- |
+| Win+Alt+N | Next on the focused assignment (primary if window hidden) | Works while fullscreen *if* UIPI allows; games that eat Win are a documented miss |
+| Win+Alt+P | Previous / history-back | Previous is history, not deck-rewind (notes_004 tray contract) |
+| Win+Alt+F | Toggle favourite on the last *applied* image of that assignment | Not the preview selection, when they differ |
+| Win+Alt+H | Hide (blacklist) + skip | Same as the 🙈 control; non-destructive |
+| Win+Alt+Z | Undo last apply on that assignment | History stack |
+| Win+Alt+S | Pause/resume that assignment | Does not clear policy reasons |
+
+```python
+# hotkeys.py — proposed v1.6. ctypes only.
+from __future__ import annotations
+
+import ctypes
+from ctypes import wintypes
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+
+WM_HOTKEY = 0x0312
+GWL_WNDPROC = -4
+MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x0001, 0x0002, 0x0004, 0x0008, 0x4000
+
+WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_longlong, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+)
+
+
+class HotkeyManager:
+    def __init__(self, hwnd: int, on_hotkey, bindings: list[tuple[int, int, int]]):
+        # bindings: (id, modifiers, vk)  e.g. (1, MOD_WIN|MOD_ALT|MOD_NOREPEAT, 0x4E)  # N
+        self.hwnd = hwnd
+        self.on_hotkey = on_hotkey
+        self.bindings = bindings
+        self._old_proc = None
+        self._registered: list[int] = []
+        self._self_proc = WNDPROC(self._wndproc)  # keep alive
+
+    def start(self) -> list[str]:
+        conflicts = []
+        for hid, mods, vk in self.bindings:
+            if not user32.RegisterHotKey(self.hwnd, hid, mods, vk):
+                conflicts.append(f"id={hid} vk=0x{vk:02X}")
+            else:
+                self._registered.append(hid)
+        self._old_proc = user32.SetWindowLongPtrW(self.hwnd, GWL_WNDPROC, self._self_proc)
+        return conflicts
+
+    def _wndproc(self, hwnd, msg, wparam, lparam):
+        if msg == WM_HOTKEY:
+            self.on_hotkey(int(wparam))
+            return 0
+        return user32.CallWindowProcW(self._old_proc, hwnd, msg, wparam, lparam)
+
+    def close(self) -> None:
+        for hid in self._registered:
+            user32.UnregisterHotKey(self.hwnd, hid)
+        self._registered.clear()
+        if self._old_proc:
+            user32.SetWindowLongPtrW(self.hwnd, GWL_WNDPROC, self._old_proc)
+            self._old_proc = None
+```
+
+**Conflict detection:** `RegisterHotKey` returning 0 is the only honest signal. Surface conflicts in the status line and a Settings list; do not steal another app's binding in a retry loop. `MOD_NOREPEAT` prevents key-repeat storms while held.
+
+**UIPI / fullscreen:** a process running medium-integrity cannot register a hotkey that an elevated game already owns, and some exclusive-fullscreen titles never yield Win. The tray menu remains the fallback. Do not inject into other processes.
+
+**Config shape (v1.6 additive):**
+
+```json
+"hotkeys": {
+  "enabled": true,
+  "next": "Win+Alt+N",
+  "prev": "Win+Alt+P",
+  "favourite": "Win+Alt+F",
+  "hide": "Win+Alt+H",
+  "undo": "Win+Alt+Z",
+  "toggle": "Win+Alt+S"
+}
+```
+
+Parse with a small grammar (`Win|Ctrl|Alt|Shift` + one key). Reject bindings without a modifier — a bare `N` would steal typing.
+
+#### 2.3.2 Windows lock-screen synchronisation
+
+Still a **research gate**, now scheduled as a v2.1 spike with a go/no-go, not a promised command. The API is `Windows.System.UserProfile.LockScreen.SetImageFileAsync(IStorageFile)`. Constraints to verify on the *actual* host (script *and* frozen unpackaged exe, Win10 22H2 and Win11 24H2):
+
+- Unpackaged Python / PyInstaller has historically needed `winsdk` (or `winrt`) and an `IStorageFile` obtained via `StorageFile.GetFileFromPathAsync`. The image must live on a local NTFS path; UNC often fails.
+- Group Policy `Prevent changing lock screen` silently fails the call.
+- Spotlight / Windows Spotlight will overwrite on next refresh if the user left it enabled — disclose this.
+- Do not set the lock screen to a NAS path. Copy into `%LOCALAPPDATA%\DesktopVista\lockscreen\current.jpg` first (quota-capped, last-good retained).
+
+Product options, only after the spike passes:
+
+- Off (default)
+- Mirror desktop primary
+- Independent source (a collection or playlist)
+
+Failure retains the previous lock image and reports. Never a SPI fallback — SPI does not own the lock screen.
+
+#### 2.3.3 Playback history & undo
+
+v1.6, against the single controller; v2.0, one ring per assignment.
+
+- Ring of 100 **successfully applied** paths (not preview-only navigations). Persist in `playback_state.json` (or, from v2.1, the `history` table) so a crash still undoes.
+- Tray Previous and Win+Alt+P walk this ring, then apply. Slideshow Next appends. Hide-and-skip appends the *replacement*, not the hidden file.
+- Undo (Win+Alt+Z / an explicit tray item) reapplies `history[-2]` and truncates. Empty ring → status "Nothing to undo".
+- Do not persist full 4K pixels. Paths only, plus fingerprint and timestamp.
+
+This is also the data the SQLite `history` table ingests at v2.1 migration.
+
+---
+
+### 2.4 Track 4 — Intelligent media curation (v2.1)
+
+All three items are catalogue features. Shipping them against JSON path arrays would copy the scale problem. They wait for `desktop_vista.db`.
+
+**Focal-point crop.** Default Fill on a 16:9 image onto a 9:16 portrait will decapitate. v2.1 computes a cheap saliency box without ONNX:
+
+1. Downscale to ~128 px on the long side (the preview decoder already did similar work).
+2. Convert to greyscale, compute per-tile Shannon entropy (8×8 tiles) and a Sobel-like absolute-gradient map in pure Python / Pillow.
+3. The centroid of `0.6 * normalised_entropy + 0.4 * normalised_gradient` is `(sx, sy)` in 0..1.
+4. Crop the source to the target aspect around that centroid, clamped to image bounds.
+5. Cache `(path, mtime_ns, size, target_aspect) → crop box` in the catalogue (`saliency_x`, `saliency_y`).
+
+Use this crop only when the assignment's display aspect differs from the image aspect by more than 8 % *and* the global fit style is Fill. Fit/Centre/Stretch are left alone. An ONNX model is a Future opt-in that writes the same two columns; the apply path must not care which producer filled them.
+
+**Perceptual duplicates.** Lazy `dhash` (difference hash, 8×8 → 16 hex chars) computed on first preview of each image, stored on the row. "Find near-duplicates" is a maintenance view: Hamming distance ≤ 8 within the same source, or across sources. Actions: hide the lower-resolution copy, or the one not favourited. Never delete files. Do not compute hashes during folder scan.
+
+**Resolution down-rank.** If `image.width * image.height < 0.5 * display.width * display.height`, exclude from that assignment's shuffle unless it is favourited or it is the only remaining candidate. Disclose with a status count: `12 images below this display's native resolution were skipped`.
+
+**EXIF inspector.** Pillow `getexif()` / `_getexif()`. Show make, model, lens (tag 42036), focal length, F, exposure, ISO, taken-at, GPS. "Show on Map" opens `https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=16/{lat}/{lon}` via `os.startfile` — no Google key, no telemetry. GPS is opt-in to display; the catalogue may store it (local DB) but it must never appear in a feed upload or log line at INFO.
+
+---
+
+### 2.5 Track 5 — Cloud & curated feeds (opt-in)
+
+Feeds are a new **source kind**, not a parallel wallpaper engine. If the network is down, `resolve_source_images` sees an empty online folder and the existing offline behaviour applies.
+
+| Feed | Endpoint | Auth | Cadence |
+| :--- | :--- | :--- | :--- |
+| Bing Daily | `https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=8&mkt=en-GB` | none | 1× / day |
+| NASA APOD | `https://api.nasa.gov/planetary/apod?api_key=DEMO_KEY` (or user key) | optional | 1× / day |
+| Unsplash / Wallhaven | user key | required | Future |
+
+Download into `%LOCALAPPDATA%\DesktopVista\feeds\<feed_id>\` as a normal folder that playlists/collections can include. Quota (defaults): 30 files **or** 2 GB per feed, whichever first; purge oldest non-favourited. Favourited feed images are exempt from auto-purge and can be copied into a user folder on request (copy, not move, so the feed folder remains the cache).
+
+Sandbox rules: HTTPS only, size cap 25 MB per file, Pillow verify before promoting from `*.part`, no executable extensions, no HTML-masquerade (sniff JPEG/PNG/WebP magic). A failed fetch is a log line, not a modal.
+
+v2.1 ships Bing + quota. APOD ships if DEMO_KEY rate limits are acceptable for a single-user local app (they are); document that a personal key is preferred. Unsplash/Wallhaven wait on ToS review and a settings field for the key — do not embed a shared key in the exe.
+
+---
+
+### 2.6 Track 6 — Single-instance mutex & named-pipe IPC
+
+v1.6. This is the prerequisite for "Start with Windows" being safe (today two logon-race instances can both apply wallpapers and race `save_config`, even with unique temp names).
+
+#### 2.6.1 Mutex
+
+```python
+# ipc.py — proposed v1.6. ctypes against kernel32.
+from __future__ import annotations
+
+import ctypes
+from ctypes import wintypes
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+ERROR_ALREADY_EXISTS = 183
+MUTEX_NAME = "Local\\DesktopVista.SingleInstance"   # per-session; use Global\\ only if we must
+PIPE_NAME = r"\\.\pipe\DesktopVista.Ipc"
+
+def try_become_primary() -> tuple[object, bool]:
+    handle = kernel32.CreateMutexW(None, True, MUTEX_NAME)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    existed = ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+    return handle, not existed
+```
+
+- Script launch (`pythonw desktop_vista.py`) and frozen (`DesktopVista.exe`) **must share the mutex name**, otherwise a dev run and a startup-run duplicate. They already share `APP_NAME`.
+- `Local\\` is session-scoped: a fast-user-switch second session may run its own instance. That is correct (different desktop).
+- Never use `Global\\` without an explicit "one instance per machine" setting; it requires SeCreateGlobalPrivilege in some contexts and surprises terminal-services users.
+
+If we are not primary: parse argv, send one IPC request, print the reply on stdout (so `--status` is scriptable), exit 0/1. Do not open a second Tk.
+
+#### 2.6.2 Named pipe protocol
+
+Newline-delimited JSON, UTF-8, one request → one response, then the client may close. Server accepts one client at a time (message mode, 64 KiB). ACL: the pipe is created with a security descriptor allowing the same user only (`SECURITY_WORLD` is unacceptable — any local process could then change the wallpaper).
+
+```
+→ {"cmd":"next"}
+← {"ok":true,"applied":"D:\\Wallpapers\\coast.jpg","target":"primary"}
+
+→ {"cmd":"prev"}
+→ {"cmd":"pause"}
+→ {"cmd":"resume"}
+→ {"cmd":"toggle"}
+→ {"cmd":"favourite"}
+→ {"cmd":"hide"}
+→ {"cmd":"undo"}
+→ {"cmd":"set","path":"D:\\photo.jpg","target":"primary"}
+→ {"cmd":"status"}
+← {"ok":true,"version":"1.6.0","running":true,"paused":["fullscreen"],
+   "assignments":[{"fp":"…","image":"…","source":"Workday"}]}
+→ {"cmd":"ping"}
+← {"ok":true}
+```
+
+CLI mapping (frozen argv, also accepted by the python entry):
+
+```
+DesktopVista.exe --next
+DesktopVista.exe --prev
+DesktopVista.exe --pause
+DesktopVista.exe --resume
+DesktopVista.exe --toggle
+DesktopVista.exe --status
+DesktopVista.exe --set "D:\photo.jpg"
+DesktopVista.exe --favourite
+DesktopVista.exe --hide
+DesktopVista.exe --undo
+```
+
+`--minimized` remains a *primary-instance* flag. If a primary already exists, `--minimized` is treated as "restore/hide is the running instance's business" and exits 0 after a `ping`.
+
+Implementation sketch (server on a daemon thread, *commands marshalled onto Tk with `after(0, …)`* — the pipe thread never calls COM or touches widgets):
+
+```python
+import json
+import threading
+import ctypes
+from ctypes import wintypes
+
+PIPE_ACCESS_DUPLEX = 0x00000003
+PIPE_TYPE_MESSAGE = 0x00000004
+PIPE_READMODE_MESSAGE = 0x00000002
+PIPE_WAIT = 0x00000000
+PIPE_UNLIMITED_INSTANCES = 255
+ERROR_PIPE_CONNECTED = 535
+
+class IpcServer(threading.Thread):
+    def __init__(self, dispatch_on_ui):
+        super().__init__(name="dv-ipc", daemon=True)
+        self.dispatch_on_ui = dispatch_on_ui  # (payload) -> response dict, Tk-thread
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.is_set():
+            handle = kernel32.CreateNamedPipeW(
+                PIPE_NAME, PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+                1, 65536, 65536, 0, None,   # replace None with a user-only SD
+            )
+            if handle == -1:
+                return
+            connected = kernel32.ConnectNamedPipe(handle, None)
+            if connected or ctypes.get_last_error() == ERROR_PIPE_CONNECTED:
+                self._serve(handle)
+            kernel32.CloseHandle(handle)
+
+    def _serve(self, handle) -> None:
+        buf = ctypes.create_string_buffer(65536)
+        read = wintypes.DWORD()
+        if not kernel32.ReadFile(handle, buf, 65536, ctypes.byref(read), None):
+            return
+        raw = buf.raw[: read.value].decode("utf-8", "replace").strip()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            reply = {"ok": False, "error": "invalid json"}
+        else:
+            done = threading.Event()
+            box: dict = {}
+
+            def _ui():
+                try:
+                    box["r"] = self.dispatch_on_ui(payload)
+                except Exception as exc:
+                    box["r"] = {"ok": False, "error": str(exc)}
+                finally:
+                    done.set()
+
+            self.dispatch_on_ui.__self__.after(0, _ui) if False else None
+            # Real integration passes root.after bound at construction.
+            done.wait(timeout=8)
+            reply = box.get("r", {"ok": False, "error": "ui timeout"})
+        data = (json.dumps(reply) + "\n").encode("utf-8")
+        written = wintypes.DWORD()
+        kernel32.WriteFile(handle, data, len(data), ctypes.byref(written), None)
+        kernel32.FlushFileBuffers(handle)
+        kernel32.DisconnectNamedPipe(handle)
+```
+
+Stream Deck / Windows Terminal / Task Scheduler then become first-class clients without a second wallpaper authority.
+
+**Security:** the pipe must not accept commands from other users. If creating a user-only security descriptor in ctypes proves brittle in v1.6, fall back to a second mutex + a `localhost` loopback socket bound to `127.0.0.1` with a random token written to `%LOCALAPPDATA%\DesktopVista\ipc.token` (ACL'd to the user). Named pipe is preferred; the token socket is the escape hatch, not a public API.
+
+---
+
+## 3. Database Schema & Migration Specification
+
+JSON remains the settings file through v1.6. SQLite is introduced in **v2.1** as the catalogue, not as a second copy of tray/power/hotkey preferences. Mixing the two is how migrations get stuck.
+
+### 3.1 What stays in `config.json` (settings)
+
+`schema_version` (integer, starts at 3 when the catalogue exists; v1.5 files have no key ≡ 1; v1.6 additive keys keep the file unversioned-as-1 with forward-compatible validation, then v2.0 assignments bump to 2, v2.1 catalogue bump to 3). Settings keys: `style`, `interval`, `interval_custom_seconds`, `shuffle`, `tray`, `power`, `schedule`, `solar`, `wallpaper_target`, `hotkeys`, `weather`, `accent_sync`, `lockscreen`, `feeds`, `ipc`, `display_assignments` (fingerprints + source refs only), `cache` budgets. No path arrays of images.
+
+### 3.2 `desktop_vista.db` — complete DDL
+
+Location: `%LOCALAPPDATA%\DesktopVista\desktop_vista.db` for installed/frozen builds; `<APP_DIR>/desktop_vista.db` in portable mode (next to `config.json`). WAL, foreign keys, 5 s busy timeout. One writer connection owned by a `Catalogue` object on a dedicated thread; UI and controllers submit requests and receive immutable snapshots. **Do not** share a `sqlite3` connection across the preview pool, the COM STA thread, and Tk.
+
+```sql
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
+PRAGMA synchronous = NORMAL;
+
+CREATE TABLE schema_migrations (
+    version     INTEGER PRIMARY KEY,
+    applied_at  TEXT    NOT NULL
+);
+
+CREATE TABLE sources (
+    id            TEXT PRIMARY KEY,               -- 12-hex, same generator as new_id()
+    kind          TEXT NOT NULL CHECK (kind IN ('local', 'removable', 'network', 'feed')),
+    path          TEXT NOT NULL,
+    recursive     INTEGER NOT NULL DEFAULT 0 CHECK (recursive IN (0, 1)),
+    volume_id     TEXT,                           -- GetVolumeNameForVolumeMountPointW GUID
+    volume_label  TEXT,
+    status        TEXT NOT NULL DEFAULT 'unknown'
+                  CHECK (status IN ('online', 'offline', 'permission_denied',
+                                    'scanning', 'error', 'unknown')),
+    last_scan_at  TEXT,
+    last_error    TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE UNIQUE INDEX idx_sources_path ON sources(path);
+
+CREATE TABLE images (
+    id            TEXT PRIMARY KEY,               -- sha1(source_id || '|' || relative_path)
+    source_id     TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    relative_path TEXT NOT NULL,
+    abs_path      TEXT NOT NULL,
+    file_size     INTEGER,
+    mtime_ns      INTEGER,
+    width         INTEGER,
+    height        INTEGER,
+    orientation   INTEGER,
+    format        TEXT,
+    phash         TEXT,
+    dhash         TEXT,
+    favourite     INTEGER NOT NULL DEFAULT 0 CHECK (favourite IN (0, 1)),
+    hidden        INTEGER NOT NULL DEFAULT 0 CHECK (hidden IN (0, 1)),
+    play_count    INTEGER NOT NULL DEFAULT 0,
+    last_played_at TEXT,
+    dominant_color TEXT,                          -- #RRGGBB
+    saliency_x    REAL,
+    saliency_y    REAL,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    UNIQUE (source_id, relative_path)
+);
+CREATE INDEX idx_images_source     ON images(source_id);
+CREATE INDEX idx_images_abs_path   ON images(abs_path);
+CREATE INDEX idx_images_hidden     ON images(hidden);
+CREATE INDEX idx_images_favourite  ON images(favourite);
+CREATE INDEX idx_images_dhash      ON images(dhash);
+
+CREATE TABLE tags (
+    id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    name  TEXT NOT NULL COLLATE NOCASE UNIQUE
+);
+
+CREATE TABLE image_tags (
+    image_id TEXT    NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    tag_id   INTEGER NOT NULL REFERENCES tags(id)   ON DELETE CASCADE,
+    PRIMARY KEY (image_id, tag_id)
+);
+CREATE INDEX idx_image_tags_tag ON image_tags(tag_id);
+
+CREATE TABLE playlists (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE playlist_sources (
+    playlist_id TEXT    NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    source_id   TEXT    NOT NULL REFERENCES sources(id)   ON DELETE CASCADE,
+    position    INTEGER NOT NULL,
+    PRIMARY KEY (playlist_id, source_id)
+);
+
+CREATE TABLE collections (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    match_mode      TEXT NOT NULL DEFAULT 'any'
+                    CHECK (match_mode IN ('any', 'all', 'expr')),
+    tag_expr        TEXT,                         -- boolean expression for match_mode='expr'
+    favourites_only INTEGER NOT NULL DEFAULT 0 CHECK (favourites_only IN (0, 1)),
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE collection_tags (
+    collection_id TEXT    NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    tag_id        INTEGER NOT NULL REFERENCES tags(id)        ON DELETE CASCADE,
+    PRIMARY KEY (collection_id, tag_id)
+);
+
+CREATE TABLE displays (
+    fingerprint      TEXT PRIMARY KEY,
+    last_device_path TEXT,
+    last_gdi_name    TEXT,
+    last_rect        TEXT,                        -- "l,t,r,b"
+    native_w         INTEGER,
+    native_h         INTEGER,
+    dpi              INTEGER,
+    is_primary       INTEGER NOT NULL DEFAULT 0 CHECK (is_primary IN (0, 1)),
+    edid_mfg         TEXT,
+    edid_serial      TEXT,
+    edid_name        TEXT,
+    last_seen_at     TEXT,
+    orphaned         INTEGER NOT NULL DEFAULT 0 CHECK (orphaned IN (0, 1))
+);
+
+CREATE TABLE display_assignments (
+    fingerprint      TEXT PRIMARY KEY REFERENCES displays(fingerprint) ON DELETE CASCADE,
+    source_kind      TEXT NOT NULL
+                     CHECK (source_kind IN ('folder', 'playlist', 'collection',
+                                            'favourites', 'span_group')),
+    source_id        TEXT,
+    interval_seconds INTEGER,
+    shuffle          INTEGER NOT NULL DEFAULT 0 CHECK (shuffle IN (0, 1)),
+    schedule_mode    TEXT NOT NULL DEFAULT 'inherit'
+                     CHECK (schedule_mode IN ('inherit', 'interval', 'daily', 'solar')),
+    intent_running   INTEGER NOT NULL DEFAULT 0 CHECK (intent_running IN (0, 1)),
+    last_image_id    TEXT REFERENCES images(id) ON DELETE SET NULL,
+    span_group_id    TEXT,
+    bezel_mm         REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE span_groups (
+    id       TEXT PRIMARY KEY,
+    name     TEXT NOT NULL,
+    bezel_mm REAL NOT NULL DEFAULT 0
+);
+
+CREATE TABLE span_group_members (
+    group_id     TEXT NOT NULL REFERENCES span_groups(id) ON DELETE CASCADE,
+    fingerprint  TEXT NOT NULL REFERENCES displays(fingerprint) ON DELETE CASCADE,
+    position     INTEGER NOT NULL,
+    PRIMARY KEY (group_id, fingerprint)
+);
+
+CREATE TABLE history (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT NOT NULL,
+    fingerprint  TEXT,
+    image_id     TEXT REFERENCES images(id) ON DELETE SET NULL,
+    abs_path     TEXT NOT NULL,
+    source_kind  TEXT,
+    source_id    TEXT,
+    applied      INTEGER NOT NULL DEFAULT 1 CHECK (applied IN (0, 1)),
+    reason       TEXT NOT NULL
+);
+CREATE INDEX idx_history_ts ON history(ts);
+CREATE INDEX idx_history_fp ON history(fingerprint);
+
+CREATE TABLE image_exif (
+    image_id      TEXT PRIMARY KEY REFERENCES images(id) ON DELETE CASCADE,
+    camera_make   TEXT,
+    camera_model  TEXT,
+    lens          TEXT,
+    focal_length  REAL,
+    f_number      REAL,
+    exposure_time TEXT,
+    iso           INTEGER,
+    taken_at      TEXT,
+    gps_lat       REAL,
+    gps_lon       REAL
+);
+
+CREATE TABLE feed_items (
+    id         TEXT PRIMARY KEY,
+    feed       TEXT NOT NULL,
+    remote_id  TEXT,
+    local_path TEXT,
+    title      TEXT,
+    copyright  TEXT,
+    fetched_at TEXT NOT NULL,
+    favourite  INTEGER NOT NULL DEFAULT 0 CHECK (favourite IN (0, 1)),
+    UNIQUE (feed, remote_id)
+);
+
+CREATE TABLE settings_shadow (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL                           -- JSON; diagnostic mirror, not source of truth
+);
+
+INSERT INTO schema_migrations(version, applied_at) VALUES (1, datetime('now'));
+```
+
+Boolean tag expressions (`match_mode='expr'`) are parsed by a tiny recursive-descent parser supporting `AND` `OR` `NOT` parentheses and tag tokens. The v1.5 `tags_any` list migrates as `match_mode='any'`. Invalid expressions fall back to `any` and are reported, not dropped.
+
+Example query the catalogue must answer in well under 50 ms at 50k rows:
+
+```sql
+-- collection "nature AND (4k OR 8k) NOT car", hidden-filtered, online sources only
+SELECT i.abs_path
+FROM images i
+JOIN sources s ON s.id = i.source_id
+WHERE i.hidden = 0
+  AND s.status = 'online'
+  AND EXISTS (SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
+              WHERE it.image_id = i.id AND t.name = 'nature')
+  AND (
+        EXISTS (SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
+                WHERE it.image_id = i.id AND t.name = '4k')
+     OR EXISTS (SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
+                WHERE it.image_id = i.id AND t.name = '8k')
+  )
+  AND NOT EXISTS (SELECT 1 FROM image_tags it JOIN tags t ON t.id = it.tag_id
+                  WHERE it.image_id = i.id AND t.name = 'car');
+```
+
+### 3.3 Zero-data-loss migration from config.json v1.5
+
+Idempotent. Re-running against an already-migrated tree is a no-op. The old application is **not** forward-compatible once image arrays leave JSON (notes_004 §7 already stated this); ship an explicit "Export v1.5 JSON" command.
+
+**Algorithm**
+
+1. **Read without writing.** If `desktop_vista.db` exists and `schema_migrations` contains version 1 (or later), stop. If `config.json` is missing, create an empty DB and a default settings file; do not invent folders.
+2. **Backup.** Copy `config.json` → `config.json.bak-v1.5` next to it, never overwrite an existing backup. Copy is full-file, flushed.
+3. **Validate** with the current `_validate_config`. A file that already falls back to defaults must not be treated as a populated library.
+4. **Create the DB** as `desktop_vista.db.tmp`, not the final name.
+5. **Sources.** Every unique path in `folders` plus every path in every playlist's `folders` list becomes a `sources` row. Preserve order via playlist_sources.position. `kind`: UNC (`\\`) → `network`; otherwise `local` (removable detection is best-effort via `GetDriveTypeW` and must not drop a path it is unsure about). `recursive = 0`. Offline paths **stay** (notes_004: do not delete what cannot currently be resolved). Stable `id = new_id()`; persist a map path→id in the transaction so playlists and tags join.
+6. **Images, first pass (cheap).** For each *online* source, `list_images` as today (non-recursive). Insert `images` rows with `abs_path`, `relative_path`, `file_size`/`mtime_ns` from `stat`, dimensions left NULL (filled lazily on preview). Do not decode pixels. Offline sources: insert no image rows yet; they appear on the first successful scan.
+7. **Favourites / hidden.** Match by `abs_path` (normalised with `os.path.normcase` on Windows). Unmatched paths (file vanished) land in `history`-style leftover table? No — write them to a `migration_orphans.json` report and skip. They are not deleted from the backup.
+8. **Tags.** Flatten `tags: {path: [str]}` into `tags` + `image_tags`. Empty names already stripped by `_validate_config`. Paths with tags but no image row (offline) create a stub image row with `width NULL` so the tag is not lost; the next scan fills identity.
+9. **Playlists / collections.** Reuse existing 12-hex ids. Collections: `tags_any` → `collection_tags` + `match_mode='any'`.
+10. **Current selection.** `playback_source` and `current_image` go to settings JSON and, if a primary display fingerprint is already known from a v2.0 assignment file, to `display_assignments`. If v2.1 is installed onto a v1.5 tree that never ran v2.0, create a single assignment `"all"` with that source.
+11. **History.** If `playback_state.json` (v1.6) exists, ingest its ring into `history`.
+12. **Atomic publish.** `PRAGMA wal_checkpoint(TRUNCATE);` close; `os.replace(desktop_vista.db.tmp, desktop_vista.db)`. Then rewrite `config.json` (unique temp sibling + `os.replace`, as `save_config` already does) with the settings-only document, `schema_version: 3`, and without `folders`/`favourites`/`hidden`/`tags`/`playlists`/`collections` arrays. Those keys remaining in the backup is the downgrade path.
+13. **Verify.** Re-open DB, `SELECT COUNT(*)` images/sources ≥ expected online counts, foreign keys `PRAGMA foreign_key_check`. On any failure: delete the new DB, leave `config.json` untouched (the replace in step 12 has not happened yet if verification is before it — **verification is step 12a, replace JSON is 12b**). Report in the UI: "Catalogue migration failed; running on JSON. See log."
+
+**Downgrade.** Restoring `config.json.bak-v1.5` over `config.json` and renaming the DB aside returns a v1.5.1-readable tree. The v2.1 app must refuse to write v1 JSON over a v3 file without that explicit export.
+
+**Portable vs installed.** Frozen builds currently keep `config.json` beside the exe (`APP_DIR = Path(sys.executable).parent`). That is portable-by-accident and breaks if the exe lives under `C:\Program Files`. v2.1 is the moment to introduce `%LOCALAPPDATA%\DesktopVista\` as the default writable root **with a one-time copy of the sibling config.json**, and a `portable.flag` file next to the exe to keep the old behaviour. Do not mix this location move with the schema migration in the same unrecoverable step: first copy, then migrate the copy.
+
+---
+
+## 4. Hardware & Operating System Edge-Case Analysis
+
+These are the cases that unit tests on a single-display development machine will not catch. v1.5.1 already documented the one-display verification limit; v2.0's exit criteria exist because of this section.
+
+### 4.1 Multi-GPU and driver switches
+
+Hybrid laptops (Intel iGPU + NVIDIA dGPU) re-enumerate displays when a dock engages the dGPU. COM device-path instance tails change; GDI ordinals shuffle; RECTs may keep relative layout. Fingerprint scoring (2.1.4) is the mitigation. Additional rules:
+
+- Re-create the `ComWallpaperBackend` STA object on a GPU switch. A COM pointer created against the previous adapter can return `RPC_E_SERVERFAULT` or stale monitor lists. `close()` + lazy reconstruct, same as today's lazy `_get_com_backend`.
+- Do not cache `IDesktopWallpaper` across `WM_DISPLAYCHANGE`. Today's backend already `CreateObject`s per call — keep that until a profiled reason appears; it is the safer default.
+- Duplicate-display mode (Win+P "Duplicate") yields one RECT covering two panels. Treat it as one assignment. Independent wallpapers are impossible; the UI must say so.
+
+### 4.2 Mixed-DPI scaling
+
+Virtual-desktop RECTs from `GetMonitorRECT` / `GetMonitorInfoW` are in **pixels**, but Tk widgets are in **logical** units (`dpi / 96`). `compute_topology_layout` is currently correct in pixel space and then drawn into a 260×80 Tk `Canvas` that does not query DPI. Consequences:
+
+- A 4K 150 % display next to a 1080p 100 % display will look right in the strip *if* we keep using pixel RECTs (Windows already scaled those RECTs into the virtual desktop). Do not further multiply by DPI.
+- Span *slicing* must also use those pixel RECTs. Converting millimetre bezels uses each monitor's `LOGPIXELSX` from `GetDeviceCaps` on that monitor's DC, not the primary's DPI.
+- Preview crop simulation for a 200 % display must decode to physical pixels (`width * scale_factor`), capped, or the crop preview lies. Notes_004 already required this; it becomes user-visible once per-monitor crop preview ships.
+- Pillow transcode cache keys must include the target pixel box, or a 100 % preview will be upscaled onto a 200 % apply path.
+
+### 4.3 HDR and colour
+
+`IDesktopWallpaper` and `SystemParametersInfoW` both push an 8-bit JPEG/BMP/PNG through the desktop compositor. HDR10 displays tone-map that SDR image. Desktop Vista cannot author true HDR wallpapers through this API.
+
+Rules:
+
+- Do not transcode to a wider gamut. JPEG quality 95, sRGB, remains the WebP fallback.
+- Do not set `UseAdvancedColor` / HDR wallpaper registry keys — undocumented for this API surface, easy to leave a machine in a bad state.
+- Status may show "HDR display: wallpaper is SDR (Windows will tone-map)" when `DXGI_OUTPUT_DESC1.ColorSpace` indicates HDR, as an informational badge only.
+- Advanced Colour / Auto HDR in games is a fullscreen suppression concern (already paused) not a wallpaper-apply concern.
+
+### 4.4 Sleep, hibernate, and session resume
+
+| Event | What breaks today | v1.6 / v2.0 contract |
+| :--- | :--- | :--- |
+| S3 sleep, 2 hours, interval 15 min | Tk `after(900000)` may fire immediately on resume or not at all | 1 Hz scheduler + monotonic due times; at most one missed apply per controller |
+| Hibernate (S4) | Process may have been snapped; COM pointer dead | On `PBT_APMRESUMEAUTOMATIC`, drop COM backend, refresh topology, recompute solar/daily, do not catch-up-storm |
+| Fast Startup (hybrid boot) | Looks like resume, not a cold start; Run key may not re-fire | Primary instance is the resume path; mutex still held if the process survived; if not, `--minimized` starts clean |
+| Session unlock | Wallpaper sometimes reset by Explorer | Re-apply last successful per assignment, once, debounce 2 s |
+| Explorer crash/restart | COM object gone; desktop host recreated | Same as GPU switch: reconstruct backend, re-apply last |
+| RDP connect / disconnect | Topology collapses to the RDP display or expands | Orphan the physical fingerprints, assign the RDP display independently; on disconnect, reconcile as a dock event |
+| Win+L lock | Slideshow can keep running (and waste GPU on an unseen desktop) | Optional pause-on-lock via `WTSQuerySessionInformation(WTSSessionInfoEx)` or `SHQueryUserNotificationState` if it reports locked; default **on** for battery, **off** on AC |
+
+`WM_POWERBROADCAST` must be seen by the same subclassed WndProc that handles `WM_HOTKEY` and `WM_DISPLAYCHANGE`. One subclass, three messages. Restore the previous WndProc on shutdown (the hotkey manager already must).
+
+### 4.5 Portrait, negative coordinates, and non-origin primaries
+
+`compute_topology_layout` already handles negative virtual-desktop origins (primary not top-left). Span slicing must use the same union-min translation. Additional cases:
+
+- A portrait display whose RECT is `(0,-2160,1920,0)` above a landscape primary: relative_slot `"above"`. Fingerprint relative_slot must use the same vocabulary as reconciliation.
+- Taskbar on a portrait display changes `rcWork` but not `rcMonitor`. Wallpaper applies to `rcMonitor`. Never slice against `rcWork`.
+- Display Scaling can make `GetMonitorInfo` RECTs not equal the EDID native pixels (e.g. 3840×2160 at 150 % still reports 3840×2160 in `rcMonitor` on current Windows — verify per build; if a future Windows reports logical sizes here, prefer `DEVMODE.dmPelsWidth` from `EnumDisplaySettings`).
+
+### 4.6 Fullscreen, exclusive GPU, and UIPI
+
+`SHQueryUserNotificationState` remains session-wide. A 4K game on monitor 1 will pause the portrait-art slideshow on monitor 2 in v2.0. That is accepted. A Future per-monitor detector (`GetForegroundWindow` + `GetWindowRect` ∩ monitor RECT, excluding Progman / WorkerW / Desktop Vista itself) can be prototyped behind a flag; borderless-windowed games that do not cover 100 % will false-negative, exclusive fullscreen will false-positive the session API instead. Do not combine both as AND (would never pause) or OR (would always pause). Prototype, measure, then decide.
+
+Hotkeys during exclusive fullscreen: expect failure, keep the tray.
+
+### 4.7 NAS, removable drives, and file locks
+
+Unchanged from notes_004 Track A, now interacting with N controllers:
+
+- At most one outstanding probe per source, not per controller.
+- A vanished file mid-slideshow skips, bounded search (today's silent `_set_wallpaper`). All controllers sharing that source see the same skip.
+- WebP transcode cache is global (keyed by path+mtime+size). Two controllers applying the same WebP concurrently must not race the JPEG write — `ensure_wallpaper_path` needs an in-process lock per output name in v1.6 (today a two-instance race was fixed with unique temp *config* files; the transcode path is still a fixed output name).
+
+### 4.8 Frozen-build and packing constraints
+
+| Item | Rule |
+| :--- | :--- |
+| New native deps | Forbidden unless measured against the 19.5 MB budget |
+| `sqlite3` | stdlib; confirm PyInstaller collects `sqlite3.dll` in `--selftest` |
+| `comtypes` | already optional; v2.0 may promote it to required if COM becomes default, with SPI still compiled in |
+| `winsdk` / `winrt` | lock-screen spike only; extra install, never a hard import |
+| ONNX runtime | Future, optional extra |
+| `APP_DIR` vs `_MEIPASS` | writable DB/cache/config beside the real exe (or AppData); never inside `_MEIPASS` |
+| `--selftest` | extend with mutex create/release, pipe ping, sqlite pragma, solar of a known lat/lon/date |
+
+---
+
+## 5. Implementation Roadmap & Phased Execution Plan
+
+Version numbers are release names, not calendar dates. Each milestone is independently shippable. Estimates assume one developer familiar with this tree, not a commitment.
+
+### v1.6 — "Scriptable companion" · last single-pipeline release · ~2 weeks
+
+The collection-restore defect plus every feature that does not need a second monitor to be *true*.
+
+| # | Item | Exit criteria |
+| :---: | :--- | :--- |
+| 1 | Accept `playback_source.kind == "collection"` in `_validate_config` and `_resolve_initial_source` | Select a collection, restart, same collection and image restored. Add a unit test next to the playlist restore cases. |
+| 2 | `playback_state.json` history ring (100) + Undo | Tray Previous walks applied history; Undo reapplies previous; survives restart. Preview-only Left/Right does not pollute the ring. |
+| 3 | 1 Hz scheduler replaces `after(seconds*1000)` | Sleep 10 minutes with a 5-minute interval applies once on resume, not a burst. Daily mode still DST-safe. Tk delay stays ≤ 1000 ms. |
+| 4 | Solar mode wired | With lat/lon set and `#dusk` tags present, a clock-stubbed tick at 19:00 selects a dusk-tagged image. With no such tags, unfiltered play and an honest status line. Polar fixture uses fallback times. |
+| 5 | `CreateMutexW` single-instance | Second launch with no argv exits 0 after pinging the first. Two `--minimized` logon starts cannot both apply. |
+| 6 | Named-pipe IPC + CLI | `DesktopVista.exe --status` from a second process prints JSON of the running instance. `--next` applies. A non-owner user cannot connect (or the token-socket escape hatch is documented and tested). |
+| 7 | Global hotkeys | Win+Alt+N applies next while the window is hidden. Conflict on bind is shown, not retried. Unregister on exit. Fullscreen miss is documented, not treated as a defect. |
+| 8 | Preview LRU + off-thread folder enum (notes_004 leftover) | 500 rapid navigations stay within the byte budget; a dead NAS add-folder does not freeze the sidebar. |
+
+**v1.6 non-goals:** per-monitor playback, SQLite, weather, accent, lock screen, feeds.
+
+**Gate to v2.0:** v1.6 ships only after the 96 existing tests plus new tests for (1)(2)(4) remain green, and `--selftest` on a frozen build reports mutex+pipe+solar fixtures.
+
+### v2.0 — "One Perfect View" · display rewrite · ~3 weeks + a hardware session
+
+| # | Item | Exit criteria |
+| :---: | :--- | :--- |
+| 1 | `PlaybackController` per fingerprint; ApplyQueue; COM default *after* independence is confirmed | Two physical displays show two different images from two sources, simultaneously, for 30+ minutes of slideshow, neither leaking onto the other. **This is the milestone.** If the hardware session fails, COM stays opt-in and v2.0 does not ship. |
+| 2 | Display fingerprint + dock/undock | Laptop + dock: undock → internal assignment remains; redock → external recovers its own source without a prompt when score ≥ 0.8; ambiguous case prompts. GPU switch reconstructs COM. |
+| 3 | `WM_DISPLAYCHANGE` + resume re-apply | Unplug a monitor mid-slideshow: that controller orphans, the other continues. Explorer restart: last images return within 2 s debounce. |
+| 4 | Span-group slicer + optional bezel | A 7680×2160 image across two 1920×1080 panels is pre-sliced; native Span is a separate, labelled choice. Mixed-DPI and portrait-in-group visually inspected, not just unit-tested. Partial COM failure reports which panel failed. |
+| 5 | Per-monitor crop preview | Selecting the portrait card previews that ratio. Fit style still labelled global. |
+| 6 | Assignments persisted | Restart restores per-display sources, indices, shuffle decks, intent. SPI remains compiled in and selectable. |
+
+**Hardware lab (blocking):** ≥2 displays, mixed DPI if available, one portrait if available, one dock/undock laptop if this is still Mark's machine class. Record the session in `VERIFICATION.md`. Without that record, do not flip `wallpaper_target` default to `"com"`.
+
+**v2.0 non-goals:** SQLite, weather, accent, lock screen, feeds, ONNX.
+
+### v2.1 — "Ambient intelligence" · catalogue + sensors · ~3 weeks
+
+| # | Item | Exit criteria |
+| :---: | :--- | :--- |
+| 1 | SQLite catalogue + v1.5 JSON migration | A 1.5 config with two drives, tags, a playlist, a collection, favourites and hidden migrates; backup preserved; restart lists the same images; killing the app mid-migration leaves JSON intact. A 10k-image fixture filters a boolean collection in < 50 ms. |
+| 2 | Weather bias (Open-Meteo) | Forced `weather_code=61` with `#rain` tags present draws rain; with none, unfiltered. Airplane mode uses cache. |
+| 3 | Accent sync opt-in | Enable, apply a strongly-coloured image, confirm DWM colour changes *or* honestly report that Win11 ignored it. Disable restores the previous accent. |
+| 4 | Lock-screen spike | A written go/no-go in notes (or VERIFICATION.md) from the frozen unpackaged host. Ship the command only on go. |
+| 5 | Entropy focal crop + resolution down-rank + dhash duplicates + EXIF panel | Portrait assignment of a 16:9 face-heavy image keeps the face. Duplicates view never deletes. GPS "Show on Map" opens OSM. |
+| 6 | Bing Daily feed + 2 GB / 30-file quota | One fetch, appears as a source, offline plays the cache, purge skips favourites. |
+| 7 | Battery throttle option | On battery, not Battery Saver: interval × N (default 2), user-configurable. Battery Saver still pauses. |
+
+### Future (unscheduled)
+
+- ONNX saliency writing the same `saliency_x/y` columns.
+- Unsplash / Wallhaven with a user key.
+- Per-monitor fullscreen detection, if a prototype beats the session-wide API on real games.
+- Desktop crossfade: remains a research gate. No undocumented WorkerW renderer in core.
+
+### Sequencing graph
+
+```mermaid
+flowchart LR
+    v151[v1.5.1 shipped] --> v16[v1.6 scriptable companion]
+    v16 --> v20[v2.0 multi-monitor rewrite]
+    v20 -->|hardware gate pass| v21[v2.1 catalogue and ambient]
+    v20 -->|hardware gate fail| v20b[keep COM opt-in; retry]
+    v21 --> fut[Future feeds / ONNX / crossfade]
+```
+
+v1.6 does not wait for a second monitor. v2.1 does not start until v2.0's assignment model exists, because the catalogue's `display_assignments` table would otherwise encode a fiction.
+
+### Test additions the plan owes
+
+Pure (no Tk, no Windows): controller state machine; shuffle cycle at 5k members; history undo; solar fixtures including polar and DST; span slice arithmetic including negative origins and bezels; fingerprint scoring; boolean tag parser; migration of a synthetic v1.5 document; quota purge.
+
+Windows integration (disposable profile, never Mark's real wallpaper without restore — MEMORY.md already records this hazard): mutex/pipe; hotkey register/unregister; COM two-display independence; dock/undock; sleep/resume; Explorer restart; mixed DPI; frozen `--selftest`.
+
+---
+
+## 6. Review completion record
+
+Inspected for this pack: `desktop_vista.py` v1.5.1 (DEFAULT_CONFIG, `_validate_config`, `resolve_source_images`, slideshow/pause, COM apply path, monitor enumeration, solar model), `windows_wallpaper_com.py` (STA, `SetPosition` global, device-path volatility), `config.example.json`, `ROADMAP.md`, `MEMORY.md`, `notes/notes_001.txt`–`notes_004.txt`, `requirements.txt`, `test_desktop_vista.py` (structure), `AGENT_1_FEATURE_INNOVATION.md`.
+
+As-built defects recorded, not fixed (this is a notes pack):
+
+* Collection `playback_source` dropped on load (`_validate_config` kind whitelist; `_resolve_initial_source` has no collection branch).
+* COM picker labels by enumeration order, not fingerprint.
+* WebP transcode output path is still a fixed name per source key — safe under one instance, racy under two; mutex in v1.6 removes the second instance.
+
+No application code, configuration, wallpaper, or registry was changed while producing this document. Proposed Python parses as design material; it is not integrated and not executed against the live desktop.
+
+**Recommended next implementation session:** v1.6 item 1 (collection restore) through item 7 (hotkeys), in that order — each is user-visible on the current single-display machine, and items 5–6 make the tray daemon scriptable before the v2.0 hardware gate.

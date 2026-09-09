@@ -147,6 +147,15 @@ def test_load_config_valid_values_kept(tmp_path):
             "fallback_times": ["06:00", "08:00", "18:00", "21:00"],
         },
         "wallpaper_target": "spi",
+        "hotkeys": {
+            "enabled": True,
+            "next": "Win+Alt+N",
+            "prev": "Win+Alt+P",
+            "favourite": "Win+Alt+L",
+            "hide": "Win+Alt+H",
+            "undo": "Win+Alt+Z",
+            "toggle": "Win+Alt+S",
+        },
     }
 
 
@@ -313,6 +322,43 @@ def test_save_config_tmp_cleaned_on_success(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# playback history ring (v1.6)
+# ---------------------------------------------------------------------------
+
+def test_load_history_missing_file_returns_empty(tmp_path):
+    assert dv.load_history(tmp_path / "playback_state.json") == []
+
+
+def test_save_history_atomic_roundtrip(tmp_path):
+    state_path = tmp_path / "playback_state.json"
+    dv.save_history(["C:\\A\\1.jpg", "C:\\A\\2.jpg"], state_path)
+    assert state_path.is_file()
+    assert not list(tmp_path.glob("*.tmp"))
+    assert dv.load_history(state_path) == ["C:\\A\\1.jpg", "C:\\A\\2.jpg"]
+
+
+def test_load_history_truncates_to_max(tmp_path):
+    state_path = tmp_path / "playback_state.json"
+    entries = [f"C:\\A\\{i}.jpg" for i in range(dv.HISTORY_MAX + 20)]
+    state_path.write_text(json.dumps({"history": entries}), encoding="utf-8")
+    loaded = dv.load_history(state_path)
+    assert len(loaded) == dv.HISTORY_MAX
+    assert loaded == entries[-dv.HISTORY_MAX:]
+
+
+def test_load_history_malformed_file_returns_empty(tmp_path):
+    state_path = tmp_path / "playback_state.json"
+    state_path.write_text("not json", encoding="utf-8")
+    assert dv.load_history(state_path) == []
+
+    state_path.write_text(json.dumps({"history": "not-a-list"}), encoding="utf-8")
+    assert dv.load_history(state_path) == []
+
+    state_path.write_text(json.dumps({"history": [1, 2, 3]}), encoding="utf-8")
+    assert dv.load_history(state_path) == []
+
+
+# ---------------------------------------------------------------------------
 # list_images
 # ---------------------------------------------------------------------------
 
@@ -361,6 +407,30 @@ def test_folder_display_label_online_unchanged(tmp_path):
 def test_folder_display_label_offline_badged(tmp_path):
     folder = str(tmp_path / "gone")
     assert dv.folder_display_label(folder) == folder + dv.OFFLINE_SUFFIX
+
+
+def test_folder_display_label_uses_online_cache_not_filesystem(tmp_path):
+    """v1.6: a recurring probe (the reconnect poll) must never fall back to
+    a live filesystem check — an unreachable NAS path would block the Tk
+    thread for the OS network timeout. A real (online) folder, if the cache
+    says otherwise, must show as offline; an unknown folder defaults to
+    online rather than pessimistically badging everything before the first
+    probe completes."""
+    real_folder = str(tmp_path)
+    assert dv.folder_display_label(real_folder, {real_folder: False}) == (
+        real_folder + dv.OFFLINE_SUFFIX
+    )
+    assert dv.folder_display_label(real_folder, {}) == real_folder
+    assert dv.folder_display_label("D:\\Unknown", {}) == "D:\\Unknown"
+
+
+def test_playlist_folder_status_uses_online_cache():
+    playlist = {"folders": ["A", "B", "C"]}
+    online, total = dv.playlist_folder_status(playlist, {"A": True, "B": False, "C": True})
+    assert (online, total) == (2, 3)
+    # Unlisted folders default to online, same as folder_display_label.
+    online, total = dv.playlist_folder_status(playlist, {"A": False})
+    assert (online, total) == (2, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +531,34 @@ def test_load_config_playback_source_playlist_reference(tmp_path):
     assert cfg["playback_source"] == {"kind": "playlist", "id": "p1"}
 
 
+def test_load_config_playback_source_collection_reference(tmp_path):
+    """v1.6 regression: a saved collection playback_source must survive a
+    reload rather than being dropped by a kind-whitelist that only knew
+    about folders and playlists (notes_005 §0 defect #4)."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "collections": [{"id": "c1", "name": "Dusk", "tags_any": ["dusk"]}],
+                "playback_source": {"kind": "collection", "id": "c1"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["playback_source"] == {"kind": "collection", "id": "c1"}
+
+
+def test_load_config_playback_source_dangling_collection_falls_back(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"collections": [], "playback_source": {"kind": "collection", "id": "gone"}}),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["playback_source"] is None
+
+
 def test_resolve_source_images_playlist_unions_folders(tmp_path):
     f1, f2 = tmp_path / "f1", tmp_path / "f2"
     f1.mkdir()
@@ -555,6 +653,53 @@ def test_load_config_schedule_invalid_mode_falls_back(tmp_path):
     cfg_path.write_text(json.dumps({"schedule": {"mode": "lunar"}}), encoding="utf-8")
     cfg = dv.load_config(cfg_path)
     assert cfg["schedule"]["mode"] == "interval"
+
+
+def test_load_config_schedule_solar_mode_kept(tmp_path):
+    """v1.6: 'solar' is now a valid schedule.mode alongside interval/daily —
+    see notes_005 §2.2.1 and _solar_advance/_compute_next_due."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"schedule": {"mode": "solar"}}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["schedule"]["mode"] == "solar"
+
+
+def test_load_config_hotkeys_defaults_when_missing(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["hotkeys"] == dv.DEFAULT_CONFIG["hotkeys"]
+
+
+def test_load_config_hotkeys_per_binding_fallback(tmp_path):
+    """An individual malformed binding falls back to just that action's
+    default, not the whole hotkeys block — matches the pattern used for
+    tray flags and power settings."""
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "hotkeys": {
+                    "enabled": False,
+                    "next": "N",  # no modifier — invalid, must fall back
+                    "prev": "Ctrl+Alt+P",  # valid, non-default — must be kept
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["hotkeys"]["enabled"] is False
+    assert cfg["hotkeys"]["next"] == "Win+Alt+N"
+    assert cfg["hotkeys"]["prev"] == "Ctrl+Alt+P"
+    assert cfg["hotkeys"]["undo"] == "Win+Alt+Z"
+
+
+def test_load_config_hotkeys_invalid_block_falls_back(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"hotkeys": "not-a-dict"}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["hotkeys"] == dv.DEFAULT_CONFIG["hotkeys"]
 
 
 def test_is_valid_time_string():
