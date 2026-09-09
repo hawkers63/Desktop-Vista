@@ -35,9 +35,12 @@ New in v1.2 (in progress):
     - Tray menu: current image, Next/Previous, Pause/Resume slideshow,
       Reveal in Explorer, Open Desktop Vista, Exit
     - --minimized launch flag + "Start with Windows" Run-key toggle
+    - Custom slideshow interval in seconds ("Custom…" + a prompt)
+    - Offline-aware folders: "(offline)" badge in the folder dropdown,
+      unattended slideshow skips missing files instead of popping a
+      blocking error dialog
 
-Still to come in v1.2: custom interval in seconds, offline-aware folder
-badges, branded tray icon.
+Still to come in v1.2: branded tray icon.
 Planned for v2: multi-monitor (IDesktopWallpaper COM).
 """
 
@@ -74,7 +77,7 @@ except ImportError:
 
 import customtkinter as ctk
 from PIL import Image, ImageDraw, ImageOps
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -117,6 +120,11 @@ SLIDESHOW_INTERVALS = {
     "6 hours": 21600,
     "1 day": 86400,
 }
+CUSTOM_INTERVAL_LABEL = "Custom…"
+MIN_CUSTOM_INTERVAL_SECONDS = 5
+MAX_CUSTOM_INTERVAL_SECONDS = 86400
+
+OFFLINE_SUFFIX = "  (offline)"
 
 PREVIEW_W, PREVIEW_H = 800, 450  # 16:9 default; recalculated dynamically
 SAVE_DEBOUNCE_MS = 600
@@ -129,6 +137,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "style": "Fill",
     "interval": "15 minutes",
     "shuffle": False,
+    "interval_custom_seconds": None,
     "tray": {"enabled": True, "close_to_tray": True, "run_at_startup": False},
 }
 
@@ -162,6 +171,32 @@ def list_images(folder: str) -> list[str]:
         return []
 
 
+def is_folder_online(folder: str) -> bool:
+    """Return True if *folder* currently exists and is a readable directory."""
+    try:
+        return Path(folder).is_dir()
+    except OSError:
+        return False
+
+
+def folder_display_label(folder: str) -> str:
+    """Decorate *folder* with an offline badge when its drive is unreachable."""
+    return folder if is_folder_online(folder) else f"{folder}{OFFLINE_SUFFIX}"
+
+
+def resolve_interval_seconds(interval_key: str, custom_seconds: Any) -> int:
+    """Resolve a slideshow interval selection (label or custom) to seconds."""
+    if interval_key == CUSTOM_INTERVAL_LABEL:
+        if (
+            isinstance(custom_seconds, (int, float))
+            and not isinstance(custom_seconds, bool)
+            and custom_seconds > 0
+        ):
+            return max(MIN_CUSTOM_INTERVAL_SECONDS, int(custom_seconds))
+        return SLIDESHOW_INTERVALS["15 minutes"]
+    return SLIDESHOW_INTERVALS.get(interval_key, SLIDESHOW_INTERVALS["15 minutes"])
+
+
 def _validate_config(raw: dict) -> dict[str, Any]:
     """Coerce *raw* into a valid config dict, filling defaults where needed."""
     cfg = dict(DEFAULT_CONFIG)
@@ -191,10 +226,25 @@ def _validate_config(raw: dict) -> dict[str, Any]:
         log.warning("Invalid 'style' in config; using default.")
 
     interval = raw.get("interval", DEFAULT_CONFIG["interval"])
-    if isinstance(interval, str) and interval in SLIDESHOW_INTERVALS:
+    if isinstance(interval, str) and (
+        interval in SLIDESHOW_INTERVALS or interval == CUSTOM_INTERVAL_LABEL
+    ):
         cfg["interval"] = interval
     else:
         log.warning("Invalid 'interval' in config; using default.")
+
+    custom_seconds = raw.get("interval_custom_seconds", DEFAULT_CONFIG["interval_custom_seconds"])
+    if custom_seconds is None:
+        cfg["interval_custom_seconds"] = None
+    elif (
+        isinstance(custom_seconds, (int, float))
+        and not isinstance(custom_seconds, bool)
+        and custom_seconds > 0
+    ):
+        cfg["interval_custom_seconds"] = int(custom_seconds)
+    else:
+        log.warning("Invalid 'interval_custom_seconds' in config; using default.")
+        cfg["interval_custom_seconds"] = None
 
     shuffle = raw.get("shuffle", DEFAULT_CONFIG["shuffle"])
     if isinstance(shuffle, bool):
@@ -457,6 +507,7 @@ class DesktopVista(ctk.CTk):
         self.cfg = load_config()
         self.images: list[str] = []
         self.index: int = -1
+        self._folder_label_to_path: dict[str, str] = {}
         self._preview_ref = None  # keep CTkImage alive
         self._slideshow_job: Any = None
         self._save_job: Any = None
@@ -532,7 +583,8 @@ class DesktopVista(ctk.CTk):
         ctk.CTkLabel(side, text="SLIDESHOW", font=ctk.CTkFont(size=11, weight="bold"),
                      text_color="gray60").grid(row=8, column=0, padx=16, pady=(24, 0), sticky="w")
         self.interval_var = ctk.StringVar(value=self.cfg["interval"])
-        ctk.CTkOptionMenu(side, variable=self.interval_var, values=list(SLIDESHOW_INTERVALS),
+        ctk.CTkOptionMenu(side, variable=self.interval_var,
+                          values=list(SLIDESHOW_INTERVALS) + [CUSTOM_INTERVAL_LABEL],
                           command=self._on_interval_changed).grid(
             row=9, column=0, padx=16, pady=(4, 6), sticky="ew")
         self.shuffle_var = ctk.BooleanVar(value=self.cfg["shuffle"])
@@ -656,12 +708,18 @@ class DesktopVista(ctk.CTk):
     # ---------------- Folders ----------------
 
     def _refresh_folder_menu(self) -> None:
+        """Rebuild the folder dropdown, badging any currently-offline folders."""
         folders = self.cfg["folders"]
         if folders:
-            self.folder_menu.configure(values=folders)
-            if self.folder_var.get() not in folders:
-                self.folder_var.set(folders[0])
+            labels = [folder_display_label(f) for f in folders]
+            self._folder_label_to_path = dict(zip(labels, folders))
+            self.folder_menu.configure(values=labels)
+            current = self.cfg.get("current_folder")
+            if current not in folders:
+                current = folders[0]
+            self.folder_var.set(folder_display_label(current))
         else:
+            self._folder_label_to_path = {}
             self.folder_menu.configure(values=["(no folders yet)"])
             self.folder_var.set("(no folders yet)")
 
@@ -672,12 +730,11 @@ class DesktopVista(ctk.CTk):
         chosen = os.path.normpath(chosen)
         if chosen not in self.cfg["folders"]:
             self.cfg["folders"].append(chosen)
-        self.folder_var.set(chosen)
-        self._refresh_folder_menu()
         self._load_folder(chosen)
 
     def _remove_folder(self) -> None:
-        folder = self.folder_var.get()
+        label = self.folder_var.get()
+        folder = self._folder_label_to_path.get(label, label)
         if folder not in self.cfg["folders"]:
             return
         if not messagebox.askyesno(
@@ -687,7 +744,6 @@ class DesktopVista(ctk.CTk):
             return
         self._stop_slideshow()
         self.cfg["folders"].remove(folder)
-        self._refresh_folder_menu()
         if self.cfg["folders"]:
             self._load_folder(self.cfg["folders"][0])
         else:
@@ -695,18 +751,20 @@ class DesktopVista(ctk.CTk):
             self._shuffle_order = []
             self.cfg["current_folder"] = None
             self.cfg["current_image"] = None
+            self._refresh_folder_menu()
             self.preview.configure(image=None, text="Add a folder to begin")
             self.meta.configure(text="")
             self._flush_save()
 
-    def _on_folder_selected(self, folder: str) -> None:
-        if folder in self.cfg["folders"]:
+    def _on_folder_selected(self, label: str) -> None:
+        folder = self._folder_label_to_path.get(label)
+        if folder and folder in self.cfg["folders"]:
             self._load_folder(folder)
 
     def _load_folder(self, folder: str, show: bool = True) -> None:
         self._flush_save()  # persist previous folder/image before switching
         self.cfg["current_folder"] = folder
-        self.folder_var.set(folder)
+        self._refresh_folder_menu()
         self.images = list_images(folder)
         self._shuffle_order = []
         if not self.images:
@@ -714,14 +772,9 @@ class DesktopVista(ctk.CTk):
             if show:
                 self.preview.configure(image=None, text="No images found in this folder")
                 self.meta.configure(text="")
-            # Distinguish empty vs unreadable: if path missing/unreadable, list_images
-            # already returned []. Surface a clear status either way.
-            try:
-                readable = Path(folder).is_dir()
-            except OSError:
-                readable = False
-            if not readable:
-                self._set_status("Folder is empty or unreadable.")
+            # Distinguish empty vs offline (drive gone) for a clearer status.
+            if not is_folder_online(folder):
+                self._set_status("Folder is offline (drive disconnected?).")
             else:
                 self._set_status("No images found in this folder.")
             self._flush_save()
@@ -794,6 +847,7 @@ class DesktopVista(ctk.CTk):
             return
         self.preview.configure(image=None, text=f"Cannot open image\n{Path(path).name}")
         self.meta.configure(text=str(exc))
+        self._refresh_folder_menu()  # a missing file often means a drive went offline
 
     def _on_preview_ready(
         self,
@@ -879,7 +933,7 @@ class DesktopVista(ctk.CTk):
         self._shuffle_order = []
         self._save()
 
-    def _set_wallpaper(self) -> None:
+    def _set_wallpaper(self, silent: bool = False) -> None:
         if not (0 <= self.index < len(self.images)):
             self._set_status("Nothing selected.")
             return
@@ -888,11 +942,40 @@ class DesktopVista(ctk.CTk):
             set_windows_wallpaper(path, self.style_var.get())
             self._set_status(f"Wallpaper set: {Path(path).name}")
         except Exception as exc:
-            messagebox.showerror(APP_NAME, f"Could not set wallpaper:\n{exc}")
+            if silent:
+                # Unattended slideshow: never block on a modal dialog — most
+                # often this just means a drive went offline mid-run.
+                log.warning("Slideshow could not set wallpaper for %s: %s", path, exc)
+                self._set_status(f"Skipped (unavailable): {Path(path).name}")
+                self._refresh_folder_menu()
+            else:
+                messagebox.showerror(APP_NAME, f"Could not set wallpaper:\n{exc}")
 
     # ---------------- Slideshow ----------------
 
-    def _on_interval_changed(self, _value: str) -> None:
+    def _interval_display_text(self) -> str:
+        key = self.interval_var.get()
+        if key == CUSTOM_INTERVAL_LABEL:
+            seconds = resolve_interval_seconds(key, self.cfg.get("interval_custom_seconds"))
+            return f"{seconds}s (custom)"
+        return key
+
+    def _on_interval_changed(self, value: str) -> None:
+        if value == CUSTOM_INTERVAL_LABEL:
+            current = self.cfg.get("interval_custom_seconds") or 60
+            seconds = simpledialog.askinteger(
+                APP_NAME,
+                "Custom slideshow interval, in seconds:",
+                initialvalue=current,
+                minvalue=MIN_CUSTOM_INTERVAL_SECONDS,
+                maxvalue=MAX_CUSTOM_INTERVAL_SECONDS,
+                parent=self,
+            )
+            if seconds is None:
+                # Cancelled — revert the dropdown to whatever was selected before.
+                self.interval_var.set(self.cfg.get("interval", DEFAULT_CONFIG["interval"]))
+                return
+            self.cfg["interval_custom_seconds"] = seconds
         self._flush_save()
         if self._slideshow_job is not None:
             self._stop_slideshow(update_status=False)
@@ -909,16 +992,17 @@ class DesktopVista(ctk.CTk):
             self._set_status("Add a folder with images first.")
             return
         self.slide_btn.configure(text="Stop Slideshow", fg_color="#b71c1c", hover_color="#951616")
-        self._set_status(f"Slideshow running — every {self.interval_var.get()}.")
-        self._set_wallpaper()
+        self._set_status(f"Slideshow running — every {self._interval_display_text()}.")
+        self._set_wallpaper(silent=True)
         self._schedule_next()
 
     def _schedule_next(self) -> None:
         if not self.images:
             self._stop_slideshow()
             return
-        interval_key = self.interval_var.get()
-        seconds = SLIDESHOW_INTERVALS.get(interval_key, 900)
+        seconds = resolve_interval_seconds(
+            self.interval_var.get(), self.cfg.get("interval_custom_seconds")
+        )
         self._slideshow_job = self.after(seconds * 1000, self._slideshow_tick)
 
     def _slideshow_tick(self) -> None:
@@ -932,7 +1016,7 @@ class DesktopVista(ctk.CTk):
         else:
             self.index = (self.index + 1) % len(self.images)
             self._show_current()
-        self._set_wallpaper()
+        self._set_wallpaper(silent=True)
         if self.images:
             self._schedule_next()
         else:

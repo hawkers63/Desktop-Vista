@@ -45,6 +45,7 @@ def test_load_config_missing_keys_filled(tmp_path):
     assert cfg["shuffle"] is False
     assert cfg["current_folder"] is None
     assert cfg["current_image"] is None
+    assert cfg["interval_custom_seconds"] is None
 
 
 def test_load_config_invalid_types_fall_back(tmp_path):
@@ -58,6 +59,7 @@ def test_load_config_invalid_types_fall_back(tmp_path):
                 "shuffle": "yes",
                 "current_folder": 99,
                 "current_image": [],
+                "interval_custom_seconds": "soon",
             }
         ),
         encoding="utf-8",
@@ -69,6 +71,18 @@ def test_load_config_invalid_types_fall_back(tmp_path):
     assert cfg["shuffle"] is False
     assert cfg["current_folder"] is None
     assert cfg["current_image"] is None
+    assert cfg["interval_custom_seconds"] is None
+
+
+def test_load_config_interval_custom_label_and_seconds_kept(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"interval": dv.CUSTOM_INTERVAL_LABEL, "interval_custom_seconds": 45}),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["interval"] == dv.CUSTOM_INTERVAL_LABEL
+    assert cfg["interval_custom_seconds"] == 45
 
 
 def test_load_config_valid_values_kept(tmp_path):
@@ -79,6 +93,7 @@ def test_load_config_valid_values_kept(tmp_path):
         "style": "Centre",
         "interval": "1 hour",
         "shuffle": True,
+        "interval_custom_seconds": None,
         "tray": {"enabled": False, "close_to_tray": False, "run_at_startup": True},
     }
     cfg_path = tmp_path / "config.json"
@@ -263,6 +278,58 @@ def test_list_images_unreadable_returns_empty(tmp_path, monkeypatch):
 
     monkeypatch.setattr(Path, "iterdir", boom)
     assert dv.list_images(str(tmp_path)) == []
+
+
+# ---------------------------------------------------------------------------
+# Offline-aware folders
+# ---------------------------------------------------------------------------
+
+def test_is_folder_online_true_for_existing_dir(tmp_path):
+    assert dv.is_folder_online(str(tmp_path)) is True
+
+
+def test_is_folder_online_false_for_missing_dir(tmp_path):
+    assert dv.is_folder_online(str(tmp_path / "nonexistent_xyz")) is False
+
+
+def test_folder_display_label_online_unchanged(tmp_path):
+    folder = str(tmp_path)
+    assert dv.folder_display_label(folder) == folder
+
+
+def test_folder_display_label_offline_badged(tmp_path):
+    folder = str(tmp_path / "gone")
+    assert dv.folder_display_label(folder) == folder + dv.OFFLINE_SUFFIX
+
+
+# ---------------------------------------------------------------------------
+# Custom slideshow interval resolution
+# ---------------------------------------------------------------------------
+
+def test_resolve_interval_seconds_known_label():
+    assert dv.resolve_interval_seconds("1 hour", None) == 3600
+
+
+def test_resolve_interval_seconds_unknown_label_falls_back():
+    assert dv.resolve_interval_seconds("bogus", None) == dv.SLIDESHOW_INTERVALS["15 minutes"]
+
+
+def test_resolve_interval_seconds_custom_valid():
+    assert dv.resolve_interval_seconds(dv.CUSTOM_INTERVAL_LABEL, 42) == 42
+
+
+def test_resolve_interval_seconds_custom_below_minimum_clamped():
+    assert dv.resolve_interval_seconds(dv.CUSTOM_INTERVAL_LABEL, 1) == dv.MIN_CUSTOM_INTERVAL_SECONDS
+
+
+def test_resolve_interval_seconds_custom_missing_falls_back():
+    assert dv.resolve_interval_seconds(dv.CUSTOM_INTERVAL_LABEL, None) == \
+        dv.SLIDESHOW_INTERVALS["15 minutes"]
+
+
+def test_resolve_interval_seconds_custom_invalid_type_falls_back():
+    assert dv.resolve_interval_seconds(dv.CUSTOM_INTERVAL_LABEL, "abc") == \
+        dv.SLIDESHOW_INTERVALS["15 minutes"]
 
 
 # ---------------------------------------------------------------------------

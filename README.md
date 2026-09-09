@@ -44,13 +44,14 @@ The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to previ
 
 - **Multi-drive folder management** — add or remove wallpaper directories from any drive
 - **Instantaneous 16:9 preview decoding** — Pillow decodes to preview size for a fast, light UI
-- **Custom slideshow intervals** — 1 minute through 1 day
+- **Custom slideshow intervals** — 1 minute through 1 day, or a "Custom…" interval in seconds
 - **Shuffle engine** — optional random order during slideshows
 - **Fit styles** — Fill, Fit, Stretch, Centre, Span (Windows wallpaper registry styles)
 - **Keyboard navigation** — browse and apply without reaching for the mouse
 - **Persistent preferences** — folders, style, interval, shuffle, and last image remembered in `config.json`
 - **System tray** — closing the window hides Desktop Vista to the tray instead of quitting; the tray menu shows the current image and offers Next / Previous, Pause / Resume slideshow, Reveal in Explorer, Open Desktop Vista, and Exit
 - **Start with Windows** — an optional Run-key entry launches Desktop Vista minimised to the tray at login (`--minimized` flag)
+- **Offline-aware folders** — folders on a disconnected drive show `(offline)` in the folder dropdown, and an unattended slideshow skips missing files instead of stopping on an error dialog
 
 ---
 
@@ -114,7 +115,8 @@ Settings are stored in `config.json` beside `desktop_vista.py`. Use [`config.exa
 | `current_folder` | `string \| null` | Folder currently selected in the UI |
 | `current_image` | `string \| null` | Last selected image path (restored on launch) |
 | `style` | `string` | Wallpaper fit style: `Fill`, `Fit`, `Stretch`, `Centre`, or `Span` |
-| `interval` | `string` | Slideshow interval label, e.g. `"15 minutes"` (see app for full list) |
+| `interval` | `string` | Slideshow interval label, e.g. `"15 minutes"`, or `"Custom…"` (see app for full list) |
+| `interval_custom_seconds` | `number \| null` | Seconds used when `interval` is `"Custom…"` |
 | `shuffle` | `boolean` | When `true`, slideshow picks images at random |
 | `tray.enabled` | `boolean` | Start the system tray icon (default `true`) |
 | `tray.close_to_tray` | `boolean` | Closing the window hides to tray instead of quitting (default `true`) |
