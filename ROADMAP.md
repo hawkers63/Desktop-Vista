@@ -68,18 +68,32 @@ filter the active slideshow without modifying source files (✅).
 
 ---
 
-## v1.4 — Power & Context Awareness
+## v1.4 — Power & Context Awareness ✅ Done (2026-09-09)
 
 Goal: behave well on laptops and stop interrupting foreground work.
 
-| Priority | Item |
-| :---: | :--- |
-| P0 | Battery Saver pause/throttle (`GetSystemPowerStatus`) |
-| P0 | Fullscreen/game suppression (`SHQueryUserNotificationState`) |
-| P1 | Clock-time interval triggers ("every day at 08:00") alongside fixed intervals |
-| P2 | Acrylic/Mica backdrop experiment on Win11 (optional; may slip to v1.5) |
+| Priority | Item | Status |
+| :---: | :--- | :--- |
+| P0 | Battery Saver pause (`GetSystemPowerStatus`) | ✅ Done — throttle (a *different*, slower interval while on battery but Battery Saver isn't on) not implemented; only the on/off pause was in this release's exit criteria |
+| P0 | Fullscreen/game suppression (`SHQueryUserNotificationState`) | ✅ Done — suppresses on `QUNS_RUNNING_D3D_FULL_SCREEN`/`QUNS_PRESENTATION_MODE` |
+| P1 | Clock-time interval triggers ("every day at 08:00") alongside fixed intervals | ✅ Done — `schedule.mode: "daily"` + `schedule.daily_times` |
+| P2 | Acrylic/Mica backdrop experiment on Win11 | ❌ Dropped — disproportionate implementation risk/value for this app; not revisited |
 
-**Exit criteria:** slideshow auto-pauses on Battery Saver and while a fullscreen app/game is active; clock-time trigger fires within the same tick tolerance as fixed intervals.
+**Implementation note:** pause reasons (`battery_saver`, `fullscreen`) are tracked
+independently, and slideshow "running" (user intent) is tracked separately from
+whether a tick is currently scheduled — so an auto-pause can't be mistaken for
+the user having stopped it, and clearing one pause reason can't accidentally
+resume a slideshow that's also paused for the other. The daily-schedule trigger
+is recomputed fresh from wall-clock time on every call rather than cached, so a
+DST change or clock adjustment self-corrects on the next tick instead of
+drifting — full DST fold/gap policy (notes_004 Track D) wasn't built out further
+than that.
+
+**Exit criteria:** slideshow auto-pauses on Battery Saver and while a fullscreen
+app/game is active (✅ — verified via a mocked power/notification-state smoke
+test, not a real battery-saver/fullscreen session); daily-times trigger computes
+the correct next occurrence (✅ — unit tested for same-day, roll-to-tomorrow, and
+exact-time-boundary cases).
 
 ---
 

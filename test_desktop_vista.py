@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -135,6 +136,8 @@ def test_load_config_valid_values_kept(tmp_path):
         "favourites": [],
         "hidden": [],
         "playback_source": None,
+        "power": {"pause_on_battery_saver": True, "pause_on_fullscreen": True},
+        "schedule": {"mode": "interval", "daily_times": []},
     }
 
 
@@ -502,6 +505,95 @@ def test_source_display_label_playlist_partial_offline():
         ]
     }
     assert dv.source_display_label(cfg, "playlist", "p1") == "▶ Workday  (0/2 drives online)"
+
+
+# ---------------------------------------------------------------------------
+# v1.4 — power/fullscreen predicates, daily schedule math
+# ---------------------------------------------------------------------------
+
+def test_load_config_power_defaults_when_missing(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["power"] == {"pause_on_battery_saver": True, "pause_on_fullscreen": True}
+    assert cfg["schedule"] == {"mode": "interval", "daily_times": []}
+
+
+def test_load_config_power_non_bool_falls_back(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps({"power": {"pause_on_battery_saver": "yes", "pause_on_fullscreen": 0}}),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["power"] == {"pause_on_battery_saver": True, "pause_on_fullscreen": True}
+
+
+def test_load_config_schedule_daily_times_filters_invalid(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {"schedule": {"mode": "daily", "daily_times": ["08:00", "25:00", "9:5", "18:30"]}}
+        ),
+        encoding="utf-8",
+    )
+    cfg = dv.load_config(cfg_path)
+    assert cfg["schedule"] == {"mode": "daily", "daily_times": ["08:00", "18:30"]}
+
+
+def test_load_config_schedule_invalid_mode_falls_back(tmp_path):
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(json.dumps({"schedule": {"mode": "lunar"}}), encoding="utf-8")
+    cfg = dv.load_config(cfg_path)
+    assert cfg["schedule"]["mode"] == "interval"
+
+
+def test_is_valid_time_string():
+    assert dv.is_valid_time_string("08:00") is True
+    assert dv.is_valid_time_string("23:59") is True
+    assert dv.is_valid_time_string("24:00") is False
+    assert dv.is_valid_time_string("8:00") is False
+    assert dv.is_valid_time_string("08:60") is False
+    assert dv.is_valid_time_string("not-a-time") is False
+
+
+def test_next_daily_trigger_picks_soonest_today():
+    now = datetime(2026, 9, 9, 10, 0, 0)
+    trigger = dv.next_daily_trigger(now, ["08:00", "14:00", "20:00"])
+    assert trigger == datetime(2026, 9, 9, 14, 0, 0)
+
+
+def test_next_daily_trigger_rolls_to_tomorrow_when_all_passed():
+    now = datetime(2026, 9, 9, 22, 0, 0)
+    trigger = dv.next_daily_trigger(now, ["08:00", "14:00"])
+    assert trigger == datetime(2026, 9, 10, 8, 0, 0)
+
+
+def test_next_daily_trigger_no_valid_times_returns_none():
+    now = datetime(2026, 9, 9, 10, 0, 0)
+    assert dv.next_daily_trigger(now, []) is None
+    assert dv.next_daily_trigger(now, ["bogus"]) is None
+
+
+def test_next_daily_trigger_exact_time_rolls_to_tomorrow():
+    """A candidate exactly equal to 'now' has already happened this tick,
+    so it must roll forward rather than fire again immediately."""
+    now = datetime(2026, 9, 9, 8, 0, 0)
+    trigger = dv.next_daily_trigger(now, ["08:00"])
+    assert trigger == datetime(2026, 9, 10, 8, 0, 0)
+
+
+def test_is_battery_saver_active_pure_predicate():
+    assert dv.is_battery_saver_active({"battery_saver_on": True}) is True
+    assert dv.is_battery_saver_active({"battery_saver_on": False}) is False
+    assert dv.is_battery_saver_active(None) in (True, False)  # falls back to live query, not a crash
+
+
+def test_is_fullscreen_active_pure_predicate():
+    assert dv.is_fullscreen_active(3) is True  # QUNS_RUNNING_D3D_FULL_SCREEN
+    assert dv.is_fullscreen_active(4) is True  # QUNS_PRESENTATION_MODE
+    assert dv.is_fullscreen_active(5) is False  # QUNS_ACCEPTS_NOTIFICATIONS
+    assert dv.is_fullscreen_active(None) is False
 
 
 # ---------------------------------------------------------------------------

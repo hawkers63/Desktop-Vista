@@ -30,5 +30,13 @@
   "playback_source": {
     "kind": "folder",
     "id": "D:\\Wallpapers\\Landscapes"
+  },
+  "power": {
+    "pause_on_battery_saver": true,
+    "pause_on_fullscreen": true
+  },
+  "schedule": {
+    "mode": "interval",
+    "daily_times": []
   }
 }

@@ -57,6 +57,8 @@ The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to previ
 - **Playlists** — group folders from any drives into one named, deduplicated slideshow source ("All My Drives", v1.3)
 - **Favourites & Hide** — non-destructive per-image curation; hidden images are filtered out of playback everywhere without touching the source file
 - **Drive reconnect watcher** — offline badges and empty sources refresh automatically on a 15-second poll
+- **Battery Saver & fullscreen auto-pause** — the slideshow pauses itself on Battery Saver or while a fullscreen app/game is active, and resumes automatically once the reason clears (v1.4)
+- **Daily-times schedule** — an alternative to a fixed interval: pick times of day ("08:00, 18:00") instead
 
 ---
 
@@ -149,6 +151,10 @@ Settings are stored in `config.json` beside `desktop_vista.py`. Use [`config.exa
 | `favourites` | `string[]` | Favourited image paths (non-destructive) |
 | `hidden` | `string[]` | Hidden image paths — filtered out of playback everywhere (non-destructive) |
 | `playback_source` | `{kind, id} \| null` | The active source: `kind` is `"folder"` or `"playlist"`, `id` is a folder path or playlist id |
+| `power.pause_on_battery_saver` | `boolean` | Auto-pause the slideshow while Windows Battery Saver is on (default `true`) |
+| `power.pause_on_fullscreen` | `boolean` | Auto-pause while a fullscreen app/game or presentation is active (default `true`) |
+| `schedule.mode` | `string` | `"interval"` (fixed interval, default) or `"daily"` (`daily_times`) |
+| `schedule.daily_times` | `string[]` | 24-hour `"HH:MM"` times used when `schedule.mode` is `"daily"` |
 
 Example (placeholders only):
 

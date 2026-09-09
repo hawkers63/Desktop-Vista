@@ -8,7 +8,7 @@
 # See the LICENSE file in the project root for the full proprietary notice.
 """
 Desktop Vista  —  All my drives. One perfect view.
-Version 1.3.0  (September 2026)
+Version 1.4.0  (September 2026)
 
 A lightweight Windows wallpaper manager.
 
@@ -71,8 +71,22 @@ New in v1.3 "All My Drives":
     - Playback source generalised to folder-or-playlist (`playback_source`
       in config); `current_folder` kept in sync for older readers
 
-Planned for v1.4+: power/context awareness, then monitor-topology
-groundwork, and finally multi-monitor (IDesktopWallpaper COM) in v2.0 —
+New in v1.4 "Power & Context Awareness":
+    - Auto-pause on Battery Saver (GetSystemPowerStatus) and while a
+      fullscreen app/game or presentation is active
+      (SHQueryUserNotificationState) — independent pause reasons, so
+      resuming from one can't accidentally resume while the other still
+      applies; manual Start/Stop intent is tracked separately from the
+      currently-scheduled tick, so a resume picks back up automatically
+    - Daily-times schedule mode as an alternative to a fixed interval
+      ("run at these times of day"); recomputes the next trigger fresh on
+      every tick rather than caching one, so it self-corrects across a
+      DST change or clock adjustment
+    - Mica/Acrylic backdrop experiment dropped from scope — disproportionate
+      implementation risk for a CustomTkinter app relative to its value
+
+Planned for v1.5+: monitor-topology groundwork, tags/collections, solar
+data model, and finally multi-monitor (IDesktopWallpaper COM) in v2.0 —
 see ROADMAP.md.
 """
 
@@ -85,12 +99,14 @@ import logging
 import math
 import os
 import random
+import re
 import subprocess
 import sys
 import tempfile
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -129,7 +145,7 @@ log = logging.getLogger("desktop_vista")
 # ---------------------------------------------------------------------------
 
 APP_NAME = "Desktop Vista"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 TAGLINE = "All my drives. One perfect view."
 
 # Frozen (PyInstaller) builds extract bundled files under a temporary
@@ -195,12 +211,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "favourites": [],          # [image path, ...] — non-destructive
     "hidden": [],              # [image path, ...] — non-destructive
     "playback_source": None,   # {"kind": "folder"|"playlist", "id": str} or None
+    # v1.4 Power & Context Awareness — additive.
+    "power": {"pause_on_battery_saver": True, "pause_on_fullscreen": True},
+    "schedule": {"mode": "interval", "daily_times": []},  # mode: "interval"|"daily"
 }
 
 STARTUP_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE_NAME = "DesktopVista"
 
 RECONNECT_POLL_MS = 15_000
+POWER_POLL_MS = 5_000
+DAILY_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+# SHQueryUserNotificationState values worth suppressing on: a fullscreen D3D
+# app or a presentation is running. QUNS_BUSY/QUIET_TIME are deliberately
+# excluded — those fire for ordinary foreground apps too often to be a
+# useful "someone's watching the screen" signal.
+FULLSCREEN_NOTIFICATION_STATES = frozenset({3, 4})  # D3D_FULL_SCREEN, PRESENTATION_MODE
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +336,101 @@ def set_membership(cfg: dict, list_key: str, path: str, member: bool) -> None:
     elif not member and is_member:
         items.remove(path)
     cfg[list_key] = items
+
+
+def is_valid_time_string(text: str) -> bool:
+    return bool(DAILY_TIME_RE.match(text))
+
+
+def parse_daily_time(text: str) -> tuple[int, int]:
+    hour_str, minute_str = text.split(":")
+    return int(hour_str), int(minute_str)
+
+
+def next_daily_trigger(now: datetime, daily_times: list[str]) -> Optional[datetime]:
+    """
+    Return the soonest upcoming local trigger from a list of "HH:MM" times.
+
+    Each time is evaluated independently against *now* (today if still
+    ahead, otherwise tomorrow), then the earliest candidate wins. Recomputing
+    from wall-clock "now" on every call — rather than caching a fixed future
+    timestamp — is deliberate: it means a DST jump or system clock change
+    between ticks self-corrects on the next call instead of drifting.
+    """
+    valid_times = [t for t in daily_times if is_valid_time_string(t)]
+    if not valid_times:
+        return None
+    candidates = []
+    for text in valid_times:
+        hour, minute = parse_daily_time(text)
+        candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if candidate <= now:
+            candidate += timedelta(days=1)
+        candidates.append(candidate)
+    return min(candidates)
+
+
+class _SystemPowerStatus(ctypes.Structure if ctypes is not None else object):
+    _fields_ = (
+        [
+            ("ACLineStatus", ctypes.c_byte),
+            ("BatteryFlag", ctypes.c_byte),
+            ("BatteryLifePercent", ctypes.c_byte),
+            ("SystemStatusFlag", ctypes.c_byte),
+            ("BatteryLifeTime", ctypes.c_ulong),
+            ("BatteryFullLifeTime", ctypes.c_ulong),
+        ]
+        if ctypes is not None
+        else []
+    )
+
+
+def get_power_status() -> Optional[dict]:
+    """Return parsed GetSystemPowerStatus fields, or None if unavailable."""
+    if ctypes is None or sys.platform != "win32":
+        return None
+    status = _SystemPowerStatus()
+    try:
+        ok = ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status))
+    except OSError:
+        return None
+    if not ok:
+        return None
+    return {
+        "ac_line_status": status.ACLineStatus,  # 0=battery, 1=AC, 255=unknown
+        "battery_life_percent": status.BatteryLifePercent,  # 0-100, 255=unknown
+        # Bit 0 of SystemStatusFlag is the distinct "Battery Saver" toggle —
+        # being on battery is not the same thing (notes_004 Track C).
+        "battery_saver_on": bool(status.SystemStatusFlag & 1),
+    }
+
+
+def is_battery_saver_active(status: Optional[dict] = None) -> bool:
+    """Pure predicate over a power-status dict — pass one explicitly in
+    tests; real callers omit it to query the live GetSystemPowerStatus."""
+    if status is None:
+        status = get_power_status()
+    return bool(status and status.get("battery_saver_on"))
+
+
+def query_user_notification_state() -> Optional[int]:
+    """Return the raw SHQueryUserNotificationState value, or None if unavailable."""
+    if ctypes is None or sys.platform != "win32":
+        return None
+    state = ctypes.c_int(0)
+    try:
+        hresult = ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(state))
+    except OSError:
+        return None
+    return state.value if hresult == 0 else None  # 0 == S_OK
+
+
+def is_fullscreen_active(state: Optional[int] = None) -> bool:
+    """Pure predicate over a notification-state value — pass one explicitly
+    in tests; real callers omit it to query the live Win32 API."""
+    if state is None:
+        state = query_user_notification_state()
+    return state in FULLSCREEN_NOTIFICATION_STATES if state is not None else False
 
 
 def resolve_interval_seconds(interval_key: str, custom_seconds: Any) -> int:
@@ -448,6 +569,36 @@ def _validate_config(raw: dict) -> dict[str, Any]:
         cfg["playback_source"] = {"kind": kind, "id": sid} if valid_ref else None
     else:
         cfg["playback_source"] = None
+
+    # ---- v1.4 additions (all additive; absent/invalid -> safe defaults) ----
+
+    power_raw = raw.get("power", DEFAULT_CONFIG["power"])
+    if isinstance(power_raw, dict):
+        power_defaults = DEFAULT_CONFIG["power"]
+        cfg["power"] = {
+            key: power_raw[key] if isinstance(power_raw.get(key), bool) else power_defaults[key]
+            for key in power_defaults
+        }
+    else:
+        log.warning("Invalid 'power' in config; using default.")
+        cfg["power"] = dict(DEFAULT_CONFIG["power"])
+
+    schedule_raw = raw.get("schedule", DEFAULT_CONFIG["schedule"])
+    if isinstance(schedule_raw, dict):
+        mode = schedule_raw.get("mode")
+        daily_times_raw = schedule_raw.get("daily_times", [])
+        valid_times = (
+            [t for t in daily_times_raw if isinstance(t, str) and is_valid_time_string(t)]
+            if isinstance(daily_times_raw, list)
+            else []
+        )
+        cfg["schedule"] = {
+            "mode": mode if mode in ("interval", "daily") else "interval",
+            "daily_times": valid_times,
+        }
+    else:
+        log.warning("Invalid 'schedule' in config; using default.")
+        cfg["schedule"] = dict(DEFAULT_CONFIG["schedule"])
 
     return cfg
 
@@ -734,6 +885,14 @@ class DesktopVista(ctk.CTk):
         self._active_id: Optional[str] = None
         self._source_label_to_key: dict[str, tuple[str, str]] = {}
         self._reconnect_job: Any = None
+        # "Running" reflects user intent (Start/Stop Slideshow); _slideshow_job
+        # is only the currently-scheduled tick, which auto-pause cancels
+        # without touching intent — the two can legitimately disagree while
+        # paused for battery/fullscreen, and the monitor tick below acts on
+        # exactly that gap to resume once the reason clears.
+        self._slideshow_running: bool = False
+        self._auto_pause_reasons: set[str] = set()
+        self._power_job: Any = None
         self._preview_ref = None  # keep CTkImage alive
         self._slideshow_job: Any = None
         self._save_job: Any = None
@@ -759,6 +918,7 @@ class DesktopVista(ctk.CTk):
         self._init_tray()
         self._sync_startup_state()
         self._start_reconnect_watcher()
+        self._start_power_monitor()
         if self._start_minimized:
             if self._tray_is_ready():
                 self.withdraw()
@@ -856,6 +1016,31 @@ class DesktopVista(ctk.CTk):
             side, text="Start Slideshow", height=40, fg_color="#2e7d32", hover_color="#27682a",
             command=self._toggle_slideshow)
         self.slide_btn.grid(row=row(), column=0, padx=16, pady=(12, 0), sticky="ew")
+
+        # Power & schedule
+        ctk.CTkLabel(side, text="POWER & SCHEDULE", font=ctk.CTkFont(size=11, weight="bold"),
+                     text_color="gray60").grid(row=row(), column=0, padx=16, pady=(24, 0), sticky="w")
+        self.battery_pause_var = ctk.BooleanVar(value=self.cfg["power"]["pause_on_battery_saver"])
+        ctk.CTkSwitch(side, text="Pause on Battery Saver", variable=self.battery_pause_var,
+                      command=self._on_power_settings_changed).grid(
+            row=row(), column=0, padx=16, pady=(4, 0), sticky="w")
+        self.fullscreen_pause_var = ctk.BooleanVar(value=self.cfg["power"]["pause_on_fullscreen"])
+        ctk.CTkSwitch(side, text="Pause during fullscreen/games", variable=self.fullscreen_pause_var,
+                      command=self._on_power_settings_changed).grid(
+            row=row(), column=0, padx=16, pady=(4, 6), sticky="w")
+        self.schedule_mode_var = ctk.StringVar(
+            value="Daily times" if self.cfg["schedule"]["mode"] == "daily" else "Fixed interval")
+        ctk.CTkOptionMenu(side, variable=self.schedule_mode_var,
+                          values=["Fixed interval", "Daily times"],
+                          command=self._on_schedule_mode_changed).grid(
+            row=row(), column=0, padx=16, pady=(0, 4), sticky="ew")
+        self.daily_times_var = ctk.StringVar(value=", ".join(self.cfg["schedule"]["daily_times"]))
+        self.daily_times_entry = ctk.CTkEntry(
+            side, textvariable=self.daily_times_var, placeholder_text="e.g. 08:00, 18:00")
+        self.daily_times_entry.grid(row=row(), column=0, padx=16, sticky="ew")
+        ctk.CTkButton(side, text="Apply times", fg_color="gray30", hover_color="gray25",
+                      command=self._on_daily_times_apply).grid(
+            row=row(), column=0, padx=16, pady=(4, 0), sticky="ew")
 
         # Startup
         ctk.CTkLabel(side, text="STARTUP", font=ctk.CTkFont(size=11, weight="bold"),
@@ -1083,7 +1268,7 @@ class DesktopVista(ctk.CTk):
             else:
                 self._set_status("No images found in this folder.")
             self._flush_save()
-            if self._slideshow_job is not None:
+            if self._slideshow_running:
                 self._stop_slideshow()
             return
 
@@ -1492,6 +1677,36 @@ class DesktopVista(ctk.CTk):
         self._shuffle_cursor = 0
         self._save()
 
+    def _on_power_settings_changed(self) -> None:
+        self.cfg["power"] = {
+            "pause_on_battery_saver": bool(self.battery_pause_var.get()),
+            "pause_on_fullscreen": bool(self.fullscreen_pause_var.get()),
+        }
+        self._schedule_save()
+
+    def _on_schedule_mode_changed(self, value: str) -> None:
+        self.cfg["schedule"]["mode"] = "daily" if value == "Daily times" else "interval"
+        self._flush_save()
+        if self._slideshow_running:
+            self._stop_slideshow(update_status=False)
+            self._start_slideshow()
+
+    def _on_daily_times_apply(self) -> None:
+        raw_times = [t.strip() for t in self.daily_times_var.get().split(",") if t.strip()]
+        invalid = [t for t in raw_times if not is_valid_time_string(t)]
+        if invalid:
+            messagebox.showerror(
+                APP_NAME, f"Invalid time(s): {', '.join(invalid)}\nUse 24-hour HH:MM, e.g. 08:00."
+            )
+            return
+        self.cfg["schedule"]["daily_times"] = raw_times
+        self.daily_times_var.set(", ".join(raw_times))
+        self._flush_save()
+        self._set_status(f"Daily schedule times updated ({len(raw_times)}).")
+        if self._slideshow_running and self.cfg["schedule"]["mode"] == "daily":
+            self._stop_slideshow(update_status=False)
+            self._start_slideshow()
+
     def _set_wallpaper(self, silent: bool = False) -> None:
         if not (0 <= self.index < len(self.images)):
             self._set_status("Nothing selected.")
@@ -1536,21 +1751,33 @@ class DesktopVista(ctk.CTk):
                 return
             self.cfg["interval_custom_seconds"] = seconds
         self._flush_save()
-        if self._slideshow_job is not None:
+        if self._slideshow_running:
             self._stop_slideshow(update_status=False)
             self._start_slideshow()
 
     def _toggle_slideshow(self) -> None:
-        if self._slideshow_job is None:
-            self._start_slideshow()
-        else:
+        if self._slideshow_running:
             self._stop_slideshow()
+        else:
+            self._start_slideshow()
+
+    def _auto_pause_status_text(self) -> str:
+        labels = {
+            "battery_saver": "Battery Saver is on",
+            "fullscreen": "a fullscreen app is active",
+        }
+        reasons = ", ".join(labels[r] for r in sorted(self._auto_pause_reasons) if r in labels)
+        return f"Slideshow paused — {reasons}."
 
     def _start_slideshow(self) -> None:
         if not self.images:
             self._set_status("Add a folder with images first.")
             return
+        self._slideshow_running = True
         self.slide_btn.configure(text="Stop Slideshow", fg_color="#b71c1c", hover_color="#951616")
+        if self._auto_pause_reasons:
+            self._set_status(self._auto_pause_status_text())
+            return
         self._set_status(f"Slideshow running — every {self._interval_display_text()}.")
         self._set_wallpaper(silent=True)
         self._schedule_next()
@@ -1559,9 +1786,21 @@ class DesktopVista(ctk.CTk):
         if not self.images:
             self._stop_slideshow()
             return
-        seconds = resolve_interval_seconds(
-            self.interval_var.get(), self.cfg.get("interval_custom_seconds")
-        )
+        if self.cfg["schedule"]["mode"] == "daily":
+            trigger = next_daily_trigger(datetime.now(), self.cfg["schedule"]["daily_times"])
+            seconds = (
+                max(1, int((trigger - datetime.now()).total_seconds()))
+                if trigger is not None
+                # No valid daily times configured — fall back to the fixed
+                # interval so the slideshow doesn't silently stall forever.
+                else resolve_interval_seconds(
+                    self.interval_var.get(), self.cfg.get("interval_custom_seconds")
+                )
+            )
+        else:
+            seconds = resolve_interval_seconds(
+                self.interval_var.get(), self.cfg.get("interval_custom_seconds")
+            )
         self._slideshow_job = self.after(seconds * 1000, self._slideshow_tick)
 
     def _slideshow_tick(self) -> None:
@@ -1582,6 +1821,7 @@ class DesktopVista(ctk.CTk):
             self._stop_slideshow()
 
     def _stop_slideshow(self, update_status: bool = True) -> None:
+        self._slideshow_running = False
         if self._slideshow_job is not None:
             try:
                 self.after_cancel(self._slideshow_job)
@@ -1596,6 +1836,36 @@ class DesktopVista(ctk.CTk):
             pass
         if update_status:
             self._set_status("Slideshow stopped.")
+
+    # ---------------- Power & fullscreen auto-pause ----------------
+
+    def _start_power_monitor(self) -> None:
+        self._power_job = self.after(POWER_POLL_MS, self._power_monitor_tick)
+
+    def _power_monitor_tick(self) -> None:
+        if self._closing:
+            return
+        reasons: set[str] = set()
+        if self.cfg["power"]["pause_on_battery_saver"] and is_battery_saver_active():
+            reasons.add("battery_saver")
+        if self.cfg["power"]["pause_on_fullscreen"] and is_fullscreen_active():
+            reasons.add("fullscreen")
+        was_paused = bool(self._auto_pause_reasons)
+        if reasons != self._auto_pause_reasons:
+            self._auto_pause_reasons = reasons
+            if self._slideshow_running:
+                if reasons and not was_paused:
+                    if self._slideshow_job is not None:
+                        try:
+                            self.after_cancel(self._slideshow_job)
+                        except Exception:
+                            pass
+                        self._slideshow_job = None
+                    self._set_status(self._auto_pause_status_text())
+                elif not reasons and was_paused:
+                    self._set_status(f"Slideshow running — every {self._interval_display_text()}.")
+                    self._schedule_next()
+        self._power_job = self.after(POWER_POLL_MS, self._power_monitor_tick)
 
     # ---------------- Startup (Run key) ----------------
 
@@ -1642,7 +1912,7 @@ class DesktopVista(ctk.CTk):
             current_name = f"Current: {Path(self.images[self.index]).name}"
         else:
             current_name = "Current: (none)"
-        slideshow_running = self._slideshow_job is not None
+        slideshow_running = self._slideshow_running
         return (
             pystray.MenuItem(current_name, None, enabled=False),
             pystray.Menu.SEPARATOR,
@@ -1752,7 +2022,7 @@ class DesktopVista(ctk.CTk):
     # ---------------- Close ----------------
 
     def _cancel_after_jobs(self) -> None:
-        for attr in ("_slideshow_job", "_save_job", "_reconnect_job"):
+        for attr in ("_slideshow_job", "_save_job", "_reconnect_job", "_power_job"):
             job = getattr(self, attr, None)
             if job is not None:
                 try:
