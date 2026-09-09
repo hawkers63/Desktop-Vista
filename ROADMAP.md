@@ -10,14 +10,14 @@ This document schedules the **next four releases**, drawing on the feature backl
 
 Goal: live in the tray, survive a drive unplug, stop demanding the window stay open.
 
-| Priority | Item |
-| :---: | :--- |
-| P0 | `pystray` tray icon + context menu; close/minimise → `withdraw`; Exit quits cleanly |
-| P0 | `--minimized` launch flag + optional `HKCU\...\Run` startup entry |
-| P0 | Reveal in File Explorer (`explorer /select,"path"`) |
-| P1 | Custom slideshow interval in seconds (`interval_custom_seconds`, schema bump) |
-| P1 | Offline-aware folders — skip missing files without crashing, `(offline)` badge, resume on reconnect |
-| P2 | Branded `.ico` (Framed Landscape or Floating Displays concept from `notes/notes_001.txt`) |
+| Priority | Item | Status |
+| :---: | :--- | :--- |
+| P0 | `pystray` tray icon + context menu; close/minimise → `withdraw`; Exit quits cleanly | ✅ Done |
+| P0 | `--minimized` launch flag + optional `HKCU\...\Run` startup entry | ✅ Done |
+| P0 | Reveal in File Explorer (`explorer /select,"path"`) | ✅ Done (shipped as part of the tray menu) |
+| P1 | Custom slideshow interval in seconds (`interval_custom_seconds`, schema bump) | ✅ Done |
+| P1 | Offline-aware folders — skip missing files without crashing, `(offline)` badge, resume on reconnect | ✅ Done |
+| P2 | Branded `.ico` (Framed Landscape or Floating Displays concept from `notes/notes_001.txt`) | ⏳ Open — needs icon design, not just code; tray currently uses a procedural placeholder (`build_tray_icon_image()`) |
 
 **Exit criteria:** slideshow survives window hide; unplugging a USB drive mid-slideshow doesn't crash; app can start minimised from Windows startup.
 
