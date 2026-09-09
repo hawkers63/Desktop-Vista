@@ -17,9 +17,31 @@ Goal: live in the tray, survive a drive unplug, stop demanding the window stay o
 | P0 | Reveal in File Explorer (`explorer /select,"path"`) | ✅ Done (shipped as part of the tray menu) |
 | P1 | Custom slideshow interval in seconds (`interval_custom_seconds`, schema bump) | ✅ Done |
 | P1 | Offline-aware folders — skip missing files without crashing, `(offline)` badge, resume on reconnect | ✅ Done |
-| P2 | Branded `.ico` (Framed Landscape or Floating Displays concept from `notes/notes_001.txt`) | ⏳ Open — needs icon design, not just code; tray currently uses a procedural placeholder (`build_tray_icon_image()`) |
+| P2 | Branded `.ico` (monitor + cog concept, supplied 2026-09-09) | ✅ Done — `icon/desktop_vista.ico`/`.png`, loaded via `load_brand_icon()` for the tray and `iconbitmap()` for the window; falls back to the procedural placeholder if missing |
 
 **Exit criteria:** slideshow survives window hide; unplugging a USB drive mid-slideshow doesn't crash; app can start minimised from Windows startup.
+
+---
+
+## v1.2.1 — Hardening addendum
+
+An architecture/UX review (`notes/notes_004.txt`, 2026-09-09) audited the v1.2 codebase and supplied the icon assets above. The following findings were fixed directly; the review's larger structural proposals (bounded preview LRU cache, full tray/Tk command-queue bridge, single-instance guard, `IDesktopWallpaper` COM backend, SQLite catalogue) are carried forward into v1.3+ rather than folded into this patch.
+
+| Priority | Item | Status |
+| :---: | :--- | :--- |
+| High | Stale-`exc`-in-lambda `NameError` risk in the preview error callback | ✅ Fixed |
+| High | Tray "Next/Previous Wallpaper" only updated the preview, never applied | ✅ Fixed — tray navigation now calls `_set_wallpaper(silent=True)` |
+| Medium | Tray readiness only checked "Icon object exists", not "background thread actually started" — a failed tray could strand `--minimized` with a hidden, unrecoverable window | ✅ Fixed — explicit `threading.Event` readiness/failure signal, `--minimized` falls back to a visible window on failure |
+| Medium | Switching to an empty/offline folder didn't invalidate in-flight preview loads from the previous folder | ✅ Fixed — load token bumps on every folder switch |
+| Medium | `_load_preview_image` called `exif_transpose` before `draft`, undermining the fast reduced decode for rotated images | ✅ Fixed — orientation read first, draft box swapped accordingly |
+| Medium | Shared mutable `DEFAULT_CONFIG["folders"]` could leak into `cfg` on a rejected field and be mutated in place | ✅ Fixed — `copy.deepcopy(DEFAULT_CONFIG)` |
+| Medium | Tray boolean flags accepted via `bool(value)`, so `"false"`/`0`/`1` were silently coerced | ✅ Fixed — requires a literal `bool` |
+| Medium | Non-finite (`inf`/`nan`) custom interval seconds could crash `int()` at apply time | ✅ Fixed — rejected during validation and at resolve time |
+| Medium | `save_config` used a fixed `.tmp` filename — two instances writing at once could race | ✅ Fixed — unique temp file per write via `tempfile.mkstemp` |
+| Medium | "Start with Windows" reported "on" from mere key existence, even after Python/script relocation | ✅ Fixed — compares the actual registry command to what this install would write today |
+| Low | `_advance_shuffle` used `list.pop(0)` (O(n) shift) | ✅ Fixed — cursor-indexed deck |
+
+Deferred to v1.3+ (see notes_004 §1, §4–5, §7): background-thread folder enumeration/offline probing off the Tk thread, a bounded byte-budgeted preview LRU cache, a formal tray/Tk command-queue bridge, single-instance ownership, and the config schema v2 migration (sources/playlists/catalogue) that those features depend on.
 
 ---
 
@@ -78,4 +100,4 @@ Goal: lay organisational and topology groundwork before the multi-monitor COM re
 
 - Version numbers above are release numbers, not calendar dates — fit the cadence to actual capacity.
 - Update `notes/notes_002.txt`'s schema/wireframe sections as each release's config keys land, and keep `config.example.json` in sync. `config.json` itself stays gitignored.
-- Source backlog: `notes/notes_001.txt` (design intent), `notes/notes_002.txt` (feature matrix + phased plan), `notes/notes_003.txt` (v1.1 hardening audit), `AGENT_1_FEATURE_INNOVATION.md`.
+- Source backlog: `notes/notes_001.txt` (design intent), `notes/notes_002.txt` (feature matrix + phased plan), `notes/notes_003.txt` (v1.1 hardening audit), `notes/notes_004.txt` (v1.2 architecture/UX review + supplied icon assets), `AGENT_1_FEATURE_INNOVATION.md`.

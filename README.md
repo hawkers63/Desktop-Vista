@@ -52,6 +52,8 @@ The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to previ
 - **System tray** — closing the window hides Desktop Vista to the tray instead of quitting; the tray menu shows the current image and offers Next / Previous, Pause / Resume slideshow, Reveal in Explorer, Open Desktop Vista, and Exit
 - **Start with Windows** — an optional Run-key entry launches Desktop Vista minimised to the tray at login (`--minimized` flag)
 - **Offline-aware folders** — folders on a disconnected drive show `(offline)` in the folder dropdown, and an unattended slideshow skips missing files instead of stopping on an error dialog
+- **Branded icon** — the window and tray icon use the Desktop Vista glyph (`icon/desktop_vista.ico`), with a procedural fallback if the asset is ever missing
+- **Tray Next/Previous apply the wallpaper** — not just the in-window preview, so the tray menu does what its labels say
 
 ---
 
@@ -64,6 +66,12 @@ The preview pane keeps a fixed 16:9 aspect ratio. Pillow decodes images to previ
 ---
 
 ## Installation
+
+### Option A — prebuilt executable (no Python required)
+
+Download `DesktopVista.exe` from the project's [Releases](https://github.com/hawkers63/Desktop-Vista/releases) page (or build it yourself — see [Building the executable](#building-the-executable)) and run it directly. It carries the branded icon and creates `config.json` beside itself on first launch.
+
+### Option B — from source
 
 1. Clone or copy this repository to a local folder (for example `D:\Desktop_Vista`).
 2. Open PowerShell in that folder.
@@ -87,6 +95,19 @@ python desktop_vista.py
 ```
 
 > **Note:** `config.json` is gitignored and must never be committed — it may contain private drive paths.
+
+---
+
+## Building the executable
+
+A standalone `DesktopVista.exe` is built with [PyInstaller](https://pyinstaller.org/):
+
+```powershell
+pip install pyinstaller
+pyinstaller build_exe.spec
+```
+
+The output is written to `dist\DesktopVista.exe` — a single-file, windowed (no console) build carrying `icon/desktop_vista.ico` as both the file icon and the runtime window/tray icon. See `build_exe.spec` for the exact PyInstaller configuration.
 
 ---
 
@@ -150,6 +171,8 @@ Example (placeholders only):
 ```
 Desktop_Vista/
 ├── desktop_vista.py      # Main application
+├── build_exe.spec        # PyInstaller spec for DesktopVista.exe
+├── icon/                 # Branded window/tray icon (desktop_vista.ico/.png)
 ├── config.example.json   # Safe configuration template
 ├── config.json           # Local settings (not tracked)
 ├── LICENSE               # Proprietary — All Rights Reserved
@@ -162,6 +185,8 @@ Desktop_Vista/
 ## Roadmap (planned)
 
 See [`ROADMAP.md`](ROADMAP.md) for the full four-release plan (v1.2 → v1.5) — tray/background automation, cross-drive playlists, power awareness, and monitor-topology groundwork ahead of the v2.0 multi-monitor rewrite.
+
+v1.2.1 folded in a hardening addendum from an architecture/UX review (`notes/notes_004.txt`): the branded icon, tray Next/Previous now applying the wallpaper, safer config validation, and a few race/timing fixes. That review's larger proposals — a bounded preview cache, `IDesktopWallpaper` COM integration, the SQLite catalogue for cross-drive playlists, and so on — remain scoped into v1.3 and later.
 
 ---
 
