@@ -16,6 +16,11 @@ block_cipher = None
 datas = collect_data_files("customtkinter")
 datas += [("icon", "icon")]
 
+# numpy (and its bundled OpenBLAS DLL, tens of MB on its own) is pulled in
+# transitively by Pillow's PyInstaller hook purely because it happens to be
+# installed in this environment — desktop_vista.py never uses NumPy-backed
+# Pillow features (no Image.fromarray/np.array), so it's safe to exclude
+# and keeps the single-file build well under typical distribution limits.
 a = Analysis(
     ["desktop_vista.py"],
     pathex=[],
@@ -25,7 +30,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=["numpy"],
     noarchive=False,
     cipher=block_cipher,
 )
