@@ -148,3 +148,55 @@ them in the same session. Scope settled on:
   confirmed.
 
 See ROADMAP.md for the authoritative per-release status as this lands.
+
+## 2026-09-09 (later still) — v1.3, v1.4, v1.5, v1.5.1 all shipped in one session
+
+Continued straight through the four-release plan per Mark's request. All
+pushed to `origin/main`; ROADMAP.md has the full per-release exit-criteria
+detail. Summary:
+
+- **v1.3** (commit 5dc188b): playlists/favourites/hidden/reconnect-watcher,
+  additive config fields (not the full schema-v2/SQLite catalogue notes_004
+  proposed — simpler model, same exit criteria). Also fixed a real latent
+  bug found while smoke-testing teardown: `<Configure>` events during
+  window close could resubmit decode work to an already-shut-down
+  executor (`_show_current()` now checks `self._closing`).
+- **v1.4** (commit c749bfe): Battery Saver + fullscreen auto-pause as
+  independently tracked pause reasons; slideshow "running" (user intent)
+  now tracked separately from "a tick is scheduled" so auto-pause can
+  resume itself via a 5s poll without racing manual Start/Stop; daily-times
+  schedule mode recomputes fresh each tick (self-corrects across DST/clock
+  changes rather than caching a stale target).
+- **v1.5** (commit 6a9b7b3): read-only monitor topology (Win32
+  `EnumDisplayMonitors`, no COM needed for read-only), tags + collections
+  as a third playback-source kind, solar dawn/day/dusk/night data model
+  (validated, stored, deliberately NOT wired into playback yet).
+- **v1.5.1** (commit cc60436): `windows_wallpaper_com.py` — a real
+  `IDesktopWallpaper` COM backend behind an opt-in `wallpaper_target: "com"`
+  flag (default stays `"spi"`). Verified on this machine (one display):
+  COM object creation, monitor enumeration, and apply-to-all/apply-to-one-
+  real-monitor all work and visibly change the desktop, confirmed
+  identically inside the frozen PyInstaller build via the new
+  `--selftest` CLI flag. **Not verified anywhere: true per-monitor
+  independence** (two different images, two different physical
+  displays) — no second monitor was available to check. That's why this
+  shipped as 1.5.1, not 2.0: the full v2.0 milestone (independent
+  per-monitor playback state, span assist, solar/tags wired into what's
+  actually applied, crossfade decision) is still ahead.
+
+96/96 tests passing throughout. Rebuilt and re-sent `DesktopVista.exe`
+(PyInstaller, ~19.5MB) reflecting all of this.
+
+**Side note for future sessions:** ad hoc smoke tests in this session
+called `_set_wallpaper()`/COM `set_wallpaper()` for real, which changes
+this machine's actual desktop wallpaper (not sandboxed). Restored it to
+Mark's real configured wallpaper (`C:\Program Files\Glow\Windows 11 -
+Glow1.jpg`, Fill style) after each round of testing — worth doing again
+if a future session's smoke tests touch the wallpaper-apply path.
+
+**Next up:** v1.3-v1.5.1 exhausts the four-release plan from the first
+"Let's get started" session. Remaining open threads: the full v2.0
+milestone (see ROADMAP.md's "Still ahead" list under v1.5.1), or circling
+back to notes_004's deferred structural items (preview LRU cache, tray/Tk
+command-queue bridge, single-instance guard) that were explicitly
+carried forward rather than done in the v1.2.1 pass.
