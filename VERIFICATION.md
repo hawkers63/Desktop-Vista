@@ -115,27 +115,32 @@ Narrator scan mode as a whole, not a per-control defect list.
 
 ### Contrast
 
-- [ ] Turn on Windows high contrast (Settings → Accessibility → Contrast themes). The app should
-      switch to CTk's "system" tokens automatically (`_apply_appearance_mode` /
+- [x] Turn on Windows high contrast (Settings → Accessibility → Contrast themes). The app should
+      switch to CTk's "system" tokens automatically (`_apply_ui_appearance_mode` /
       `is_high_contrast_active`, SPI_GETHIGHCONTRAST) rather than fighting it with a saved
       light/dark preference. Confirm your saved preference re-applies once high contrast is
-      turned back off.
-- [ ] In Light and in Dark (high contrast off), check text-on-fill contrast is comfortably
-      readable against Win11's default accent colours.
+      turned back off. **Pass, 2026-09-10 (Mark):** everything stays visible under contrast
+      themes; saved preference returns correctly once turned off.
+- [x] In Light and in Dark (high contrast off), check text-on-fill contrast is comfortably
+      readable against Win11's default accent colours. **Pass, 2026-09-10:** no issues detected.
 
 ### Multi-DPI
 
-- [ ] Run `python desktop_vista.py --selftest` (or the frozen `.exe --selftest`) and record its
+- [x] Run `python desktop_vista.py --selftest` (or the frozen `.exe --selftest`) and record its
       "Per-monitor DPI (GetDpiForMonitor)" and "Tk scaling factor" lines here for this machine —
       this is the measurement the v2.0 mixed-DPI span-crop work starts from, not an assumption.
+      **2026-09-10, this machine (single 1920x1080 display, 100% Windows scaling):**
+      `Per-monitor DPI (GetDpiForMonitor): [{'device': '\\\\.\\DISPLAY1', 'dpi_x': 96, 'dpi_y': 96}]`,
+      `Tk scaling factor: 1.3333333333333333`.
 - [ ] At 125% / 150% / 200% Windows scaling, confirm nothing required for the app's exit criteria
-      is clipped at the 980×560 minimum window size.
+      is clipped at the 980×560 minimum window size. **Not yet run** — this dev machine's display
+      is currently at 100% scaling; needs an actual Windows scaling change to test.
 
 ### Outcomes (fill in per pass)
 
 | Date | Tester | Windows build | Narrator scan mode | Contrast | Multi-DPI | Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 2026-09-10 | Mark | Windows 11 Home 10.0.26100 | Toolkit limitation (root-caused via direct UIA/MSAA query — see above) | Pending | Pending | Tab order/focus (§ above): pass |
+| 2026-09-10 | Mark | Windows 11 Home 10.0.26100 | Toolkit limitation (root-caused via direct UIA/MSAA query — see above) | Pass | Partial (100% scaling measured; 125/150/200% not yet tried) | Tab order/focus (§ above): pass |
 
 ## Linux / CI note
 
