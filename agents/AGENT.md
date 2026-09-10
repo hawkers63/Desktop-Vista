@@ -35,7 +35,7 @@ D:\Desktop_Vista\
 ├── ui_components.py          # Floating HUD pill, Tag chips, Toast manager, modal dialogs
 ├── config.json               # Local runtime config (GITIGNORED — contains user drive paths)
 ├── config.example.json       # Clean tracked configuration template (MUST stay in sync)
-├── test_*.py                 # Pytest automated test suite (150+ tests)
+├── tests/                    # Pytest suite (see pytest.ini)
 └── notes/                    # Sequential deliverable notes (notes_001.txt → notes_[N].txt)
 ```
 
