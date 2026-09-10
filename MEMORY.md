@@ -502,3 +502,57 @@ real on this machine and confirmed clean (no lingering process afterward).
 
 APP_VERSION bumped to "1.8". 171/171 tests passing (up from 152). Commits not yet pushed to
 `origin/main` — local `main` is 4 commits ahead, pending Mark's go-ahead.
+
+**Later the same evening:** Mark asked to push (done — `origin/main` updated) and to build and
+send `DesktopVista.exe`. Built, `--selftest`-verified against the frozen build, sent.
+
+---
+
+## 2026-09-10 (continued) — v1.8.1 walkthrough started; two bugs found and fixed
+
+**Context:** Mark asked to start v1.8.1 and walk through the `VERIFICATION.md` Narrator script
+together, section by section, reporting results back after each one.
+
+**Launch crash, found immediately:** Mark tried to launch the freshly-sent `DesktopVista.exe` and
+hit `TypeError: DesktopVista._apply_appearance_mode() takes 1 positional argument but 2 were
+given`, from inside `customtkinter`'s own `CTk.__init__`. Root cause: the method added for v1.8's
+high-contrast honour, `_apply_appearance_mode`, has the exact same name as a real CustomTkinter
+internal (`AppearanceModeBaseClass._apply_appearance_mode(self, color)`, used by every CTk widget
+to resolve a light/dark colour tuple) — Python let the override shadow it silently at class-
+definition time, and it only blew up the moment the base class's own code called it for real.
+**Lesson saved to memory** ([[desktop_vista_ctk_method_collisions]]): grep customtkinter's
+installed source for a candidate method name before adding it to `DesktopVista`/`EditorSheet`/any
+CTk subclass. Fixed by renaming to `_apply_ui_appearance_mode`. Live-verified this time (launched
+`--minimized`, confirmed the process survived, queried real state over `--status` IPC read-only,
+force-closed cleanly) before resending the exe — checked every other new v1.8 method name against
+customtkinter's source too; nothing else collided.
+
+**Sidebar layout gap, found by Mark:** a screenshot showed a visible empty gap between the nav
+buttons (Library/Playback/Displays/Settings) and the sidebar's actual page content below them.
+Root cause (pre-existing, not a v1.8 regression): `sidebar.grid_rowconfigure(2, weight=1)` gave
+the small fixed-height nav-button row the same grid stretch weight as row 3 (the real scrollable
+content), so Tk split leftover vertical space between both instead of giving it all to row 3.
+One-line fix (dropped the stray row-2 weight).
+
+**Narrator investigation — root-caused, not just relayed:** rather than keep going back and forth
+on what Narrator did or didn't say, queried the live running app's actual accessibility trees
+directly via a throwaway read-only script (`comtypes`, both `IUIAutomation` and legacy
+`IAccessible`/`AccessibleChildren` — no clicks, no state changes, window handle found via
+`EnumWindows` while Mark had the window open). Result: **both APIs expose zero real application
+content.** UIA's entire Tk client area is two unnamed, childless elements. MSAA returns nothing
+under any window but generic Windows-supplied chrome (title bar, scrollbars), recursively
+duplicated, confirmed by filtering all of that out of an 864-line, depth-8 dump of the whole tree
+and finding one unnamed leftover "graphic" element and nothing else. This means whatever handful
+of items Narrator *did* announce (app title, tagline, three Library-page buttons, Apply, two
+dropdowns) was not coming from either accessibility API at all — most likely Narrator's own
+fallback of reading a focused window's raw caption text, which depends on incidental per-widget
+construction internals rather than any real contract, and is not something fixable from
+application code. Recorded as a toolkit limitation for Narrator scan mode as a whole in
+`VERIFICATION.md`, with the full evidence trail, not a vague "some things didn't work."
+
+**Result of the pass so far:** Tab order/focus — pass. Contrast (high-contrast honour switches to
+system tokens and back correctly; Light/Dark text-on-fill readability) — pass. Multi-DPI —
+`--selftest` numbers recorded for this machine (96 DPI, Tk scaling 1.333 at 100% Windows scaling);
+the 125%/150%/200% scaling clipping check was **not run** — Mark stopped here for the night
+(2:15am UK time). All commits pushed to `origin/main`. Next session: run the remaining scaling
+check to close v1.8.1 out.

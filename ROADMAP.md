@@ -230,11 +230,29 @@ preference, because `ctk.set_appearance_mode("dark")` was hardcoded before confi
 re-applied at startup (only on an explicit dropdown change). Folded into `_apply_appearance_mode`,
 called once after config load and again on every appearance change.
 
-## v1.8.1 — Accessibility verification gate
+## v1.8.1 — Accessibility verification gate 🔶 In progress (started 2026-09-10)
 
-No feature work if v1.8's tab-order/contrast/DPI groundwork lands cleanly. Mark (or a designated
-tester) runs the `VERIFICATION.md` Narrator script on real Windows 11 — Light/Dark, 100%/150%
-scaling. Outcomes recorded as pass / fail / toolkit-limitation; a fake pass is never recorded.
+Mark ran the `VERIFICATION.md` script on this dev machine (Windows 11 Home 10.0.26100) on
+2026-09-10. Full results and evidence are in `VERIFICATION.md`'s Narrator section and Outcomes
+table; summary:
+
+| Check | Result |
+| :--- | :--- |
+| Tab order & focus | ✅ Pass |
+| Narrator scan mode | 📋 Toolkit limitation — **root-caused, not just observed.** A direct UIA/MSAA query against the live running app (read-only COM calls) found both accessibility APIs expose zero real application content — Tk/CustomTkinter provides no accessible tree at all for this app, not an incomplete one. Whatever Narrator did announce is not coming from either API and can't be made consistent from application code. |
+| Contrast (high-contrast honour + Light/Dark readability) | ✅ Pass |
+| Multi-DPI — `--selftest` per-monitor DPI + Tk scaling | ✅ Recorded (96 DPI, Tk scaling 1.333 at this machine's 100% scaling) |
+| Multi-DPI — 125%/150%/200% Windows scaling, check nothing clips at 980×560 | ⏳ **Not yet run** — deferred, next session |
+
+**Bugs found and fixed along the way (both pushed to `origin/main`):**
+- Launch-crashing bug: `DesktopVista._apply_appearance_mode()` (added for this same v1.8.1 prep)
+  collided with a real CustomTkinter internal method of the same name, crashing on first launch.
+  Renamed to `_apply_ui_appearance_mode`.
+- Sidebar layout bug (pre-existing, unrelated to v1.8): the nav-button row and the scrollable page
+  content row both had grid stretch weight, opening a visible gap between them. Fixed.
+
+**Next session:** run the 125/150/200% Windows-scaling clipping check to close this out
+completely — that's the only remaining item.
 
 ## v2.0 — "One Perfect View" (display rewrite)
 
