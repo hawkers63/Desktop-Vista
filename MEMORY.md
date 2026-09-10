@@ -622,3 +622,46 @@ available on this machine. Nothing further to build on the current five-release 
 hardware gate lifts. The `--selftest` DPI-probe-ordering bug (`enumerate_monitor_dpi()` called
 before `ctk.CTk()` exists, so it always reads the 96 DPI/100% default at any scaling) is still
 open as a standalone follow-up, independent of the gate.
+
+**Same session, ROADMAP.md status tables found stale** (still showed v1.8.1 as "Blocked"/"In
+progress" — an oversight, the earlier v1.8.1-closure commit only touched `docs/VERIFICATION.md`
+and this file). Corrected in a follow-up commit: v1.8.1 → Done throughout, DPI checklist row →
+Pass.
+
+## 2026-09-10 (continued) — Help section + packaging raised; v2.0 deferred by decision; v1.9 scoped
+
+**Context:** After v1.8.1 closed, Mark raised three things in the same session: (1) while testing
+the interface, concluded a Help/Instructions section explaining the controls would be useful; (2)
+eventually wants to package the app as something his brother can run — an installer or a `.zip` —
+since his brother's machine won't have Python installed; (3) wants v2.0 (dual-monitor) deferred
+ahead of that packaging work, explicitly because neither Mark's dev machine nor his/his family's
+actual-use machines have dual-monitor access — this isn't just the existing hardware gate, it's a
+deliberate deprioritization independent of whether that gate ever lifts.
+
+**Packaging discussion — clarified before concluding anything:** checked `build_exe.spec` first
+rather than assuming — `DesktopVista.exe` is already a PyInstaller **single-file** build, fully
+self-contained (no separate Python needed on the target machine). Mark then clarified his brother
+hasn't tried it yet and isn't expecting it for a couple of weeks — this is forward planning, not a
+live bug report. Recommended, and Mark accepted deferring: a plain `.zip` of the existing portable
+exe as the near-zero-cost first step (extract-and-run, no installer), with an Inno Setup installer
+(Start Menu entry, uninstaller) as a later option only if he wants that polish. Not yet
+investigated: whether an unsigned exe trips Windows SmartScreen on a machine that's never seen it
+— flagged as worth testing before assuming either route is friction-free. **Deliberately not
+scheduled into any release** — written into `ROADMAP.md`'s new "Distribution / packaging" section
+as background to revisit when Mark actually hands a build to his brother.
+
+**Scope written up, not started:** `ROADMAP.md` now has a new proposed **v1.9 "Help & polish"**
+section between v1.8.1 and v2.0, combining Mark's Help-section ask with the small pool of
+non-gated polish items notes_009 (Kevin) and notes_010 (Lynda, just synced this session) both
+independently proposed as ready-now work: the Help panel itself and the `--selftest` DPI-ordering
+fix are listed as confirmed/confirmed-worthy; a bounded LRU preview cache (repeatedly deferred
+since notes_004/v1.2.1, never landed), hotkey conflict-toast surfacing, and a `--solar-phase`
+diagnostic flag are listed as candidates, not yet committed. **Mark asked to save this scope and
+take time to consider which candidate items to include before starting anything** — no
+implementation done this pass, this is a planning/documentation checkpoint only.
+
+**v2.0 section in ROADMAP.md updated** to "⏸ Deferred by decision" (was "⏳ Blocked") with the
+reasoning above; the full technical spec stays intact for whenever it's revisited.
+
+**Resume point:** wait for Mark's decision on v1.9's scope (which candidate items, if any, beyond
+the two confirmed ones) before starting implementation.

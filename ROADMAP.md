@@ -198,13 +198,16 @@ gated plans:
 | Release | Theme | Readiness |
 | :--- | :--- | :--- |
 | **v1.8** | Leftover closure (single pipeline) | ✅ Done (2026-09-10) |
-| **v1.8.1** | Accessibility verification gate | ⏳ Blocked — needs Mark + real Narrator on Windows 11 |
-| **v2.0** | "One Perfect View" display rewrite | ⏳ Blocked — needs 2+ physical displays + a dock/undock cycle |
+| **v1.8.1** | Accessibility verification gate | ✅ Done (2026-09-10) |
+| **v1.9** *(proposed)* | Help/Instructions section + small single-pipeline polish | 📋 Proposed 2026-09-10 — scope written up below, Mark reviewing before committing |
+| **v2.0** | "One Perfect View" display rewrite | ⏸ **Deferred by decision, 2026-09-10** — not just hardware-blocked: Mark confirmed neither his dev machine nor his and his family's actual-use machines have dual-monitor access, so this is intentionally not next in line even if the hardware gate were lifted. Revisit only if that changes. |
 | **v2.1** | Intelligence & scale | ⏳ Blocked — depends on v2.0's assignment model existing |
 | **Future / research gate** | dhash/ONNX saliency, extra cloud feeds, per-monitor fullscreen, desktop crossfade | ⏳ Blocked — sequenced after v2.1, some items may never ship (see notes_007 §2 "Deliberate non-features") |
 
-Only v1.8 is unblocked by anything other than engineering time, so it's the release under
-active development this session.
+v1.9 is the only release unblocked by anything other than engineering time and Mark's go-ahead on
+scope — it's the proposed candidate for active development once he's reviewed it. See "Distribution
+/ packaging" below for the installer/zip question, which is deliberately not tied to any specific
+release — it's needed whenever Mark actually shares a build with his brother, not before.
 
 ## v1.8 — Leftover closure (single pipeline) ✅ Done (2026-09-10)
 
@@ -230,7 +233,7 @@ preference, because `ctk.set_appearance_mode("dark")` was hardcoded before confi
 re-applied at startup (only on an explicit dropdown change). Folded into `_apply_appearance_mode`,
 called once after config load and again on every appearance change.
 
-## v1.8.1 — Accessibility verification gate 🔶 In progress (started 2026-09-10)
+## v1.8.1 — Accessibility verification gate ✅ Done (2026-09-10)
 
 Mark ran the `docs/VERIFICATION.md` script on this dev machine (Windows 11 Home 10.0.26100) on
 2026-09-10. Full results and evidence are in `docs/VERIFICATION.md`'s Narrator section and Outcomes
@@ -242,7 +245,7 @@ table; summary:
 | Narrator scan mode | 📋 Toolkit limitation — **root-caused, not just observed.** A direct UIA/MSAA query against the live running app (read-only COM calls) found both accessibility APIs expose zero real application content — Tk/CustomTkinter provides no accessible tree at all for this app, not an incomplete one. Whatever Narrator did announce is not coming from either API and can't be made consistent from application code. |
 | Contrast (high-contrast honour + Light/Dark readability) | ✅ Pass |
 | Multi-DPI — `--selftest` per-monitor DPI + Tk scaling | ✅ Recorded (96 DPI, Tk scaling 1.333 at this machine's 100% scaling) |
-| Multi-DPI — 125%/150%/200% Windows scaling, check nothing clips at 980×560 | ⏳ **Not yet run** — deferred, next session |
+| Multi-DPI — 125%/150%/200% Windows scaling, check nothing clips at 980×560 | ✅ Pass — 125% verified interactively, 150%/200% verified by Mark solo (sign-out required for custom scaling on this display); no clipping at any scale |
 
 **Bugs found and fixed along the way (both pushed to `origin/main`):**
 - Launch-crashing bug: `DesktopVista._apply_appearance_mode()` (added for this same v1.8.1 prep)
@@ -251,15 +254,44 @@ table; summary:
 - Sidebar layout bug (pre-existing, unrelated to v1.8): the nav-button row and the scrollable page
   content row both had grid stretch weight, opening a visible gap between them. Fixed.
 
-**Next session:** run the 125/150/200% Windows-scaling clipping check to close this out
-completely — that's the only remaining item.
+**v1.8.1 is fully closed.** Next gate is v2.0, blocked on hardware (see below). One independent,
+non-gated follow-up remains open: `run_selftest()` calls `enumerate_monitor_dpi()` before
+`ctk.CTk()` exists, so its "Per-monitor DPI" line always reads the 96 DPI/100%-scaling default
+regardless of the real Windows scaling setting — not a v1.8.1 blocker (the real clipping check
+was verified by eye/hand, not via `--selftest`), just an inaccurate diagnostic worth fixing
+separately.
 
-## v2.0 — "One Perfect View" (display rewrite)
+## v1.9 — Help & polish 📋 Proposed (2026-09-10, not started — scope under Mark's review)
+
+Mark asked for a Help/Instructions section after testing the interface; separately, both notes_009
+(Kevin) and notes_010 (Lynda) independently proposed the same small pool of non-gated,
+single-pipeline polish items as ready-now "v1.8 polish"/"v1.9" work, since nothing on the v2.0+
+path can proceed without dual-monitor hardware. Combining both into one proposed release rather
+than scattering them:
+
+| Priority | Item | Source | Notes |
+| :---: | :--- | :--- | :--- |
+| Confirmed | Help / Instructions panel — explains the nav rail, HUD buttons (Prev/Random/Next/Favourite/Hide/Tags/More), and hotkeys | Mark, 2026-09-10 | Mirror the existing "Local shortcut reference (?)" pattern on the Settings page rather than inventing a new UI idiom |
+| Confirmed-worthy | Fix `run_selftest()`'s DPI-probe ordering (`enumerate_monitor_dpi()` runs before `ctk.CTk()` exists, so it always reads the 96 DPI/100% default at any real Windows scaling) | Found during v1.8.1 walkthrough | Small, already root-caused; call `SetProcessDpiAwareness`/construct the probe root first |
+| Candidate | Bounded LRU preview cache (byte-budgeted, workers publish data / Tk polls) | notes_004 → notes_005 (v1.6) → notes_009 ("v1.9, Next") → notes_010 | Repeatedly deferred since v1.2.1 without ever landing; real benefit is bounding memory/decode work under rapid navigation |
+| Candidate | Hotkey rebind UI / conflict-toast deepening | notes_009, notes_010 | v1.6 already detects and logs a conflicting hotkey registration (found live against `Win+Alt+F`); this would surface it to the user instead of only the log |
+| Candidate | `--solar-phase` diagnostic CLI flag | notes_009, notes_010 | Small; prints the current computed solar phase for troubleshooting schedule mode |
+
+**Not yet committed to a scope** — Mark is taking time to consider before picking which of the
+candidate rows (if any) to include alongside the two confirmed items. No implementation started.
+
+## v2.0 — "One Perfect View" (display rewrite) ⏸ Deferred by decision (2026-09-10)
 
 See "Beyond this window — v2.0" below for the full item list and exit criteria. Non-negotiable
 prerequisites: a machine with 2+ physical displays attached, at least one dock/undock or Win+P
 cycle during verification, and `ApplyQueue` landed before any UI claims "Applying…". Extracts
 `playback.py` (PlaybackController) and `displays.py` (topology join, fingerprinting, span slicer).
+
+**Deferred, not just blocked:** Mark confirmed 2026-09-10 that his own dev machine and the
+machine(s) he and his family actually use are all single-display, so this milestone is
+intentionally not queued as "next once hardware becomes available" — it stays fully specified
+below for whenever that changes, but v1.9 (or whatever Mark scopes next) takes priority
+regardless of gate status.
 
 ## v2.1 — Intelligence and scale
 
@@ -316,6 +348,26 @@ Shipped ahead of the full milestone, gated behind `wallpaper_target: "com"` (def
 - SQLite catalogue, weather bias, accent-colour sync, curation (focal crop/dedupe/EXIF), curated feeds — all scoped to **v2.1** in notes_005, deliberately after v2.0 since a catalogue's `display_assignments` table would encode a fiction before per-monitor assignment exists.
 
 ---
+
+## Distribution / packaging — in due course, not yet scheduled
+
+Mark wants to give his brother a copy and asked how it might be packaged: a real installer, or a
+`.zip` of the portable build. Discussed 2026-09-10, deliberately not tied to any release above —
+his brother hasn't tried the app yet and isn't expecting it for a couple of weeks, so this is
+background context to revisit when it's actually needed, not a queued task.
+
+- `DesktopVista.exe` (`build_exe.spec`) is already a PyInstaller **single-file** build — the
+  Python interpreter and every dependency are bundled in; a target machine needs no separate
+  Python install.
+- **Recommended first step, near-zero cost:** just zip the existing exe (+ maybe a short README).
+  Extract-and-run, no installer needed. Sufficient for handing to one family member.
+- **If more polish is wanted later** (Start Menu entry, optional desktop shortcut, clean uninstall
+  via Add/Remove Programs): wrap the existing exe with **Inno Setup** — free, standard for exactly
+  this case, doesn't require rewriting anything, a few hours of work.
+- Not yet investigated: whether an unsigned exe trips Windows SmartScreen on a machine that's never
+  seen it before (common false "something's missing" impression for a non-technical user) — worth
+  a real test on his brother's machine (or a clean VM) before assuming either the zip or the
+  installer route is friction-free.
 
 ## Notes
 
