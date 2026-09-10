@@ -8,7 +8,7 @@
 # See the LICENSE file in the project root for the full proprietary notice.
 """
 Desktop Vista  —  All my drives. One perfect view.
-Version 1.7  (September 2026)
+Version 1.8  (September 2026)
 
 A lightweight Windows wallpaper manager.
 
