@@ -17,7 +17,7 @@ The Agent 1 brief (and notes_002’s original matrix) still describes historical
 | `APP_VERSION` | **1.8** |
 | Main module | `desktop_vista.py` ≈ **4301** lines |
 | Companion modules | `hotkeys.py`, `ipc.py`, `schedule.py`, `ui_components.py`, `windows_wallpaper_com.py` |
-| Tests | `test_desktop_vista.py`, `test_hotkeys.py`, `test_ipc.py`, `test_schedule.py` |
+| Tests | `tests/test_desktop_vista.py`, `tests/test_hotkeys.py`, `tests/test_ipc.py`, `tests/test_schedule.py` |
 | Shell | Four-page nav (Library / Playback / Displays / Settings) since **v1.7** |
 | Wallpaper default | `"wallpaper_target": "spi"` — COM is **opt-in**, not default |
 
@@ -443,7 +443,7 @@ Do **not** invent renames (`blacklist` → keep `hidden`; `sources` → keep `pl
 3. Confirm About four-liner + licence notice + tray About → Settings.  
 4. Confirm Displays page: read-only topology, unresolved labels; **no** clickable assign.  
 5. Confirm accessibility honesty: tab order, icon text equivalents, `SPI_GETHIGHCONTRAST`, `--selftest` DPI output; **no** toast “Narrator mode”.  
-6. Document real Narrator steps in `VERIFICATION.md` when hardware AT testing is available.
+6. Document real Narrator steps in `docs/VERIFICATION.md` when hardware AT testing is available.
 
 ### Next — single-display (v1.9 UX polish)
 

@@ -19,7 +19,7 @@ The topology canvas and COM picker represent separate identity spaces. Merging t
 **Narrator**  
 Refrain from simulation.
 
-CustomTkinter is built on Tk and does not feature a complete UIA tree. A toast-based “Narrator mode” would misrepresent the functionality. Version 1.8 can enhance non-AT capabilities: adjust tab order, ensure no focus interruptions on grid_removed pages, provide text equivalents for icon-only controls, respect SPI_GETHIGHCONTRAST, and output per-monitor DPI from --selftest. Include a genuine Narrator script in VERIFICATION.md for hardware testing. Document the limitations of the toolkit as failures, rather than as misleading providers.
+CustomTkinter is built on Tk and does not feature a complete UIA tree. A toast-based “Narrator mode” would misrepresent the functionality. Version 1.8 can enhance non-AT capabilities: adjust tab order, ensure no focus interruptions on grid_removed pages, provide text equivalents for icon-only controls, respect SPI_GETHIGHCONTRAST, and output per-monitor DPI from --selftest. Include a genuine Narrator script in docs/VERIFICATION.md for hardware testing. Document the limitations of the toolkit as failures, rather than as misleading providers.
 
 **About**  
 The settings already feature the heading.

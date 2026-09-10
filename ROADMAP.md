@@ -220,7 +220,7 @@ map, and anything else that belongs to v2.0+ (notes_007 §6.5).
 | P1/P2 | Playlist/collection `EditorSheet` + `TagSelector` reuse + playlist "Browse…" + live match-count + inline validation | ✅ Done |
 | Low | About/copyright block on Settings + tray "About Desktop Vista…" entry | ✅ Done |
 | Med | Read-only topology: session RECT join (`join_monitor_topology`) for display labels, unresolved (ambiguous) displays flagged — still no click handler | ✅ Done |
-| Med | Keyboard tab-order audit + `SPI_GETHIGHCONTRAST` honour + `--selftest` DPI dump + Narrator test script written into `VERIFICATION.md` | ✅ Done — tab order audited via a standalone Tk traversal probe (no code change needed, see `VERIFICATION.md`); high-contrast honour and per-monitor DPI dump implemented; Narrator/contrast/multi-DPI hardware pass itself is v1.8.1 |
+| Med | Keyboard tab-order audit + `SPI_GETHIGHCONTRAST` honour + `--selftest` DPI dump + Narrator test script written into `docs/VERIFICATION.md` | ✅ Done — tab order audited via a standalone Tk traversal probe (no code change needed, see `docs/VERIFICATION.md`); high-contrast honour and per-monitor DPI dump implemented; Narrator/contrast/multi-DPI hardware pass itself is v1.8.1 |
 
 **Exit criteria (all met):** 171/171 tests passing (was 152); `APP_VERSION` → `"1.8"`.
 
@@ -232,8 +232,8 @@ called once after config load and again on every appearance change.
 
 ## v1.8.1 — Accessibility verification gate 🔶 In progress (started 2026-09-10)
 
-Mark ran the `VERIFICATION.md` script on this dev machine (Windows 11 Home 10.0.26100) on
-2026-09-10. Full results and evidence are in `VERIFICATION.md`'s Narrator section and Outcomes
+Mark ran the `docs/VERIFICATION.md` script on this dev machine (Windows 11 Home 10.0.26100) on
+2026-09-10. Full results and evidence are in `docs/VERIFICATION.md`'s Narrator section and Outcomes
 table; summary:
 
 | Check | Result |

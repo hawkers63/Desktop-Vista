@@ -402,7 +402,7 @@ What only real AT can verify (v1.8.1 gate, Mark or a designated tester)
 Limitation: we will not reach "Narrator certified" on CustomTkinter this
 year. The honest product stance is: keyboard-complete, contrast-aware,
 screen-reader-best-effort, with a written test script Mark runs once on
-his hardware. Publish the script in VERIFICATION.md; do not add a fake
+his hardware. Publish the script in docs/VERIFICATION.md; do not add a fake
 pass to ROADMAP.md.
 
 1.5 About / copyright disclosure
@@ -1044,7 +1044,7 @@ That dual-write is the actual zero-data-loss guarantee.
        Exit: unit tests for two-monitor, negative origin, clone
        (ambiguous = unresolved). No click handler.
     7. Tab-order audit + SPI_GETHIGHCONTRAST honour + --selftest DPI
-       dump. Write the Narrator script into VERIFICATION.md.
+       dump. Write the Narrator script into docs/VERIFICATION.md.
        Exit: script exists; we do not tick "Narrator verified".
 
     Regression bar: 152 existing tests remain green, plus the new
@@ -1052,7 +1052,7 @@ That dual-write is the actual zero-data-loss guarantee.
 
 6.2 v1.8.1 — Accessibility gate
 
-    Mark (or a designated tester) runs VERIFICATION.md's Narrator
+    Mark (or a designated tester) runs docs/VERIFICATION.md's Narrator
     script on real Windows 11 with Narrator, Light and Dark, at 100%
     and 150%. Outcomes are recorded as pass / fail / toolkit-limitation.
     Failures that are ours (missing names, focus traps, contrast) come
@@ -1060,7 +1060,7 @@ That dual-write is the actual zero-data-loss guarantee.
     blank UIA tree are documented as limitations, not fixed with a
     fake provider.
 
-    Exit: a written record in VERIFICATION.md, not a ROADMAP green
+    Exit: a written record in docs/VERIFICATION.md, not a ROADMAP green
     tick that says "accessible".
 
 6.3 v2.0 — One Perfect View
@@ -1149,7 +1149,7 @@ Leave item 6 (joined topology labels) for the start of the v2.0 branch
 if time is short — it is the only v1.8 item that touches identity, and
 identity work has a habit of becoming the display rewrite by accident.
 
-Leave item 7 (a11y prep + VERIFICATION.md script) as the last commit of
+Leave item 7 (a11y prep + docs/VERIFICATION.md script) as the last commit of
 the sitting so the Narrator gate has a script waiting for Mark, not a
 promise that we already ran one.
 

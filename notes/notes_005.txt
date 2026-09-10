@@ -1381,7 +1381,7 @@ The collection-restore defect plus every feature that does not need a second mon
 | 5 | Per-monitor crop preview | Selecting the portrait card previews that ratio. Fit style still labelled global. |
 | 6 | Assignments persisted | Restart restores per-display sources, indices, shuffle decks, intent. SPI remains compiled in and selectable. |
 
-**Hardware lab (blocking):** ≥2 displays, mixed DPI if available, one portrait if available, one dock/undock laptop if this is still Mark's machine class. Record the session in `VERIFICATION.md`. Without that record, do not flip `wallpaper_target` default to `"com"`.
+**Hardware lab (blocking):** ≥2 displays, mixed DPI if available, one portrait if available, one dock/undock laptop if this is still Mark's machine class. Record the session in `docs/VERIFICATION.md`. Without that record, do not flip `wallpaper_target` default to `"com"`.
 
 **v2.0 non-goals:** SQLite, weather, accent, lock screen, feeds, ONNX.
 
@@ -1392,7 +1392,7 @@ The collection-restore defect plus every feature that does not need a second mon
 | 1 | SQLite catalogue + v1.5 JSON migration | A 1.5 config with two drives, tags, a playlist, a collection, favourites and hidden migrates; backup preserved; restart lists the same images; killing the app mid-migration leaves JSON intact. A 10k-image fixture filters a boolean collection in < 50 ms. |
 | 2 | Weather bias (Open-Meteo) | Forced `weather_code=61` with `#rain` tags present draws rain; with none, unfiltered. Airplane mode uses cache. |
 | 3 | Accent sync opt-in | Enable, apply a strongly-coloured image, confirm DWM colour changes *or* honestly report that Win11 ignored it. Disable restores the previous accent. |
-| 4 | Lock-screen spike | A written go/no-go in notes (or VERIFICATION.md) from the frozen unpackaged host. Ship the command only on go. |
+| 4 | Lock-screen spike | A written go/no-go in notes (or docs/VERIFICATION.md) from the frozen unpackaged host. Ship the command only on go. |
 | 5 | Entropy focal crop + resolution down-rank + dhash duplicates + EXIF panel | Portrait assignment of a 16:9 face-heavy image keeps the face. Duplicates view never deletes. GPS "Show on Map" opens OSM. |
 | 6 | Bing Daily feed + 2 GB / 30-file quota | One fetch, appears as a source, offline plays the cache, purge skips favourites. |
 | 7 | Battery throttle option | On battery, not Battery Saver: interval × N (default 2), user-configurable. Battery Saver still pauses. |
@@ -1427,7 +1427,7 @@ Windows integration (disposable profile, never Mark's real wallpaper without res
 
 ## 6. Review completion record
 
-Inspected for this pack: `desktop_vista.py` v1.5.1 (DEFAULT_CONFIG, `_validate_config`, `resolve_source_images`, slideshow/pause, COM apply path, monitor enumeration, solar model), `windows_wallpaper_com.py` (STA, `SetPosition` global, device-path volatility), `config.example.json`, `ROADMAP.md`, `MEMORY.md`, `notes/notes_001.txt`–`notes_004.txt`, `requirements.txt`, `test_desktop_vista.py` (structure), `AGENT_1_FEATURE_INNOVATION.md`.
+Inspected for this pack: `desktop_vista.py` v1.5.1 (DEFAULT_CONFIG, `_validate_config`, `resolve_source_images`, slideshow/pause, COM apply path, monitor enumeration, solar model), `windows_wallpaper_com.py` (STA, `SetPosition` global, device-path volatility), `config.example.json`, `ROADMAP.md`, `MEMORY.md`, `notes/notes_001.txt`–`notes_004.txt`, `requirements.txt`, `tests/test_desktop_vista.py` (structure), `AGENT_1_FEATURE_INNOVATION.md`.
 
 As-built defects recorded, not fixed (this is a notes pack):
 

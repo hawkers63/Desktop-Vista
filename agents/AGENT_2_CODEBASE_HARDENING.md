@@ -97,7 +97,7 @@ When executing this task, produce a structured markdown report and code updates 
      - Structured logging via Python's `logging` module.
      - Clean window teardown.
 3. **Automated Test Suite**:
-   - A comprehensive test file (e.g., `test_desktop_vista.py`) using `unittest` or `pytest` that validates:
+   - A comprehensive test file (e.g., `tests/test_desktop_vista.py`) using `unittest` or `pytest` that validates:
      - Config loading, corruption recovery, and atomic saving.
      - Image list sorting and error resilience on missing paths.
      - Transcode cache behavior for WebP.

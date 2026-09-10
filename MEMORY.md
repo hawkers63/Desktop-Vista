@@ -270,7 +270,7 @@ change the actual wallpaper):**
   instead of trying to marshal onto a Tk thread that's mid-shutdown).
 
 148/148 tests passing (up from 96 at the start of this session), across
-`test_desktop_vista.py`, `test_schedule.py`, `test_ipc.py`, `test_hotkeys.py`.
+`tests/test_desktop_vista.py`, `tests/test_schedule.py`, `tests/test_ipc.py`, `tests/test_hotkeys.py`.
 `--selftest` extended to cover mutex/pipe/hotkey/solar fixtures.
 APP_VERSION bumped to "1.6".
 
@@ -487,7 +487,7 @@ full, across four commits (`d6f8f87`..`df2328c`).
   script) confirmed `tk_focusNext` already excludes `grid_remove()`'d and `place_forget()`'d
   widgets via `winfo_ismapped()` — hidden pages/overlays cannot become focus stops, and no code
   change was needed for the thing notes_007 flagged. Full Narrator/contrast/multi-DPI script
-  written into `VERIFICATION.md` for the v1.8.1 hardware gate — not run this session (needs real
+  written into `docs/VERIFICATION.md` for the v1.8.1 hardware gate — not run this session (needs real
   AT and a human).
 
 **Not done live this session, by design:** did not construct a real `DesktopVista()` against a
@@ -510,7 +510,7 @@ send `DesktopVista.exe`. Built, `--selftest`-verified against the frozen build, 
 
 ## 2026-09-10 (continued) — v1.8.1 walkthrough started; two bugs found and fixed
 
-**Context:** Mark asked to start v1.8.1 and walk through the `VERIFICATION.md` Narrator script
+**Context:** Mark asked to start v1.8.1 and walk through the `docs/VERIFICATION.md` Narrator script
 together, section by section, reporting results back after each one.
 
 **Launch crash, found immediately:** Mark tried to launch the freshly-sent `DesktopVista.exe` and
@@ -548,7 +548,7 @@ dropdowns) was not coming from either accessibility API at all — most likely N
 fallback of reading a focused window's raw caption text, which depends on incidental per-widget
 construction internals rather than any real contract, and is not something fixable from
 application code. Recorded as a toolkit limitation for Narrator scan mode as a whole in
-`VERIFICATION.md`, with the full evidence trail, not a vague "some things didn't work."
+`docs/VERIFICATION.md`, with the full evidence trail, not a vague "some things didn't work."
 
 **Result of the pass so far:** Tab order/focus — pass. Contrast (high-contrast honour switches to
 system tokens and back correctly; Light/Dark text-on-fill readability) — pass. Multi-DPI —
