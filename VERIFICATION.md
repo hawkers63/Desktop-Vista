@@ -85,6 +85,34 @@ For each: does Narrator announce a sensible name and role? Record pass / fail / 
 limitation" (Tk/CTk exposes nothing meaningful here) — a toolkit limitation is not a bug to fix
 with a fake provider, it's a documented boundary.
 
+**Result, 2026-09-10 (Mark, this dev machine, Windows 11):** Apply, the Source menu, Hide,
+Favourite, Tags, Hidden Items' Unhide/Reveal/Remove missing, and Start/Stop Slideshow were all
+silent — including Start/Stop Slideshow with genuine Win32 keyboard focus on it (not just
+Narrator's scan cursor), ruling out "scan mode hasn't refreshed" as the explanation. "Fit Style"
+and "All Displays" (both `CTkOptionMenu`) did announce. A small, seemingly arbitrary set of
+Library-page items also announced (app title, tagline, Hidden Items, New Playlist, New
+Collection) despite being built identically (plain `ctk.CTkButton`) to items that didn't.
+
+**Root-caused, not just observed:** queried this app's live window directly with both the modern
+UI Automation API (`IUIAutomation`) and the legacy MSAA API (`IAccessible`/`AccessibleChildren`)
+via a throwaway read-only script (COM calls only — no clicks, no state changes). Findings:
+- UIA: the entire Tk client area is exactly two unnamed, childless elements. No widget, page, or
+  piece of text is exposed this way at all.
+- MSAA: every child window returns only the generic default Windows window-chrome Windows
+  synthesizes automatically for any window (title-bar buttons, scrollbars) — recursively
+  duplicated, and otherwise empty. Filtering that boilerplate out of an 864-line, depth-8 dump of
+  the *entire* window left a single unnamed "graphic" element and nothing else.
+
+Conclusion: neither accessibility API exposes any real application content. **Tk/CustomTkinter
+provides no accessible tree for this app to hook into, full stop** — not "an incomplete one," an
+empty one. Whatever Narrator announced was not coming from either API; it is almost certainly
+Narrator's own fallback of reading a focused window's raw caption text for specific HWNDs, which
+depends on incidental internals of how each widget happens to be constructed rather than any
+documented contract. This cannot be made consistent from application code — there is no
+accessibility surface underneath to attach a fix to, and the project has already (correctly)
+ruled out building a fake UIA provider to simulate one. Recorded as **toolkit limitation** for
+Narrator scan mode as a whole, not a per-control defect list.
+
 ### Contrast
 
 - [ ] Turn on Windows high contrast (Settings → Accessibility → Contrast themes). The app should
@@ -107,7 +135,7 @@ with a fake provider, it's a documented boundary.
 
 | Date | Tester | Windows build | Narrator scan mode | Contrast | Multi-DPI | Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| | | | | | | |
+| 2026-09-10 | Mark | Windows 11 Home 10.0.26100 | Toolkit limitation (root-caused via direct UIA/MSAA query — see above) | Pending | Pending | Tab order/focus (§ above): pass |
 
 ## Linux / CI note
 
