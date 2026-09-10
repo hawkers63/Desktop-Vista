@@ -1,0 +1,658 @@
+================================================================================
+Desktop Vista — Next-Gen Architecture Pack (notes_010)
+================================================================================
+Author:     Lynda, Principal Systems Architect (Desktop Vista / Hawkeye)
+Date:       10 September 2026 (Europe/London)
+Status:     Design-only — do NOT edit application code, config.json, ROADMAP.md,
+            MEMORY.md, or other notes. Do NOT create repo-root files.
+Position:   Successor architecture pack to notes_001–009. Does not replace them.
+Scope:      POST-v1.8 / v2.0+ advanced tracks, grounded in the live tree on
+            D:\Desktop_Vista as of this writing. British English throughout.
+
+House rules (binding, carried from notes_007 / notes_008 / notes_009):
+  • Tk owns the UI thread; workers publish plain data only.
+  • One wallpaper authority — never IDesktopWallpaper's slideshow APIs.
+  • SetPosition is global; per-monitor crop must be pre-rendered.
+  • COM device paths are session-ephemeral — never primary keys.
+  • On COM failure: never silent SPI fallback (would stamp every screen).
+  • No NumPy, no pywin32; no silent geolocation; no fake Narrator mode.
+  • v2.0 hardware gate: two physical displays + dock/undock (or equivalent
+    WM_DISPLAYCHANGE) before COM defaults or independent per-monitor playback.
+
+--------------------------------------------------------------------------------
+1. BASELINE CORRECTION TABLE
+--------------------------------------------------------------------------------
+
+The Agent brief that still mentions v1.0 / v1.5.1 tracks is obsolete. Live facts:
+
+| Fact                         | Observed on Hawkeye (D:\Desktop_Vista)                          |
+| :--------------------------- | :-------------------------------------------------------------- |
+| APP_VERSION                  | "1.8" (desktop_vista.py ≈ line 292)                             |
+| desktop_vista.py             | 4300 lines (incl. blanks); DesktopVista class at ≈1606          |
+| Companion modules            | hotkeys.py, ipc.py, schedule.py, ui_components.py,              |
+|                              | windows_wallpaper_com.py                                        |
+| Line counts (non-blank ≈)    | hotkeys 145 · ipc 258 · schedule 144 · COM 196 · ui 490         |
+| Shell                        | Four-page nav (Library / Playback / Displays / Settings) v1.7+  |
+| Wallpaper default            | wallpaper_target: "spi" — COM is opt-in only                    |
+| Tests                        | tests/test_desktop_vista.py, test_hotkeys.py, test_ipc.py,      |
+|                              | test_schedule.py                                                |
+| ROADMAP position             | v1.8 Done (2026-09-10); v1.8.1 a11y gate in progress;           |
+|                              | v2.0 / v2.1 blocked on hardware / prior milestone               |
+
+Already SHIPPED (do not re-propose as greenfield) — synthesised from
+notes_008, notes_009, ROADMAP.md (v1.2→v1.8), and live module headers:
+
+| Area                    | Shipped capability                                              | Where |
+| :---------------------- | :-------------------------------------------------------------- | :---- |
+| Tray / residency        | pystray, --minimized, HKCU Run, Reveal in Explorer, branded.ico | v1.2  |
+| Resilience              | Offline folder badges, skip missing, reconnect poll             | v1.2+ |
+| Shuffle / timing        | Fisher–Yates deck; interval_custom_seconds; 1 Hz scheduler;     | v1.1+ |
+|                         | daily clock-time mode                                           | v1.4  |
+| Aggregation             | Multi-source playlists, favourites/hidden, collections          | v1.3– |
+|                         | (tags_any), TagSelector                                         | 1.7   |
+| Power / context         | Battery-saver + fullscreen pause                                | v1.4  |
+| Solar (partial)         | schedule.py NOAA arithmetic; live bias via mode "solar"         | v1.6  |
+|                         | (_solar_phase_now / _solar_advance / phase_tag_matches)         |       |
+| COM path                | windows_wallpaper_com.py IDesktopWallpaper; STA thread;         | v1.5+ |
+|                         | opt-in SetWallpaper; topology strip read-only                   |       |
+| Identity join (session) | join_monitor_topology (max RECT intersection; ties → None)      | v1.8  |
+| Companion IPC           | Mutex single-instance; named-pipe IpcServer; CLI flags          | v1.6  |
+| Hotkeys                 | HotkeyListener dedicated GetMessage thread; MOD_NOREPEAT        | v1.6  |
+| History / undo          | HISTORY_MAX=100 ring in playback_state.json; tray Previous=undo | v1.6  |
+| UI rewrite              | Four-page shell; HoverHUD; ToastManager; EditorSheet; About     | v1.7– |
+|                         | (ABOUT_COPY); stage footer Apply; appearance switch             | 1.8   |
+| Curator correctness     | _rebuild_playback_after_filter_change; hide-of-applied;         | v1.8  |
+|                         | EditorSheet + TagSelector reuse (ROADMAP: Done)                 |       |
+
+Still ONE shared slideshow index. Independent per-monitor playback is not
+shipped. True dual-display COM independence is explicitly unverified
+(windows_wallpaper_com.py module docstring; ROADMAP v1.5.1 note).
+
+Conflict note vs notes_009: Kevin marked EditorSheet / hide-rebuild as
+"Partial — verify". ROADMAP.md marks both Done under v1.8 (2026-09-10) with
+171/171 tests. This pack treats ROADMAP as authoritative for SHIPPED status;
+Kevin's verify checklist remains useful QA, not a reason to re-scope builds.
+
+Mark gates (notes_008) — respected throughout this pack:
+  DO NOT propose for immediate/next session: ApplyQueue, SQLite, weather,
+  accent sync, lock screen, span slicing, clickable maps.
+  v2.0 needs hardware gate before COM defaults or Phase E interactivity.
+
+--------------------------------------------------------------------------------
+2. EXECUTIVE FUNCTIONAL MATRIX & VIABILITY ASSESSMENT
+--------------------------------------------------------------------------------
+
+Release labels used below:
+  SHIPPED          = already in v1.8 tree (not a target)
+  v1.8 polish      = single-display closeout / v1.8.1 residual (a11y DPI etc.)
+  v2.0             = dual-display hardware gate + display rewrite
+  v2.1             = catalogue / intelligence (after assignment model exists)
+  Future           = research / optional; may never ship
+
+| Feature Name                              | Subsystem        | Value/Impact | Risk/Complexity | Recommended Target |
+| :---------------------------------------- | :--------------- | :----------: | :-------------: | :----------------- |
+| Tray / residency / --minimized            | Shell            | High         | Low             | SHIPPED            |
+| Fisher–Yates + custom interval + daily    | Playback         | High         | Low             | SHIPPED            |
+| Offline badges + reconnect poll           | Resilience       | High         | Med             | SHIPPED            |
+| Playlists / favourites / hidden           | Aggregation      | High         | Med             | SHIPPED            |
+| Collections (tags_any) + TagSelector      | Organisation     | High         | Med             | SHIPPED            |
+| Battery-saver / fullscreen pause          | Power            | High         | Med             | SHIPPED            |
+| Solar data + live phase bias (shared)     | Schedule         | Med–High     | Med             | SHIPPED (partial)  |
+| COM opt-in apply (single shared index)    | Display          | High         | High            | SHIPPED (partial)  |
+| Read-only topology + unresolved labels    | Display / UX     | Med          | Low             | SHIPPED            |
+| join_monitor_topology (session)           | Display          | High         | Med             | SHIPPED            |
+| Mutex + named-pipe IPC + CLI flags        | IPC              | High         | Med             | SHIPPED            |
+| Global hotkeys (HotkeyListener)           | Input            | High         | Med             | SHIPPED            |
+| History / undo ring (100)                 | Playback         | Med          | Low             | SHIPPED            |
+| Four-page shell / HoverHUD / EditorSheet  | UI               | High         | Med             | SHIPPED            |
+| Hide rebuild / About / high-contrast hook | Curator / a11y   | High         | Med             | SHIPPED            |
+| Multi-DPI 125/150/200% clipping check     | a11y             | Med          | Low             | v1.8 polish        |
+| Bounded LRU preview cache harden          | Preview          | Med          | Med             | v1.8 polish        |
+| Hotkey rebind UI + conflict toast deepen  | Input            | Med          | Low             | v1.8 polish        |
+| IPC: --assign / --status enrichment       | IPC              | Med          | Low             | v2.0 (with multi)  |
+| Persistent monitor fingerprint (EDID…)    | Display identity | High         | High            | v2.0               |
+| Dock/undock + WM_DISPLAYCHANGE reconcile  | Display identity | High         | High            | v2.0               |
+| Clickable per-display map (Phase E)       | Display / UX     | High         | High            | v2.0               |
+| Independent per-monitor PlaybackController| Playback         | High         | High            | v2.0               |
+| ApplyQueue (COM off Tk thread)            | Display apply    | High         | High            | v2.0               |
+| COM as default wallpaper backend          | Display          | High         | High            | v2.0 (post-proof)  |
+| Panoramic span slicer                     | Display / crop   | Med–High     | High            | v2.0 (after proof) |
+| Per-display solar bias (own index)        | Schedule         | Med          | Med             | v2.0               |
+| monitor_assignments in config             | Config           | High         | Med             | v2.0               |
+| SQLite catalogue (desktop_vista.db)       | Persistence      | High         | High            | v2.1 / Future*     |
+| Weather-reactive bias (Open-Meteo)        | Schedule         | Med          | Med             | Future (Mark gate) |
+| Accent-colour sync / ambient glow         | Aesthetic        | Low–Med      | Med             | Future             |
+| Lock screen WinRT setter                  | OS integration   | Med          | High            | Future (spike)     |
+| History deepen (per-display rings)        | Playback         | Med          | Med             | v2.0               |
+| Entropy / saliency focal crop             | Curation         | Med          | High            | Future             |
+| Perceptual duplicate review (dhash)       | Curation         | Med          | Med–High        | v2.1 / Future      |
+| EXIF inspector + map (non-clickable first)| Metadata         | Med          | Med             | v2.1; map=Future   |
+| Curated feeds (Bing Daily / NASA APOD)    | Ingest           | Med          | Med             | v2.1               |
+| ONNX saliency / Unsplash / crossfade      | Research         | Var          | High            | Future             |
+| Acrylic / Mica on Tk                      | Aesthetic        | Low          | High            | DROPPED            |
+| ALL/NOT collection filters                | Catalog          | Med          | High            | Deferred (Mark)    |
+| Fake Narrator / simulated AT              | a11y             | —            | —               | DROPPED            |
+
+*SQLite: ROADMAP schedules v2.1; Mark notes_008 omits from near-term. This pack
+specs the schema (section 5) but marks implementation v2.1 / Future per Mark
+gate — do not start until v2.0 assignment model exists.
+
+--------------------------------------------------------------------------------
+3. DEEP-DIVE ARCHITECTURAL BLUEPRINTS
+--------------------------------------------------------------------------------
+
+3.1 Multi-monitor independent playback controller + state machine
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Today (v1.8): one shared index / shuffle deck / schedule clock inside
+DesktopVista. windows_wallpaper_com.py can target a monitor_id for a single
+apply, but navigation and slideshow remain global. Independence is unverified.
+
+Target (v2.0, hardware-gated): extract PlaybackController so each fingerprinted
+display owns its own deck, index, pause reasons, and optional schedule mode,
+while Tk still owns UI and a single ApplyQueue serialises COM/SPI writes.
+
+ASCII overview:
+
+  ┌──────────────── DesktopVista (Tk owner) ─────────────────┐
+  │  DisplaysPage ──► DisplayRegistry (fingerprints)         │
+  │       │                    │                             │
+  │       ▼                    ▼                             │
+  │  AssignmentMap     PlaybackHub                           │
+  │  (fp → source)        │                                  │
+  │                       ├─ Controller[fp_primary]          │
+  │                       │     state: IDLE|RUNNING|PAUSED   │
+  │                       │     images[], shuffle[], index   │
+  │                       │     history ring (per display)   │
+  │                       └─ Controller[fp_secondary] …      │
+  │                              │                           │
+  │                              ▼                           │
+  │                         ApplyQueue ──► SPI | COM STA     │
+  └──────────────────────────────────────────────────────────┘
+
+Mermaid:
+
+```mermaid
+stateDiagram-v2
+  [*] --> Idle
+  Idle --> Running: user_start / schedule_due
+  Running --> PausedBattery: battery_saver
+  Running --> PausedFullscreen: fullscreen
+  Running --> PausedUser: toggle
+  PausedBattery --> Running: saver_clear ∧ intent_running
+  PausedFullscreen --> Running: fs_clear ∧ intent_running
+  PausedUser --> Running: toggle
+  Running --> Applying: next_tick / hotkey_next
+  Applying --> Running: apply_ok
+  Applying --> Faulted: apply_fail (surface error; no SPI fallback)
+  Faulted --> Idle: user_ack
+  note right of Applying
+    ApplyQueue: one COM call at a time
+    never on Tk thread
+  end note
+```
+
+Python pattern (illustrative — extract to playback.py in v2.0):
+
+```python
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from collections import deque
+from typing import Optional
+
+class PlayState(Enum):
+    IDLE = auto()
+    RUNNING = auto()
+    PAUSED_USER = auto()
+    PAUSED_BATTERY = auto()
+    PAUSED_FULLSCREEN = auto()
+    APPLYING = auto()
+    FAULTED = auto()
+
+@dataclass
+class PlaybackController:
+    """One independent slideshow pipeline per fingerprinted display."""
+    fingerprint: str
+    images: list[str] = field(default_factory=list)
+    shuffle_order: list[int] = field(default_factory=list)
+    index: int = 0
+    state: PlayState = PlayState.IDLE
+    intent_running: bool = False  # user intent ≠ scheduled tick
+    history: deque[str] = field(default_factory=lambda: deque(maxlen=100))
+    style: str = "Fill"
+    pause_reasons: set[str] = field(default_factory=set)
+
+    def can_tick(self) -> bool:
+        return self.intent_running and not self.pause_reasons and self.images
+
+    def advance(self) -> Optional[str]:
+        if not self.can_tick():
+            return None
+        # Fisher–Yates deck already built; cursor advance mirrors v1.8
+        self.index = (self.index + 1) % len(self.images)
+        path = self.images[self.shuffle_order[self.index] if self.shuffle_order
+                           else self.index]
+        return path
+
+    def note_applied(self, path: str) -> None:
+        self.history.append(path)
+```
+
+DisplayRegistry fingerprint (never persist COM path):
+
+```python
+@dataclass(frozen=True)
+class MonitorFingerprint:
+    edid_hash: str          # empty string if EDID unavailable
+    width: int
+    height: int
+    origin_x: int
+    origin_y: int
+    is_primary: bool
+    orientation: int        # DMDO_* 
+
+    def key(self) -> str:
+        return "|".join([
+            self.edid_hash or "no-edid",
+            f"{self.width}x{self.height}",
+            f"@{self.origin_x},{self.origin_y}",
+            "P" if self.is_primary else "S",
+            str(self.orientation),
+        ])
+```
+
+Reconciliation on WM_DISPLAYCHANGE / resume / dock:
+  1. Re-enumerate GDI monitors + COM paths.
+  2. join_monitor_topology (already shipped) for session COM routing.
+  3. Match new geometry to persisted fingerprints by EDID then max RECT
+     intersection; mark unresolved rather than guessing (Mark notes_008).
+  4. Remap PlaybackController instances; never key config by COM path.
+
+Exit criterion for enabling COM default: two different images visible on two
+physical displays after a dock/undock cycle, with fingerprints stable across
+the cycle and unresolved displays labelled — not guessed.
+
+
+3.2 Global hotkey listener — deltas / hardening only
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SHIPPED: hotkeys.py HotkeyListener (dedicated thread, RegisterHotKey +
+GetMessage, MOD_NOREPEAT, conflicts list, marshal via root.after). Defaults in
+config.example.json (Win+Alt+N/P/L/H/Z/S). Win+Alt+F was swapped to L after a
+live collision (ROADMAP v1.6 note).
+
+Remaining value (v1.8 polish → v2.0):
+
+| Gap                         | Proposal                                              | Target      |
+| :-------------------------- | :---------------------------------------------------- | :---------- |
+| No in-UI rebind editor      | Settings sheet: parse_binding + live conflict probe   | v1.8 polish |
+| Multi-monitor "next which?" | When ≥2 controllers: hotkey targets focused/primary;  | v2.0        |
+|                             | optional "next on display under cursor"               |             |
+| Function keys / F13–F24     | Extend _vk_for_key deliberately (Stream Deck macros)  | v2.0        |
+| Conflict UX                 | Toast listing .conflicts on ready (already collected) | v1.8 polish |
+
+Do NOT rewrite the listener thread model. Pattern already correct:
+
+```python
+# desktop_vista.py wiring (as-built pattern — keep)
+listener = hotkeys.HotkeyListener(bindings, on_hotkey=lambda hid: 
+    self.after(0, lambda: self._on_hotkey_id(hid)))
+```
+
+Hardening only: ensure stop path posts WM_QUIT to listener thread id on
+shutdown (symmetric with ipc server stop); surface conflicts once per session.
+
+
+3.3 Solar calculation + time-of-day scheduler — remaining wiring
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SHIPPED (schedule.py + desktop_vista):
+  • Pure NOAA-style solar_phase_boundaries / current_phase / next_boundary
+  • PHASE_TAG_ALIASES + phase_tag_matches
+  • Config: solar.enabled, latitude, longitude, fallback_times
+  • schedule.mode in {interval, daily, solar}
+  • _solar_phase_now / _solar_advance bias the SINGLE shared pipeline
+  • UI: solar switch + lat/lon entry on Playback/Settings
+  • No network, no silent geolocation (module docstring)
+
+Remaining (deepen, do not rebuild):
+
+```mermaid
+flowchart TD
+  Tick[1 Hz scheduler tick] --> Mode{schedule.mode}
+  Mode -->|interval| Due1[interval due?]
+  Mode -->|daily| Due2[next_daily_trigger]
+  Mode -->|solar| Phase[current_phase lat/lon/fallback]
+  Phase --> Bias[_solar_advance: prefer phase-tagged images]
+  Bias --> Shared[Shared index today]
+  Shared -.->|v2.0| PerDisp[Per-display Controller.advance]
+  Due1 --> Shared
+  Due2 --> Shared
+```
+
+Blueprint deltas:
+  1. v1.8 polish: when solar.enabled but coords null, keep fallback_times path
+     (already); add Settings copy that coords are explicit / never auto-GPS.
+  2. v2.0: each PlaybackController may opt into solar bias independently
+     (laptop lid vs external "always day gallery") — same schedule.py functions,
+     different images[] / tags context.
+  3. Future: weather bias layers ON TOP of phase (never replaces solar); see §2.
+  4. Polar day/night: _sun_times returns None — already handled via fallback;
+     document in VERIFICATION when testing high latitudes.
+
+Do NOT add ApplyQueue solely for solar; solar only chooses the next path.
+
+
+3.4 Single-instance Named Pipe IPC — gaps / Stream Deck CLI surface
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+SHIPPED (ipc.py):
+  • try_become_primary / release_primary (Local\DesktopVista.SingleInstance)
+  • IpcServer thread; owner-only SDDL; PIPE_REJECT_REMOTE_CLIENTS
+  • newline JSON request/reply; marshal via caller; DISPATCH_TIMEOUT_S=8
+  • cli_payload flags: --next --prev --pause --resume --toggle --status
+    --favourite --hide --undo --set <path>
+
+Gaps worth closing (not a rewrite):
+
+| Command / gap        | Rationale                                      | Target |
+| :------------------- | :--------------------------------------------- | :----- |
+| --status enrichment  | Return version, phase, per-display paths,      | v2.0   |
+|                      | pause_reasons, wallpaper_target                |        |
+| --assign fp path     | Stream Deck: pin image to fingerprinted display| v2.0   |
+| --next --display fp  | Target a controller without focusing UI        | v2.0   |
+| --solar-phase        | Diagnostics for schedule mode                  | v1.8 polish |
+| Concurrent clients   | Today one-at-a-time; document for Deck users;  | Future |
+|                      | optional multi-instance pipe only if measured need |    |
+
+Python pattern for additive commands (extend dispatch, keep wire format):
+
+```python
+# Illustrative v2.0 dispatch branch — additive only
+def _dispatch_ipc(self, req: dict) -> dict:
+    cmd = req.get("cmd")
+    if cmd == "status":
+        return {
+            "ok": True,
+            "version": APP_VERSION,
+            "wallpaper_target": self.cfg.get("wallpaper_target"),
+            "phase": self._solar_phase_now(datetime.now().astimezone())
+                     if self.cfg["schedule"]["mode"] == "solar" else None,
+            "displays": [
+                {"fp": c.fingerprint, "path": c.images[c.index] if c.images else None,
+                 "state": c.state.name}
+                for c in self._playback_hub.controllers()
+            ],
+        }
+    if cmd == "assign":
+        # Hardware-gated: reject if fingerprint unknown / unresolved
+        ...
+    # existing next/prev/undo/... unchanged
+```
+
+Stream Deck: map keys to `desktop_vista.exe --next` etc. (already works via
+second-instance → pipe). Document in README when touching docs; not this note.
+
+--------------------------------------------------------------------------------
+4. DATABASE SCHEMA & MIGRATION SPEC
+--------------------------------------------------------------------------------
+
+Mark gate: omit SQLite from near-term / next session. ROADMAP places the
+catalogue in v2.1, contingent on v2.0's per-display assignment model (otherwise
+display_assignments encodes a fiction). Spec below is design-complete so
+engineering can implement later without rediscovery; Recommended Target =
+v2.1 / Future.
+
+File: %LOCALAPPDATA%\DesktopVista\desktop_vista.db  (or beside config — decide
+at implementation; keep config.json as dual-write source of truth during
+migration).
+
+```sql
+-- desktop_vista.db — SQLite 3, WAL, UTF-8
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+INSERT INTO schema_meta(key, value) VALUES ('schema_version', '1');
+
+CREATE TABLE sources (
+    id          TEXT PRIMARY KEY,          -- playlist id or folder path hash
+    kind        TEXT NOT NULL CHECK (kind IN ('folder','playlist','collection','feed')),
+    name        TEXT NOT NULL,
+    root_path   TEXT,                      -- folder / playlist primary path
+    offline     INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE images (
+    id            TEXT PRIMARY KEY,        -- stable hash of normalised path
+    path          TEXT NOT NULL UNIQUE,
+    source_id     TEXT REFERENCES sources(id) ON DELETE SET NULL,
+    width         INTEGER,
+    height        INTEGER,
+    mtime_ns      INTEGER,
+    file_size     INTEGER,
+    exif_dt       TEXT,
+    gps_lat       REAL,
+    gps_lon       REAL,
+    perceptual_hash TEXT,                  -- dhash hex when computed
+    favourite     INTEGER NOT NULL DEFAULT 0,
+    hidden        INTEGER NOT NULL DEFAULT 0,
+    last_applied  TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE INDEX idx_images_hidden ON images(hidden);
+CREATE INDEX idx_images_fav ON images(favourite);
+CREATE INDEX idx_images_phash ON images(perceptual_hash);
+
+CREATE TABLE tags (
+    image_id  TEXT NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+    tag       TEXT NOT NULL,               -- exact-string, case-sensitive (as-built)
+    PRIMARY KEY (image_id, tag)
+);
+CREATE INDEX idx_tags_tag ON tags(tag);
+
+CREATE TABLE playlists (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE playlist_folders (
+    playlist_id TEXT NOT NULL REFERENCES playlists(id) ON DELETE CASCADE,
+    folder_path TEXT NOT NULL,
+    position    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (playlist_id, folder_path)
+);
+
+CREATE TABLE collections (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+
+CREATE TABLE collection_tags (
+    collection_id TEXT NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
+    tag           TEXT NOT NULL,
+    PRIMARY KEY (collection_id, tag)
+);
+
+-- Fingerprint string = MonitorFingerprint.key(); NEVER a COM device path
+CREATE TABLE display_assignments (
+    fingerprint   TEXT PRIMARY KEY,
+    image_id      TEXT REFERENCES images(id) ON DELETE SET NULL,
+    style         TEXT NOT NULL DEFAULT 'Fill',
+    source_kind   TEXT,                    -- folder|playlist|collection
+    source_id     TEXT,
+    updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE history (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint  TEXT,                     -- NULL = legacy shared pipeline
+    image_id     TEXT REFERENCES images(id) ON DELETE SET NULL,
+    path         TEXT NOT NULL,            -- denormalised for orphan survival
+    applied_at   TEXT NOT NULL
+);
+CREATE INDEX idx_history_fp_time ON history(fingerprint, applied_at DESC);
+```
+
+Zero-data-loss migration from config.json v1.8:
+
+```
+Phase M0 (read-only audit):
+  Load config.json via existing _validate_config; count folders, playlists,
+  collections, tags, favourites, hidden, history from playback_state.json.
+
+Phase M1 (create DB + dual-write):
+  CREATE schema; import folders → sources(kind=folder);
+  playlists → playlists + playlist_folders; collections → collections +
+  collection_tags; tags map → images + tags (create image rows on demand);
+  favourites/hidden flags; history ring → history (fingerprint NULL).
+  From this point: every save_config ALSO upserts SQLite (dual-write).
+  config.json remains authoritative if DB missing/corrupt.
+
+Phase M2 (cut-over read):
+  Prefer DB for library queries; fall back to config on mismatch; log drift.
+  display_assignments populated only after v2.0 fingerprints exist.
+
+Phase M3 (config slim — optional, later):
+  Keep user prefs (tray, hotkeys, ui, solar, schedule, wallpaper_target) in
+  JSON; catalogue rows live in DB. Never delete JSON fields until one release
+  of dual-read with zero drift reports.
+
+Rollback: delete desktop_vista.db; app boots from config.json unchanged.
+```
+
+--------------------------------------------------------------------------------
+5. HARDWARE & OS EDGE-CASE ANALYSIS
+--------------------------------------------------------------------------------
+
+| Scenario                         | Risk                                      | Mitigation (v2.0+)                          |
+| :------------------------------- | :---------------------------------------- | :------------------------------------------ |
+| Multi-GPU (iGPU + dGPU)          | Different DXGI adapters; RECT still GDI   | Fingerprint on GDI metrics + EDID; ignore   |
+|                                  |                                           | GPU index; re-join after adapter switch     |
+| Mixed-DPI (100% + 150%)          | Preview vs apply size mismatch; span crop | Work in physical pixels for COM RECT;       |
+|                                  | wrong                                     | pre-render per-monitor bitmaps at target DPI|
+| HDR wallpaper                    | SPI/COM may tone-map unpredictably;       | Document SDR assumption; Future research;   |
+|                                  | Pillow pipeline is SDR                    | do not claim HDR mastery                    |
+| Sleep / hibernate resume         | Stale COM pointers; clocks jump; offline  | On power-resume: dispose COM backend,       |
+|                                  | folders, solar phase skew                 | re-enumerate, re-join, recompute next_due   |
+| Dock / undock                    | Device paths reshuffle; clone vs extend   | Fingerprint persist; join_monitor_topology; |
+|                                  |                                           | unresolved labels; never guess ties         |
+| Clone mode (same RECT twice)     | join ties → None (already coded)          | Surface "unresolved — clone mode?" copy     |
+| COM call ≤5s on Tk               | UI freeze (known)                         | ApplyQueue on STA worker (v2.0 prerequisite)|
+| Span style                       | SetPosition global; per-monitor Span      | Reject Span for single-monitor target       |
+|                                  | invalid (COM module already rejects)      | (already); slicer pre-renders strips        |
+
+Panoramic span slicer (v2.0, after independence proof):
+  Input: one ultrawide/panorama + topology union RECT.
+  Output: N pre-cropped files (cache dir) + per-monitor Fill apply via COM.
+  Never rely on Windows Span alone for mixed-DPI or mismatched aspect.
+
+--------------------------------------------------------------------------------
+6. IMPLEMENTATION ROADMAP & PHASED EXECUTION PLAN
+--------------------------------------------------------------------------------
+
+Milestone A — v1.8 closeout / v1.8.1 polish
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Intent: finish single-display correctness; no multi-monitor autonomy.
+
+Work:
+  • Complete multi-DPI 125/150/200% clipping check (ROADMAP open item).
+  • Optional: bounded LRU preview harden; hotkey conflict toast; --solar-phase.
+  • QA Kevin's verify list against EditorSheet / hide-rebuild edge cases.
+
+Exit criteria:
+  • APP_VERSION remains 1.8.x; tests green.
+  • VERIFICATION.md DPI section filled for 125/150/200%.
+  • Still one shared slideshow index; wallpaper_target default "spi".
+  • No SQLite / weather / accent / lock / span / clickable map landed.
+
+Milestone B — v2.0 dual-display ("One Perfect View")
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Entry criteria (HARD GATE — Mark):
+  • Two physical displays attached on verification hardware.
+  • At least one dock/undock or Win+P / WM_DISPLAYCHANGE cycle recorded.
+
+Work (ordered):
+  1. ApplyQueue (COM/SPI off Tk) — prerequisite before "Applying…" UI claims.
+  2. MonitorFingerprint + persistence in monitor_assignments (config additive).
+  3. Reconcile on display-change / resume; reuse join_monitor_topology.
+  4. PlaybackHub + per-display PlaybackController (replace shared index).
+  5. Phase E clickable map + applied thumbnails.
+  6. Prove independent images on two displays → only then consider COM default.
+  7. Span slicer (optional within v2.0 once 6 proven).
+  8. Per-display history rings + IPC --assign / enriched --status.
+  9. Per-display solar bias wiring (schedule.py unchanged).
+
+Exit criteria:
+  • Two distinct wallpapers stable across dock/undock with fingerprint remap.
+  • Unresolved displays never auto-assigned.
+  • COM failure never falls back to SPI.
+  • config.example.json documents monitor_assignments; SPI still available.
+  • Unit tests for fingerprint round-trip + controller pause-reason matrix.
+  • Live verification notes attached (hardware), not screenshots of unrelated UI.
+
+Milestone C — v2.1 catalogue / feeds
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Entry: Milestone B assignment model exists.
+
+Work:
+  • SQLite desktop_vista.db dual-write migration (§4).
+  • Bing Daily / NASA APOD curated feeds (opt-in).
+  • Perceptual-duplicate review UI (dhash); resolution down-rank.
+  • EXIF inspector (read-only); map view only if privacy copy accepted —
+    clickable map for GPS remains Future per Mark.
+  • Weather / accent / lock remain Future unless Mark lifts gates.
+
+Exit criteria:
+  • Zero-data-loss import from a real config.json + playback_state.json.
+  • Dual-write for one release with drift logging; rollback by deleting DB.
+  • Feeds fail soft (offline) without breaking local slideshow.
+  • display_assignments rows match live fingerprints (no fiction).
+
+Future / research (explicitly not scheduled):
+  ONNX saliency, Unsplash/Wallhaven, per-monitor fullscreen HWND∩RECT,
+  desktop crossfade, HDR pipeline, concurrent IPC clients, Acrylic/Mica
+  (DROPPED).
+
+--------------------------------------------------------------------------------
+7. WHAT THIS PACK DELIBERATELY DOES NOT SCHEDULE NEXT
+--------------------------------------------------------------------------------
+
+Per Mark notes_008 — do not put in the immediate build queue:
+  ApplyQueue, SQLite, weather, accent sync, lock screen, span slicing,
+  clickable maps.
+
+These appear above only as v2.0 / v2.1 / Future rows with gates attached.
+
+--------------------------------------------------------------------------------
+8. HANDOFF
+--------------------------------------------------------------------------------
+
+Engineering:
+  1. Treat v1.8 as as-built baseline (APP_VERSION "1.8", ~4300-line main module).
+  2. Close v1.8.1 DPI verification before opening v2.0 code paths.
+  3. Block multi-monitor autonomy and COM-default on the hardware gate.
+  4. Implement from §3 blueprints as extracts (playback.py / displays.py) when
+     Milestone B starts — do not grow desktop_vista.py without extraction.
+
+Ellis / sync: commit and push only notes/notes_010.txt when Mark requests;
+do not touch application code or other notes in the same change-set unless
+scope expands explicitly.
+
+— Lynda, Principal Systems Architect
+  10 September 2026 · Europe/London · Desktop Vista · Hawkeye
+  *All my drives. One perfect view.*
+
+================================================================================
+END OF notes_010.txt
+================================================================================
