@@ -1,0 +1,513 @@
+# Desktop Vista — Product & UX Deliverable (notes_009)
+**Author:** Kevin — Lead Product Architect & UX Innovation Specialist  
+**Project:** Desktop Vista · **Tagline:** *All my drives. One perfect view.*  
+**Date:** 10 September 2026  
+**Audience:** Engineering, design, release planning  
+**Status:** Design deliverable only — do **not** edit application code, `config.json`, `ROADMAP.md`, or other notes.  
+**Position:** Successor product pack to notes_001–008. Does **not** replace them.
+
+---
+
+## 0. Critical baseline correction
+
+The Agent 1 brief (and notes_002’s original matrix) still describes historical **v1.0**. That snapshot is obsolete.
+
+| Fact | Live on Hawkeye (`D:\Desktop_Vista`) |
+| :--- | :--- |
+| `APP_VERSION` | **1.8** |
+| Main module | `desktop_vista.py` ≈ **4301** lines |
+| Companion modules | `hotkeys.py`, `ipc.py`, `schedule.py`, `ui_components.py`, `windows_wallpaper_com.py` |
+| Tests | `test_desktop_vista.py`, `test_hotkeys.py`, `test_ipc.py`, `test_schedule.py` |
+| Shell | Four-page nav (Library / Playback / Displays / Settings) since **v1.7** |
+| Wallpaper default | `"wallpaper_target": "spi"` — COM is **opt-in**, not default |
+
+### Already largely SHIPPED (do not propose as greenfield)
+
+- **Track C tray / residency:** `pystray`, `--minimized`, HKCU Run key, Reveal in Explorer, branded `.ico`
+- **Resilience:** offline folder badges, skip missing files, reconnect poll (off-thread)
+- **Shuffle / timing:** Fisher–Yates deck; `interval_custom_seconds`; 1 Hz scheduler; daily clock-time mode
+- **Hardening (notes_003 lineage):** threaded preview decode, responsive canvas, EXIF transpose, WebP JPEG cache, atomic config write, debounced save
+- **Aggregation (v1.3–1.7):** multi-source playlists, favourites / hidden, collections (tags_any), curator hide
+- **Power / context (v1.4+):** battery-saver and fullscreen pause; solar data model + live bias via `schedule.py` (v1.6)
+- **COM path (v1.5+):** opt-in `IDesktopWallpaper` apply; topology strip read-only; single shared slideshow index
+- **Companion (v1.6+):** history/undo ring, mutex single-instance, named-pipe IPC, global hotkeys
+- **UI rewrite (v1.7+):** four-page shell, HoverHUD, stage footer Apply, TagSelector, toasts, appearance switch, F6/F11/inspection
+- **notes_008 leftovers targeted at v1.8** (correctness / UI pass on **single-display** hardware): `EditorSheet`, `_rebuild_playback_after_filter_change`, About block (`ABOUT_COPY`), Narrator honesty (no fake AT mode; high-contrast / tab-order / text equivalents), display map remains **read-only** with unresolved labels — **verify these landed**; treat any gap as immediate polish, not a new feature track
+
+### Still DEFERRED / hardware-gated (Mark, notes_008)
+
+| Item | Gate |
+| :--- | :--- |
+| Clickable per-display map (Phase E) | **v2.0** — dual physical displays + dock/undock |
+| COM as **default** wallpaper backend | Same hardware gate; independence unverified |
+| ApplyQueue, SQLite catalogue, weather, accent sync, lock screen, span slicing, Mica/Acrylic | **Omit** from near-term |
+
+---
+
+## 1. Executive Feature Matrix
+
+Version labels: **Shipped (≤1.8)** · **v1.9** (near UX polish, single-display) · **v2.0** (multi-monitor hardware gate) · **Later / Dropped**.
+
+| Feature Name | Category | User Impact | Complexity | Target Version | Status |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **Track A — Multi-drive & aggregation** | | | | | |
+| Unified multi-folder playlists | Aggregation | High | Med | ≤1.8 | **Shipped** |
+| Playlist source = folders ∪ playlists in slideshow | Aggregation | High | Med | ≤1.8 | **Shipped** |
+| Drive hot-plug / offline folder marking | Resilience | High | Med | ≤1.8 | **Shipped** |
+| Skip missing files without crashing | Resilience | High | Low | ≤1.8 | **Shipped** |
+| Resume offline folders on reconnect | Resilience | Med | Med | ≤1.8 | **Shipped** |
+| Smart tags (non-destructive metadata) | Organisation | Med | Med | ≤1.8 | **Shipped** (tag map + TagSelector; exact-string) |
+| Virtual collections (cross-path, no copy) | Organisation | High | Med | ≤1.8 | **Shipped** (`tags_any` collections) |
+| Playlist / collection EditorSheet (draft, inline errors, Browse…) | Curator UX | High | Med | ≤1.8 / v1.9 | **Partial** — verify notes_008 close-out; polish gaps → **v1.9** |
+| Hide rebuild / hide-of-applied wallpaper | Curator correctness | High | Med | ≤1.8 | **Partial** — `_rebuild_playback_after_filter_change` present; verify edge cases |
+| Orphan purge of hidden paths (explicit, off-thread) | Curator hygiene | Med | Med | v1.9 | **Next** |
+| ALL / NOT collection filters | Catalog semantics | Med | High | Later | **Dropped** near-term (Mark: catalog semantics) |
+| **Track B — Multi-monitor** | | | | | |
+| `IDesktopWallpaper` COM per-monitor set | Display | High | High | ≤1.8 opt-in / v2.0 default | **Partial** — opt-in path shipped; independence **unverified** |
+| Monitor topology read (RECT / primary) | Display | High | Med | ≤1.8 | **Partial** — read-only strip; COM picker is a **separate** identity space |
+| Unresolved-display labelling on map | Display / UX | Med | Low | ≤1.8 | **Shipped** / verify |
+| Clickable per-display assignment map (Phase E) | Display / UX | High | High | v2.0 | **v2.0** |
+| Persistent monitor fingerprint (EDID hash, size, origin, primary, orientation) | Display identity | High | High | v2.0 | **v2.0** — never persist COM device path |
+| Per-monitor preview mini-cards | Display / UX | High | Med | v2.0 | **v2.0** |
+| Per-monitor style & assignment map (`monitor_assignments`) | Display | High | Med | v2.0 | **v2.0** |
+| Independent per-monitor slideshow indices | Playback | High | High | v2.0 | **v2.0** |
+| Panoramic / ultrawide span assist / span slicing | Display | Med | High | Later | **Later** (Mark non-goal near-term) |
+| **Track C — Tray & automation** | | | | | |
+| `pystray` daemon + context menu | Automation | High | Med | ≤1.8 | **Shipped** |
+| Minimise-to-tray (close vs hide) | Automation | High | Low | ≤1.8 | **Shipped** |
+| Startup Run key + `--minimized` | Automation | High | Low | ≤1.8 | **Shipped** |
+| Tray Next / Previous / Pause / Reveal / Exit / About | Automation | High | Low | ≤1.8 | **Shipped** (About → Settings) |
+| Battery saver pause | Power | Med | Low | ≤1.8 | **Shipped** |
+| Fullscreen / game suppression | Power | Med | Med | ≤1.8 | **Shipped** |
+| Named-pipe IPC + global hotkeys + single-instance | Automation | High | Med | ≤1.8 | **Shipped** |
+| Tray → Tk marshal hardening (queue / `after` only) | Robustness | Med | Med | v1.9 | **Next** (pattern reminder; workers must not call `after` directly) |
+| ApplyQueue (serialize COM apply off Tk) | Robustness | Med | High | Later | **Dropped** near-term (Mark: COM can block ~5 s; omit) |
+| **Track D — Schedules & shuffle** | | | | | |
+| Fisher–Yates shuffle deck | Playback | High | Low | ≤1.8 | **Shipped** |
+| Custom intervals (`interval_custom_seconds`) | Scheduling | High | Low | ≤1.8 | **Shipped** |
+| Clock-time / daily triggers | Scheduling | Med | Med | ≤1.8 | **Shipped** |
+| Solar dawn/day/dusk/night data model | Dynamic | Med | Med | ≤1.8 | **Shipped** |
+| Solar live bias into slideshow picks | Dynamic | Med | Med | ≤1.8 | **Shipped** (v1.6 `schedule.py`) |
+| Weather-driven selection | Dynamic | Low | High | Later | **Dropped** near-term |
+| **Track E — UI / UX polish** | | | | | |
+| Responsive preview canvas | UX | Med | Med | ≤1.8 | **Shipped** |
+| Four-page shell + HoverHUD + stage footer Apply | UX | High | Med | ≤1.8 | **Shipped** (v1.7+) |
+| Favourite (heart) quick list | Curator | Med | Low | ≤1.8 | **Shipped** |
+| Blacklist / hide without deleting file | Curator | Med | Low | ≤1.8 | **Shipped** |
+| Reveal in File Explorer | Curator | Med | Low | ≤1.8 | **Shipped** |
+| Branded icon | Branding | Med | Low | ≤1.8 | **Shipped** |
+| About block (name, version, copyright, GitHub, licence notice) | Branding | Low | Low | ≤1.8 | **Shipped** / verify |
+| Accessibility honesty (tab order, text equivalents, high contrast, no fake Narrator) | A11y | High | Med | ≤1.8 / v1.9 | **Partial** — SPI high-contrast helpers present; real Narrator pass → **v1.9** docs + VERIFICATION |
+| Bounded LRU preview cache (workers publish data; Tk polls) | Performance | Med | Med | v1.9 | **Next** |
+| Crossfade on real desktop | UX | Low | High | Later | **Dropped** (research spike only; no commitment) |
+| Set as Lock Screen (WinRT) | Curator | Med | High | Later | **Dropped** near-term |
+| Acrylic / Mica backdrop | Aesthetic | Low | High | Later | **Dropped** |
+| Accent-colour sync / ambient glow | Aesthetic | Low | Med | Later | **Dropped** near-term |
+
+**Reading the matrix:** anything marked **Shipped** must not reappear in plans as a greenfield build. Near-term engineering attention is **verify v1.8 leftovers**, then **v1.9 single-display polish**, then the **v2.0 hardware gate**.
+
+---
+
+## 2. Architectural Blueprints & Code Snippets
+
+Scope: patterns for what is **still open or needs hardening** — not a re-teach of shipped tray residency. British English comments. House rules unchanged:
+
+- Tk owns the UI thread; workers publish plain data; only Tk polls / applies widgets  
+- One wallpaper authority (Desktop Vista’s controller — never `IDesktopWallpaper` slideshow APIs)  
+- `SetPosition` is global; per-monitor crop must be pre-rendered  
+- COM device paths are session-ephemeral — never primary keys  
+- On COM failure: **never** silent SPI fallback (would stamp every screen)  
+- No NumPy, no pywin32; no silent geolocation; no fake Narrator mode  
+
+### 2.1 `pystray` + Tk marshal (short reference)
+
+Tray callbacks arrive on the pystray thread. They must **enqueue** commands; only the Tk thread drains the queue via `after`.
+
+```python
+# Tray / worker → Tk: enqueue only. Never call widget methods or self.after
+# from the pystray thread (Tcl is not thread-safe).
+import queue
+
+class DesktopVista:
+    def __init__(self, ...):
+        self._ui_cmds: queue.SimpleQueue = queue.SimpleQueue()
+        self.after(50, self._drain_ui_cmds)
+
+    def _post_ui(self, fn, *args) -> None:
+        self._ui_cmds.put((fn, args))
+
+    def _drain_ui_cmds(self) -> None:
+        try:
+            while True:
+                fn, args = self._ui_cmds.get_nowait()
+                fn(*args)
+        except queue.Empty:
+            pass
+        self.after(50, self._drain_ui_cmds)
+
+    # pystray menu handler (runs off Tk):
+    def _on_tray_next(self, icon, item) -> None:
+        self._post_ui(self._next_and_apply)  # not self._next()
+```
+
+### 2.2 `IDesktopWallpaper` ctypes sketch + never-silent-SPI rule
+
+```python
+# Opt-in COM apply. Failures surface to the user; never fall through to
+# SystemParametersInfoW (that would paint every monitor with one image).
+import ctypes
+from ctypes import wintypes
+
+CLSID_DesktopWallpaper = "{C2CF3110-460E-4FC1-B9D0-8A1C0C9CC4BD}"
+IID_IDesktopWallpaper = "{B92B56A9-8B55-4E14-9A89-0199BBB6F93B}"
+
+def apply_com_wallpaper(monitor_id: str | None, path: str, *, position: int) -> None:
+    """Raise on any COM failure. Caller shows the error; no SPI fallback."""
+    wall = _create_desktop_wallpaper()  # CoCreateInstance via ctypes
+    try:
+        hr = wall.SetWallpaper(monitor_id, path)  # None => all monitors
+        if hr:
+            raise OSError(f"SetWallpaper failed: HRESULT 0x{hr & 0xFFFFFFFF:08X}")
+        hr = wall.SetPosition(position)  # GLOBAL — not per-monitor
+        if hr:
+            raise OSError(f"SetPosition failed: HRESULT 0x{hr & 0xFFFFFFFF:08X}")
+    finally:
+        _release(wall)
+
+# Device paths from GetMonitorDevicePath are session-ephemeral.
+# Persist fingerprints (EDID/size/origin/primary/orientation), never the path.
+```
+
+**v2.0 gate reminder:** keep `"wallpaper_target": "spi"` as default until two physical displays prove independent COM apply through dock/undock and `WM_DISPLAYCHANGE`.
+
+### 2.3 Async pre-decode + bounded LRU preview cache
+
+Workers decode; they publish `(token, path, photo_image_bytes_or_error)` onto a queue. Tk alone constructs `CTkImage` / assigns the label.
+
+```python
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+import queue
+
+PREVIEW_CACHE_MAX = 24  # bounded; drop least-recently-used
+
+class PreviewCache:
+    def __init__(self) -> None:
+        self._lru: OrderedDict[str, object] = OrderedDict()
+
+    def get(self, key: str):
+        if key in self._lru:
+            self._lru.move_to_end(key)
+            return self._lru[key]
+        return None
+
+    def put(self, key: str, value: object) -> None:
+        self._lru[key] = value
+        self._lru.move_to_end(key)
+        while len(self._lru) > PREVIEW_CACHE_MAX:
+            self._lru.popitem(last=False)
+
+# Worker publishes data only — never touches Tk widgets.
+def _decode_preview(path: str, token: int, out: queue.SimpleQueue) -> None:
+    try:
+        rgb = _load_rgb_thumbnail(path)  # Pillow + EXIF off-thread
+        out.put(("ok", token, path, rgb))
+    except Exception as exc:
+        out.put(("err", token, path, str(exc)))
+
+# Tk poller:
+def _poll_preview_results(self) -> None:
+    try:
+        while True:
+            kind, token, path, payload = self._preview_q.get_nowait()
+            if token != self._load_token:
+                continue  # stale navigation
+            if kind == "ok":
+                self._preview_cache.put(path, payload)
+                self._paint_preview(payload)
+            else:
+                self._show_preview_error(payload)
+    except queue.Empty:
+        pass
+    self.after(16, self._poll_preview_results)
+```
+
+---
+
+## 3. UI/UX Wireframes
+
+Acknowledge: the **four-page shell** (Library / Playback / Displays / Settings) is **already in v1.7+**. Wireframes below refine task flows; they are not a proposal to reintroduce the old single-stack sidebar.
+
+### 3.1 Dual-pane + task pages (as-built)
+
+```
+┌─ Desktop Vista 1.8 ──────────────────────────────────────────────┐
+│ [≡] Library │ Playback │ Displays │ Settings          [_][□][×] │
+├─────────────┬────────────────────────────────────────────────────┤
+│ NAV RAIL    │ STAGE (preview canvas, aspect-safe)                │
+│  Library    │  ┌──────────────────────────────────────────────┐  │
+│  Playback   │  │                                              │  │
+│  Displays   │  │              current image                   │  │
+│  Settings   │  │         [HoverHUD: ◀ ? ▶  ♥ ⊘ 🏷 ⋯]         │  │
+│             │  └──────────────────────────────────────────────┘  │
+│ page body   │  filename / status          [ Apply to <target> ]  │
+│ (scroll)    │                          ▲ permanent stage footer  │
+└─────────────┴────────────────────────────────────────────────────┘
+```
+
+```mermaid
+flowchart LR
+  subgraph shell [Four-page shell v1.7+]
+    L[Library]
+    P[Playback]
+    D[Displays]
+    S[Settings]
+  end
+  L --> Stage[Preview stage + HUD + Apply footer]
+  P --> Stage
+  D --> Stage
+  S --> Stage
+  Tray[pystray menu] -->|queue / after| Stage
+```
+
+### 3.2 Playlist manager (curator sheet — v1.8 / v1.9)
+
+```
+┌─ EditorSheet: Playlist ─────────────────────────────┐
+│ Name: [ Summer Drives____________ ]                 │
+│ Folders                                             │
+│  ☑ D:\Wallpapers\Landscapes                         │
+│  ☑ E:\Media\Desktop Backgrounds                     │
+│  ☐ F:\Archive\(offline)                             │
+│ [ Browse… ]                                         │
+│                                                     │
+│ Live match count: 1,284 images  (online sources)    │
+│ ⚠ Inline error: name required                       │
+│                          [ Cancel ]  [ Save draft ] │
+└─────────────────────────────────────────────────────┘
+```
+
+Rules (Mark notes_008): modal; reuse `TagSelector` for collections; **no** ALL/NOT filters yet; replace message boxes with inline labels + live counts; Browse… for playlist folders.
+
+### 3.3 Monitor selector cards (v2.0 — hardware gate)
+
+```
+┌─ Displays (v2.0 interactive) ───────────────────────┐
+│ Topology (fingerprinted; COM path ephemeral)        │
+│   ┌──────────┐  ┌────────────────────┐              │
+│   │ Monitor 1│  │ Monitor 2          │              │
+│   │ 1920×1080│  │ 3440×1440 ultrawide│              │
+│   │ PRIMARY  │  │                    │              │
+│   │ [thumb]  │  │ [thumb]            │              │
+│   │ Assign ▾ │  │ Assign ▾           │              │
+│   └──────────┘  └────────────────────┘              │
+│ ⚠ Display 3 unresolved — reconnect or re-dock       │
+│ COM default: blocked until dual-display verified    │
+└─────────────────────────────────────────────────────┘
+```
+
+**v1.8 reality:** same page stays **read-only** labels + unresolved markers; click-to-assign is Phase E → **v2.0**.
+
+### 3.4 Tray menu (as-built reference)
+
+```
+Desktop Vista
+─────────────
+Current: lakeside_04.jpg
+Next wallpaper
+Previous wallpaper   ← history ring, not raw index
+Pause slideshow  /  Resume slideshow
+Reveal in Explorer
+─────────────
+Open Desktop Vista
+About Desktop Vista…  → Settings About block
+Exit
+```
+
+---
+
+## 4. Configuration Schema v2
+
+Extends **current** keys. **No breaking renames.** Older configs load via existing deep-copy + field validation; missing keys take `DEFAULT_CONFIG` defaults.
+
+```json
+{
+  "folders": [
+    "D:\\Wallpapers\\Landscapes",
+    "E:\\Media\\Desktop Backgrounds"
+  ],
+  "current_folder": "D:\\Wallpapers\\Landscapes",
+  "current_image": "D:\\Wallpapers\\Landscapes\\lakeside_04.jpg",
+  "style": "Fill",
+  "interval": "15 minutes",
+  "shuffle": true,
+  "interval_custom_seconds": null,
+
+  "tray": {
+    "enabled": true,
+    "close_to_tray": true,
+    "run_at_startup": false
+  },
+
+  "playlists": [
+    {
+      "id": "pl_summer",
+      "name": "Summer Drives",
+      "folders": [
+        "D:\\Wallpapers\\Landscapes",
+        "E:\\Media\\Desktop Backgrounds"
+      ]
+    }
+  ],
+  "favourites": [],
+  "hidden": [],
+  "playback_source": {
+    "kind": "playlist",
+    "id": "pl_summer"
+  },
+
+  "power": {
+    "pause_on_battery_saver": true,
+    "pause_on_fullscreen": true
+  },
+  "schedule": {
+    "mode": "interval",
+    "daily_times": ["08:00", "18:30"]
+  },
+
+  "tags": {
+    "D:\\Wallpapers\\Landscapes\\lakeside_04.jpg": ["lake", "dawn"]
+  },
+  "collections": [
+    {
+      "id": "col_dawn",
+      "name": "Dawn favourites",
+      "tags_any": ["dawn", "golden-hour"]
+    }
+  ],
+
+  "solar": {
+    "enabled": false,
+    "latitude": null,
+    "longitude": null,
+    "fallback_times": ["06:00", "08:00", "18:00", "21:00"]
+  },
+
+  "wallpaper_target": "spi",
+
+  "hotkeys": {
+    "enabled": true,
+    "next": "Win+Alt+N",
+    "prev": "Win+Alt+P",
+    "favourite": "Win+Alt+L",
+    "hide": "Win+Alt+H",
+    "undo": "Win+Alt+Z",
+    "toggle": "Win+Alt+S"
+  },
+
+  "ui": {
+    "selected_page": "library",
+    "appearance": "dark",
+    "hud_always_visible": false,
+    "reduced_motion": false,
+    "seen_shortcut_notice_v2": false
+  },
+
+  "monitor_assignments": {}
+}
+```
+
+### Migration notes (backward-compatible)
+
+| From | Behaviour |
+| :--- | :--- |
+| Pre-tray configs (folders / style / interval / shuffle only) | Load as today; `tray`, `playlists`, `power`, `tags`, `solar`, `ui`, etc. defaulted |
+| v1.2 tray configs | Accept; playlist / tag sections remain empty lists / `{}` |
+| v1.3–1.5 playlist / tag / solar configs | Unchanged keys; solar may gain live scheduling without schema rename |
+| `playback_source.kind` | `"folder"` \| `"playlist"` \| `"collection"` — unknown kinds rejected, source cleared |
+| `wallpaper_target` | Absent → `"spi"`; `"com"` only when user opts in |
+| `monitor_assignments` | **Additive for v2.0.** Shape: `{ fingerprint: { "image": path\|null, "style": "Fill"\|… } }`. Empty `{}` on single-display machines. **Never** key by COM device path |
+| `interval_custom_seconds` | `null` or finite positive number; reject `inf` / `nan` / strings |
+| Boolean tray / power flags | Require real JSON booleans (not `"false"` strings) — already enforced |
+
+Do **not** invent renames (`blacklist` → keep `hidden`; `sources` → keep `playlists` + `folders`).
+
+---
+
+## 5. Phased Implementation Roadmap (after v1.8)
+
+### Immediate — verify notes_008 leftovers landed
+
+1. Confirm `EditorSheet` for playlist + collection (TagSelector reuse, Browse…, inline errors, live match counts).  
+2. Confirm `_rebuild_playback_after_filter_change` on Hide / Unhide / editor Save; hide-of-applied replaces wallpaper or holds last good image.  
+3. Confirm About four-liner + licence notice + tray About → Settings.  
+4. Confirm Displays page: read-only topology, unresolved labels; **no** clickable assign.  
+5. Confirm accessibility honesty: tab order, icon text equivalents, `SPI_GETHIGHCONTRAST`, `--selftest` DPI output; **no** toast “Narrator mode”.  
+6. Document real Narrator steps in `VERIFICATION.md` when hardware AT testing is available.
+
+### Next — single-display (v1.9 UX polish)
+
+- Curator UX: manager hygiene, explicit off-thread orphan purge (never auto-purge on startup — NAS downtime must not erase curation).  
+- Playlist / collection editor sheet polish if any notes_008 gap remains.  
+- Preview: bounded LRU + queue-publish / Tk-poll pattern (harden any remaining worker→`after` calls).  
+- Tray/Tk command queue audit.  
+- Accessibility: genuine Narrator script results; high-contrast paint pass; toolkit limits documented as failures, not fake providers.  
+- **Still one shared slideshow index.** No COM default flip.
+
+### v2.0 — hardware gate
+
+**Entry criteria:** two physical displays **and** a dock/undock (or equivalent `WM_DISPLAYCHANGE`) exercise on Mark’s hardware.
+
+1. Fingerprint identity (EDID hash, size, origin, primary, orientation); reconcile on display-change; join by max RECT intersection; never persist COM path.  
+2. Clickable per-display map (Phase E) + `monitor_assignments` persistence.  
+3. Only then consider COM as **default**; prove independent images on two screens.  
+4. Optional later: independent per-monitor playback indices; span assist — still behind the same gate.
+
+### Explicit non-goals (matching Mark)
+
+Omit from near-term sessions:
+
+- ApplyQueue  
+- SQLite catalogue  
+- Weather  
+- Accent synchronisation  
+- Lock screen  
+- Span slicing  
+- Clickable map before fingerprinting  
+- Mica / Acrylic  
+- Fake Narrator / simulated AT  
+- Silent geolocation  
+- Silent SPI fallback on COM failure  
+- NumPy / pywin32  
+
+---
+
+## House rules (binding)
+
+| Rule | Why |
+| :--- | :--- |
+| Tk owns the UI thread | Tcl safety; workers publish data only |
+| One wallpaper authority | No parallel Windows slideshow APIs |
+| `SetPosition` is global | COM contract; crop must be pre-rendered |
+| COM paths ephemeral | Session-only; fingerprint for persistence |
+| SPI default until dual-display proof | Independence unverified on Hawkeye today |
+| Never silent SPI fallback | Would stamp every screen |
+| No NumPy / pywin32 | Frozen exe size contract |
+| No silent geolocation | Privacy; solar coords are explicit |
+| No fake Narrator | CustomTkinter ≠ full UIA tree |
+
+---
+
+## Handoff
+
+**Ellis (sync):** commit and push **only** `notes/notes_009.txt` (this file) to `origin/main` when ready. Do **not** touch application code, `config.json`, `ROADMAP.md`, or notes_001–008 in the same change-set unless Mark explicitly expands scope.
+
+**Engineering:**
+
+1. Treat **v1.8** as the as-built baseline; close any remaining notes_008 verification gaps first.  
+2. Schedule **v1.9** for single-display curator / a11y / preview-cache polish.  
+3. Block **v2.0** COM-default and Phase E map work on the dual-display + dock/undock gate.  
+4. Keep snippets in §2 as integration patterns, not a mandate to rewrite shipped tray / four-page shell.
+
+— Kevin, Lead Product Architect & UX Innovation Specialist  
+10 September 2026 · Desktop Vista · *All my drives. One perfect view.*

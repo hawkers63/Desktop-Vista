@@ -1,6 +1,6 @@
 # Desktop Vista — SuperGrok Configuration Guide
 
-This document provides ready-to-use configuration prompts for **SuperGrok** (xAI Grok) tailored for the **Desktop Vista** project, distilled directly from [`AGENT.md`](file:///d:/Desktop_Vista/AGENT.md).
+This document provides ready-to-use configuration prompts for **SuperGrok** (xAI Grok) tailored for the **Desktop Vista** project, distilled directly from [`AGENT.md`](file:///D:/Desktop_Vista/agents/AGENT.md).
 
 In Grok / SuperGrok Settings (**Settings → Customize Grok**), you have two fields:
 1. **"What would you like Grok to know about you to provide better responses?"** (User Context)

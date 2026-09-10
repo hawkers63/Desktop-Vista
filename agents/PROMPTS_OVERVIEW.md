@@ -10,12 +10,12 @@ All agents must follow the repository convention of recording their deliverables
 
 | Agent Document | Specialty Role | Target Output File | Core Focus & Mission |
 | :--- | :--- | :--- | :--- |
-| **[`AGENT.md`](file:///D:/Desktop_Vista/AGENT.md)** | **Master Autonomous Systems Architect & Lead Engineer** | Unified / Any Target | Consolidates and optimizes all 5 agent roles into a single, unified specification with multi-mode execution and safety guardrails. |
-| **[`AGENT_1_FEATURE_INNOVATION.md`](file:///D:/Desktop_Vista/AGENT_1_FEATURE_INNOVATION.md)** | **Product Architect & UX Innovation Specialist** | [`notes/notes_002.txt`](file:///D:/Desktop_Vista/notes/notes_002.txt) | Exploration of baseline features, playlists, system tray automation (`pystray`), day/night scheduling, and foundational roadmap (v1.1 → v2.0). |
-| **[`AGENT_2_CODEBASE_HARDENING.md`](file:///D:/Desktop_Vista/AGENT_2_CODEBASE_HARDENING.md)** | **Lead Codebase Auditor & QA Systems Engineer** | [`notes/notes_003.txt`](file:///D:/Desktop_Vista/notes/notes_003.txt) | In-depth audit of `desktop_vista.py`, fixing synchronous navigation I/O, background threaded decoding, WebP transcode cache, timer lifecycle, and test coverage. |
-| **[`AGENT_3_GITHUB_MANAGEMENT.md`](file:///D:/Desktop_Vista/AGENT_3_GITHUB_MANAGEMENT.md)** | **DevOps & Version Control Release Specialist** | GitHub Remote / `README.md` / `LICENSE` | Clean Git initialization, remote reconciliation with [`hawkers63/Desktop-Vista`](https://github.com/hawkers63/Desktop-Vista), `.gitignore`, and strict proprietary copyright enforcement. |
-| **[`AGENT_4_UI_IMPROVEMENTS.md`](file:///D:/Desktop_Vista/AGENT_4_UI_IMPROVEMENTS.md)** | **Lead UI/UX Designer & Interface Architect** | **[`notes/notes_005.txt`](file:///D:/Desktop_Vista/notes/notes_005.txt)** | Ergonomic overhaul of the v1.5.1 interface: decomposing the 11-section sidebar into segmented tabs/accordions, replacing 3 button rows with a floating preview HUD, interactive monitor topology card selector, tag chips, and native toast notifications. |
-| **[`AGENT_5_FUNCTIONAL_ENHANCEMENTS.md`](file:///D:/Desktop_Vista/AGENT_5_FUNCTIONAL_ENHANCEMENTS.md)** | **Principal Systems Architect & Automation Strategist** | **[`notes/notes_006.txt`](file:///D:/Desktop_Vista/notes/notes_006.txt)** | Next-generation systems architecture: independent per-monitor playback state engines, ultrawide/span image slicing, live astronomical solar scheduling, system-wide global hotkeys (`RegisterHotKey`), lock screen sync, and SQLite catalog migration. |
+| **[`AGENT.md`](file:///D:/Desktop_Vista/agents/AGENT.md)** | **Master Autonomous Systems Architect & Lead Engineer** | Unified / Any Target | Consolidates and optimizes all 5 agent roles into a single, unified specification with multi-mode execution and safety guardrails. |
+| **[`agents/AGENT_1_FEATURE_INNOVATION.md`](file:///D:/Desktop_Vista/agents/AGENT_1_FEATURE_INNOVATION.md)** | **Product Architect & UX Innovation Specialist** | [`notes/notes_002.txt`](file:///D:/Desktop_Vista/notes/notes_002.txt) | Exploration of baseline features, playlists, system tray automation (`pystray`), day/night scheduling, and foundational roadmap (v1.1 → v2.0). |
+| **[`AGENT_2_CODEBASE_HARDENING.md`](file:///D:/Desktop_Vista/agents/AGENT_2_CODEBASE_HARDENING.md)** | **Lead Codebase Auditor & QA Systems Engineer** | [`notes/notes_003.txt`](file:///D:/Desktop_Vista/notes/notes_003.txt) | In-depth audit of `desktop_vista.py`, fixing synchronous navigation I/O, background threaded decoding, WebP transcode cache, timer lifecycle, and test coverage. |
+| **[`AGENT_3_GITHUB_MANAGEMENT.md`](file:///D:/Desktop_Vista/agents/AGENT_3_GITHUB_MANAGEMENT.md)** | **DevOps & Version Control Release Specialist** | GitHub Remote / `README.md` / `LICENSE` | Clean Git initialization, remote reconciliation with [`hawkers63/Desktop-Vista`](https://github.com/hawkers63/Desktop-Vista), `.gitignore`, and strict proprietary copyright enforcement. |
+| **[`agents/AGENT_4_UI_IMPROVEMENTS.md`](file:///D:/Desktop_Vista/agents/AGENT_4_UI_IMPROVEMENTS.md)** | **Lead UI/UX Designer & Interface Architect** | **[`notes/notes_005.txt`](file:///D:/Desktop_Vista/notes/notes_005.txt)** | Ergonomic overhaul of the v1.5.1 interface: decomposing the 11-section sidebar into segmented tabs/accordions, replacing 3 button rows with a floating preview HUD, interactive monitor topology card selector, tag chips, and native toast notifications. |
+| **[`agents/AGENT_5_FUNCTIONAL_ENHANCEMENTS.md`](file:///D:/Desktop_Vista/agents/AGENT_5_FUNCTIONAL_ENHANCEMENTS.md)** | **Principal Systems Architect & Automation Strategist** | **[`notes/notes_006.txt`](file:///D:/Desktop_Vista/notes/notes_006.txt)** | Next-generation systems architecture: independent per-monitor playback state engines, ultrawide/span image slicing, live astronomical solar scheduling, system-wide global hotkeys (`RegisterHotKey`), lock screen sync, and SQLite catalog migration. |
 
 
 ---
@@ -58,8 +58,8 @@ graph TD
 
 ## Quick Reference Links
 
-- **Master Agent Specification**: [`AGENT.md`](file:///D:/Desktop_Vista/AGENT.md)
-- **SuperGrok Configuration Guide**: [`GROK_SETTINGS.md`](file:///D:/Desktop_Vista/GROK_SETTINGS.md)
+- **Master Agent Specification**: [`AGENT.md`](file:///D:/Desktop_Vista/agents/AGENT.md)
+- **SuperGrok Configuration Guide**: [`GROK_SETTINGS.md`](file:///D:/Desktop_Vista/agents/GROK_SETTINGS.md)
 - **Main Application**: [`desktop_vista.py`](file:///D:/Desktop_Vista/desktop_vista.py)
 - **COM Display Engine**: [`windows_wallpaper_com.py`](file:///D:/Desktop_Vista/windows_wallpaper_com.py)
 - **Configuration Template**: [`config.example.json`](file:///D:/Desktop_Vista/config.example.json)
