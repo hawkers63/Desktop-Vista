@@ -556,3 +556,69 @@ system tokens and back correctly; Light/Dark text-on-fill readability) — pass.
 the 125%/150%/200% scaling clipping check was **not run** — Mark stopped here for the night
 (2:15am UK time). All commits pushed to `origin/main`. Next session: run the remaining scaling
 check to close v1.8.1 out.
+
+## 2026-09-10 — Multi-DPI scaling check: 125% pass, 150%/200% needs a dedicated session
+
+Resumed the one remaining v1.8.1 item. Ran it interactively: launched the app fresh under each
+Windows scaling level, drove window placement/screenshotting from PowerShell (raw Win32
+`SetWindowPos`, since there's no accessible automation surface — see the Narrator finding above),
+Mark changed the actual Windows setting each time.
+
+**125% — Pass.** Standard preset on this display, applies live (no sign-out) once launched fresh
+after the change. Window dragged to true minimum (980×560 content); nav rail, sidebar (scrolls
+correctly for overflow), stage, and footer Apply all stayed usable — confirmed both by screenshot
+and by Mark directly resizing the live window.
+
+**Blocker hit mid-check, resolved:** the app's own `--selftest` DPI probe kept reading 96/1.333
+(the 100% baseline) even after Mark confirmed 125% was applied in Settings. Chased this down
+before trusting either signal — turned out to be two compounding red herrings, not a real
+scaling failure:
+1. `HKCU\Control Panel\Desktop\WindowMetrics\AppliedDPI` (checked directly via registry) is a
+   stale legacy mirror that only refreshes at next logon — reads old even when the live value has
+   changed.
+2. **Real bug found in the diagnostic itself:** `run_selftest()` calls `enumerate_monitor_dpi()`
+   *before* constructing a `ctk.CTk()` root — but CustomTkinter's `SetProcessDpiAwareness(2)`
+   call only fires once a `CTk` root exists. A process that hasn't yet declared per-monitor-DPI
+   awareness is told Windows' DPI-virtualized default (96) by `GetDpiForMonitor`, regardless of
+   the real display scaling. Proved this with a throwaway script: querying DPI after calling
+   `SetProcessDpiAwareness` first correctly returned 120 (live 125%); without it, 96. So
+   `--selftest`'s DPI line is **unreliable at any non-100% scaling** — not fixed yet, logged in
+   `docs/VERIFICATION.md` as a follow-up (call `SetProcessDpiAwareness` before the probe, or
+   construct the probe root first).
+
+Once that was untangled, verified 125% for real via the actual rendered window (screenshot) and
+Mark's direct resize test — both agreed: pass.
+
+**150%/200% — not reachable live on this display.** Neither is a standard preset in Settings >
+System > Display > Scale (both greyed out); only reachable via "Customised scaling" (free 100–500%
+entry), which Windows explicitly gates on sign-out: *"The custom scale factor won't be applied
+until you sign out."* Unlike 125%, there's no way to test these without ending the interactive
+session (which kills the Claude Code terminal too). Mark chose to sign out, set 150%, test solo,
+then repeat for 200%, then report results back.
+
+**State as of hand-off:** `docs/VERIFICATION.md` updated — 125% recorded as Pass with the full
+evidence trail and the `--selftest` bug noted; 150%/200% left as the explicit resume point.
+**Next session: get Mark's 150%/200% results (clipped or not, anything noteworthy) and record them
+in `docs/VERIFICATION.md`'s Multi-DPI section and Outcomes table — that's the last thing standing
+between v1.8.1 and being fully closed out.** Consider fixing the `--selftest` DPI-ordering bug in
+the same pass if there's room, though it's independent of closing the check itself.
+
+## 2026-09-10 (continued) — 150%/200% pass; v1.8.1 fully closed
+
+Mark signed out, set 150% then 200% via "Customised scaling" solo, and reported back: both
+rendered correctly, menu bar functioning as expected, no clipping observed (screenshots
+`desktop/004.jpg` and `desktop/005.jpg`). Reviewed both images directly before recording — full
+window chrome, nav rail, sidebar with scrollbar, stage, and HUD footer all present and unclipped
+at both scales, consistent with the 125% result.
+
+`docs/VERIFICATION.md` updated: Multi-DPI checklist item now records Pass at 150% and 200%
+alongside the existing 125%/100% entries; Outcomes table row changed from "Partial" to
+"Pass (100%, 125%, 150%, 200% all checked; no clipping at any scale)" with a note that the
+v1.8.1 gate is fully closed.
+
+**v1.8.1 is done.** Per [[desktop_vista_roadmap|ROADMAP.md]]'s five-release structure, the next
+gate (v2.0 "One Perfect View") is blocked on 2+ physical displays plus a dock/undock cycle — not
+available on this machine. Nothing further to build on the current five-release plan until that
+hardware gate lifts. The `--selftest` DPI-probe-ordering bug (`enumerate_monitor_dpi()` called
+before `ctk.CTk()` exists, so it always reads the 96 DPI/100% default at any scaling) is still
+open as a standalone follow-up, independent of the gate.

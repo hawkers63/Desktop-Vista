@@ -132,15 +132,39 @@ Narrator scan mode as a whole, not a per-control defect list.
       **2026-09-10, this machine (single 1920x1080 display, 100% Windows scaling):**
       `Per-monitor DPI (GetDpiForMonitor): [{'device': '\\\\.\\DISPLAY1', 'dpi_x': 96, 'dpi_y': 96}]`,
       `Tk scaling factor: 1.3333333333333333`.
-- [ ] At 125% / 150% / 200% Windows scaling, confirm nothing required for the app's exit criteria
-      is clipped at the 980×560 minimum window size. **Not yet run** — this dev machine's display
-      is currently at 100% scaling; needs an actual Windows scaling change to test.
+- [x] At 125% / 150% / 200% Windows scaling, confirm nothing required for the app's exit criteria
+      is clipped at the 980×560 minimum window size.
+      **125%, 2026-09-10 (Mark, this dev machine): Pass.** Applied live via Settings > System >
+      Display > Scale (a standard preset on this display — applies immediately, no sign-out).
+      Window dragged to its true minimum; every control either fit or scrolled correctly (sidebar
+      list scrolls; nav rail, footer Apply, stage all remained reachable). Confirmed both visually
+      (screenshot) and by the user directly resizing the live window.
+      **150%, 2026-09-10 (Mark, solo, this dev machine, via sign-out + "Customised scaling"):
+      Pass.** Menu bar functioning as expected, no clipping observed (screenshot: `desktop/004.jpg`).
+      **200%, 2026-09-10 (Mark, same session): Pass.** Same result — menu bar functioning as
+      expected, no clipping observed (screenshot: `desktop/005.jpg`). Both screenshots reviewed:
+      full window chrome, nav rail, sidebar (with scrollbar), stage, and HUD footer (Prev/Random/
+      Next/Favourite/Hide/Tags/More) all present and unclipped at both scales, consistent with the
+      125% result above.
+      **Aside — a real bug in the diagnostic, not the app:** `run_selftest()` calls
+      `enumerate_monitor_dpi()` (desktop_vista.py, before `ctk.CTk()` is constructed), but
+      CustomTkinter's `SetProcessDpiAwareness(2)` call only happens once a `CTk` root is created.
+      A process that hasn't yet declared itself per-monitor-DPI-aware is told the OS's
+      DPI-virtualized default (96) by `GetDpiForMonitor`, regardless of the real Windows scaling
+      setting — confirmed by querying DPI from a throwaway script that calls
+      `SetProcessDpiAwareness` first (got the correct 120 for live 125%) vs. not (got 96, matching
+      `--selftest`'s always-96 output at 125%). This means **the "Per-monitor DPI" line
+      `--selftest` prints is unreliable at any non-100% Windows scaling** — it will always read
+      96/1.0-ish regardless of the true setting. The 2026-09-10 100%-scaling measurement recorded
+      above happens to be correct by coincidence (96 is also the true value at 100%). Not fixed
+      yet — worth a small follow-up: call `ctypes.windll.shcore.SetProcessDpiAwareness(2)` (or
+      construct the probe root) before `enumerate_monitor_dpi()` in `run_selftest()`.
 
 ### Outcomes (fill in per pass)
 
 | Date | Tester | Windows build | Narrator scan mode | Contrast | Multi-DPI | Notes |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 2026-09-10 | Mark | Windows 11 Home 10.0.26100 | Toolkit limitation (root-caused via direct UIA/MSAA query — see above) | Pass | Partial (100% scaling measured; 125/150/200% not yet tried) | Tab order/focus (§ above): pass |
+| 2026-09-10 | Mark | Windows 11 Home 10.0.26100 | Toolkit limitation (root-caused via direct UIA/MSAA query — see above) | Pass | Pass (100%, 125%, 150%, 200% all checked; no clipping at any scale) | Tab order/focus (§ above): pass. v1.8.1 gate fully closed. |
 
 ## Linux / CI note
 
