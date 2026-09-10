@@ -1790,7 +1790,6 @@ class DesktopVista(ctk.CTk):
         sidebar = ctk.CTkFrame(self, width=300, corner_radius=12)
         sidebar.grid(row=0, column=0, sticky="nsw", padx=(12, 6), pady=12)
         sidebar.grid_columnconfigure(0, weight=1)
-        sidebar.grid_rowconfigure(2, weight=1)
         sidebar.grid_propagate(False)
 
         ctk.CTkLabel(sidebar, text=APP_NAME, font=ctk.CTkFont(size=22, weight="bold")).grid(
@@ -1813,6 +1812,11 @@ class DesktopVista(ctk.CTk):
             )
             btn.grid(row=i // 2, column=i % 2, padx=3, pady=3, sticky="ew")
             self.nav_buttons[page] = btn
+        # Only row 3 (the scrollable page content) should absorb leftover
+        # vertical space — navrow (row 2) has a small, fixed intrinsic
+        # height and must stay unweighted, or the grid stretches its cell
+        # taller than the buttons need and opens a visible gap above the
+        # page content.
         sidebar.grid_rowconfigure(3, weight=1)
 
         page_area = ctk.CTkFrame(sidebar, fg_color="transparent")
