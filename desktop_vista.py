@@ -953,7 +953,7 @@ def is_high_contrast_active(flags: Optional[int] = None) -> bool:
     explicitly in tests; real callers omit it to query live. Windows'
     Ease of Access > High contrast is a separate setting from our own
     dark/light/system choice; notes_007 §1.4 says to honour it rather than
-    invent a fourth appearance mode — see _apply_appearance_mode."""
+    invent a fourth appearance mode — see _apply_ui_appearance_mode."""
     if flags is None:
         flags = query_high_contrast_flags()
     return flags is not None and bool(flags & HCF_HIGHCONTRASTON)
@@ -1625,7 +1625,7 @@ class DesktopVista(ctk.CTk):
         # at creation time). Previously hardcoded to "dark" regardless of
         # the saved preference — folded into the same fix that honours
         # SPI_GETHIGHCONTRAST (notes_007 §1.4).
-        self._apply_appearance_mode()
+        self._apply_ui_appearance_mode()
         self.images: list[str] = []
         self.index: int = -1
         self._active_kind: str = "folder"
@@ -2389,7 +2389,7 @@ class DesktopVista(ctk.CTk):
         except Exception:
             pass
 
-    def _apply_appearance_mode(self) -> None:
+    def _apply_ui_appearance_mode(self) -> None:
         """Resolve and apply the live CTk appearance mode. Windows' Ease of
         Access > High contrast is a separate, OS-level setting; when it's
         on we defer to CTk's own "system" mode rather than fight it with a
@@ -2407,7 +2407,7 @@ class DesktopVista(ctk.CTk):
         mode = UI_APPEARANCE_LABEL_TO_VALUE.get(value, "dark")
         self.cfg["ui"]["appearance"] = mode
         self._flush_save()
-        self._apply_appearance_mode()
+        self._apply_ui_appearance_mode()
         self._restyle_canvas_widgets()
 
     def _on_hud_always_visible_changed(self) -> None:
