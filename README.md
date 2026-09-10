@@ -273,7 +273,7 @@ See [`ROADMAP.md`](ROADMAP.md) for the live plan. Headline status:
 
 ## Copyright & Licence
 
-**Copyright © 2026 Mark Hawksworth (hawkers63). All Rights Reserved.**
+**Copyright © 2026 Mark Hawksworth. All Rights Reserved.**
 
 Desktop Vista and all materials in this repository are proprietary. Unauthorised copying, reproduction, redistribution, modification, reverse-engineering, or commercial use is strictly prohibited without prior written consent from the copyright holder.
 
